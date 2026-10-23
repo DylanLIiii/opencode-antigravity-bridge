@@ -762,17 +762,25 @@ export const AntigravityBridgePlugin = async (input, options) => {
         {
           type: "api",
           // keyless tells magpie's UI to skip the API-key field entirely:
-          // authorize() supplies the credential, the user just clicks
-          // "Sign in". agy owns the real Google sign-in; this method only
-          // verifies that agy is installed and signed in.
+          // the user just clicks "Sign in" and authorize() runs. agy owns
+          // the real Google sign-in; this method only verifies that agy is
+          // installed and signed in.
+          //
+          // The host expects authorize() to return {type:"success", key?}
+          // (or {type:"failed", error}); returning anything else — such as
+          // OpenCode's {type:"api"} — is treated as a failed sign-in. The
+          // key we supply is a placeholder: agy's own credential cache is
+          // what the spawned processes actually use.
           keyless: true,
           label: "Sign in with the agy CLI",
           authorize: async () => {
             const agy = findAgy()
             if (!agy) {
-              throw new Error(
-                "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
-              )
+              return {
+                type: "failed",
+                error:
+                  "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
+              }
             }
             // `agy models` fails fast when signed out and costs no quota.
             const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
@@ -780,11 +788,12 @@ export const AntigravityBridgePlugin = async (input, options) => {
               const why = probe.timedOut
                 ? "timed out after 15s"
                 : (probe.stderr || probe.stdout || "").trim() || probe.err?.message || "unknown error"
-              throw new Error(
-                `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
-              )
+              return {
+                type: "failed",
+                error: `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
+              }
             }
-            return { type: "api", key: "agy" }
+            return { type: "success", key: "agy" }
           },
         },
       ],

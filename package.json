@@ -1,0 +1,26 @@
+{
+  "name": "@magpie-community/opencode-antigravity-bridge",
+  "version": "0.1.0",
+  "description": "Antigravity subscription provider that bridges to a real agy CLI subprocess via stream-json, avoiding HTTP impersonation",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "antigravity",
+    "agy",
+    "gemini"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "maxConcurrency": 4
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}

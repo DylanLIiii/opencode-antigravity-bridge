@@ -761,22 +761,17 @@ export const AntigravityBridgePlugin = async (input, options) => {
       methods: [
         {
           type: "api",
-          label: "agy CLI sign-in",
-          placeholder: "any non-empty value (agy owns the Google sign-in)",
-          prompts: [
-            {
-              type: "text",
-              key: "note",
-              label: "Optional note for this sign-in",
-              placeholder: "e.g. personal account",
-              optional: true,
-            },
-          ],
+          // keyless tells magpie's UI to skip the API-key field entirely:
+          // authorize() supplies the credential, the user just clicks
+          // "Sign in". agy owns the real Google sign-in; this method only
+          // verifies that agy is installed and signed in.
+          keyless: true,
+          label: "Sign in with the agy CLI",
           authorize: async () => {
             const agy = findAgy()
             if (!agy) {
               throw new Error(
-                "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli",
+                "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
               )
             }
             // `agy models` fails fast when signed out and costs no quota.
@@ -786,7 +781,7 @@ export const AntigravityBridgePlugin = async (input, options) => {
                 ? "timed out after 15s"
                 : (probe.stderr || probe.stdout || "").trim() || probe.err?.message || "unknown error"
               throw new Error(
-                `agy at ${agy} is not signed in or failed (${why}). Run \`agy\` interactively once to sign in.`,
+                `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
               )
             }
             return { type: "api", key: "agy" }

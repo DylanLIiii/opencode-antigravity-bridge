@@ -2,275 +2,194 @@
 
 ## 项目目标
 
-为 [magpie](https://github.com/yetone/magpie) 开发一个 npm provider 插件，将 **Antigravity 订阅**(Google Code Assist）桥接到真实的 `agy` CLI 进程，避免 magpie 内置 Antigravity provider 通过伪造 User-Agent 调用 Google API 导致的**封号风险**。
+为 [magpie](https://github.com/yetone/magpie) 提供 npm provider 插件，把
+Anthropic Messages 桥接到真实的 `agy` CLI，而不是复用订阅凭据并伪造
+Antigravity IDE 的 HTTP 身份。真实 CLI 可以避免客户端身份伪造，但不能承诺
+账号永远不会受到平台限制。
 
-设计灵感来自 magpie 内置的 **Claude 订阅桥**：不直接调 Anthropic API，而是启动真实 `claude` 二进制，让它代表用户与 Anthropic 通信。
+仓库：https://github.com/DylanLIiii/opencode-antigravity-bridge
 
-## 仓库地址
+当前状态：**原生 MCP 工具透传已实现**。基线 commit 为 `292fb05`；本文描述
+其后的工作区修改，不表示这些修改已经提交或发布。
 
-https://github.com/DylanLIiii/opencode-antigravity-bridge
+## 对原 Handoff 的复核结论
 
-当前状态：**MVP 可运行，但工具调用方案需要重构**（见下文"关键架构决策")。
+### 1. “同步 MCP 不可行”是错误判断
 
-## 当前实现概览
+原文混淆了两个请求：
 
-### 已完成
+- 客户端的 `/v1/messages` 请求先收到完整 `tool_use` 响应并结束；
+- MCP helper 的独立回调保持 pending，等客户端下一请求带来 `tool_result`。
 
-- ✅ 进程池管理：每个对话一个 `agy --input-format stream-json --output-format stream-json` 进程
-- ✅ 进程复用：同一对话的后续请求通过 stdio 复用同一进程
-- ✅ 进程淘汰：闲置 10 分钟回收，最多 4 个并发进程，LRU 淘汰
-- ✅ 错误处理：agy 中途死亡 → 显式 SSE error 帧，不静默截断
-- ✅ Token 统计：agy 的 `result.usage` 是会话累计值，已正确转为单回合 delta
-- ✅ 模型列表：从 `agy models` 动态读取，失败时 fallback 到硬编码列表
-- ✅ 无 key 登录：`keyless: true` 机制，用户点 Sign in 即可，authorize 返回 `{type:"success", key:"agy"}`
-- ✅ 图像拒绝：agy stream-json 不支持图像，带图请求返回 400
+magpie 内置 Claude 桥就是这样实现的，并没有挂起首个客户端响应。npm 插件
+host 也允许模块级跨请求状态、并发 fetch、子进程及流式 Response。因此不需要
+Go gateway 的私有端点，插件自己就能关联两个 HTTP 请求和 MCP 调用。
 
-### 当前工具调用方案（**需要重构**)
+证据：`yetone/magpie@8434179` 的
+[`claude_subscription.go`](https://github.com/yetone/magpie/blob/843417957c363886644174cd880cab0c7af09ae6/internal/gateway/claude_subscription.go)
+文件头、`match`、`continueWith`、`mcpCall`，以及
+[`host.js`](https://github.com/yetone/magpie/blob/843417957c363886644174cd880cab0c7af09ae6/internal/plugin/host.js)
+的 loader 缓存和 fetch 实现。
 
-当前用的是**文本约定**方案：
-1. 把客户端工具列表渲染到 prompt 里，告诉 agy "你可以用 `TOOL_CALL <name> <json>` 格式调工具"
-2. agy 输出匹配行时，解析成 Anthropic `tool_use` block 发给客户端
-3. 客户端执行后，下一轮带 `tool_result` 回来，渲染成 `[tool result]...` 文本喂给 agy
+### 2. 原方案 B 的“立即返回占位成功”已否决
 
-**问题**：依赖模型遵循文本约定，不如原生 MCP 可靠。
+回复 MCP `tools/call` 后，agy 就可以把占位内容当真实结果继续生成并结束回合。
+下一轮再发送 `[tool result]` 普通文本，不能恢复原生的调用/结果关系，还会让
+模型看见两种互相矛盾的结果。
 
-### 关键架构决策：如何透传客户端工具
+当前实现不回复占位内容：MCP 调用一直等待真正的客户端结果。对 agy 是同步
+工具调用，对客户端则是多个正常 Anthropic Messages HTTP 响应。
 
-#### 方案对比
+### 3. 每进程配置不依赖 `AGY_MCP_CONFIG`
 
-| 方案 | 可行性 | 体验 | 实现难度 |
-|---|---|---|---|
-| **A. 同步 MCP 透传**（对齐 Claude 桥） | ❌ 不可行 | 最佳 | — |
-| **B. 异步 MCP 透传** | ✅ 可行 | 良好 | 高 |
-| **C. 文本约定**（当前） | ✅ 已实现 | 一般 | 低 |
-| **D. 不透传客户端工具**（只用 agy 内置工具） | ✅ 可行 | 受限 | 低 |
+本机 `agy 1.3.3` 的 `--help` 和二进制中都没有该环境变量或独立 config flag。
+原 Handoff 的全局 `mcp_config.json` 路径也不是当前 CLI 的唯一真实布局；直接
+改写全局配置会污染用户环境。
 
-#### 方案 A 为什么不可行
+真实探针确认可用的是自定义 agent：
 
-Claude 桥的工作机制：
-1. Magpie 启动 `claude` 进程 + `magpie claude-mcp-helper`(stdio MCP server)
-2. `claude` 通过 MCP 调工具 → helper 收到
-3. helper POST 到 `/_magpie/claude-mcp/<token>`(Go gateway 内部端点）
-4. Go handler **阻塞等待**客户端的工具结果（通过 channel)
-5. 客户端下一轮请求带来结果 → handler 返回 → helper 把结果喂回 claude
+- 在临时工作区写 `.agents/agents/magpie-bridge/agent.md`；
+- frontmatter 使用 `tools: []` 和内联 `mcpServers` **数组**；
+- 每个 server 可有自己的 command、args、env 和 timeout；
+- 通过 `--agent magpie-bridge` 启动，并通过 `--add-dir` 加入真实项目目录。
 
-**关键**:Go handler 能"挂起"当前 HTTP 请求，等下一个请求的工具结果。这是 Go gateway 的内部能力。
+因此每个 agy 进程都有独立令牌和 MCP 配置，不修改用户全局 MCP/settings。
 
-npm 插件的 `fetch(input, init)` 必须在一个请求内返回 `Response`，**无法挂起等下一轮请求**。所以同步 MCP 透传在 npm 插件里做不到。
+参考：[Custom subagents](https://antigravity.google/docs/subagents/)、
+[Plugins](https://antigravity.google/docs/plugins/)。
 
-#### 方案 B：异步 MCP 透传（推荐）
+### 4. MCP 握手不能假设只有 `initialize`
 
-架构：
-```
-1. 客户端 POST /v1/messages,带 tools: [read_file, write_file, ...]
+真实 agy 1.3.3 首先发送 `server/discover`，协议版本是 `2026-07-28`，随后才
+发送 `tools/list` / `tools/call`。`mcp-server.mjs` 同时支持 modern discover
+和 legacy initialize。
 
-2. 插件:
-   a. 启动一个 stdio MCP server (Node.js),暴露客户端的工具
-   b. 写一个临时 mcp_config.json,指向这个 server
-   c. 启动 agy 进程,agy 读 mcp_config.json,连接我们的 server
-   d. agy 把工具列表作为 function declarations 发给 Gemini
+参考：[MCP discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)、
+[版本兼容](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)。
 
-3. Gemini 决定调工具 → agy 通过 MCP 调我们的 server
+### 5. “schema 验证由 MCP 层保证”表述过度
 
-4. 我们的 server 收到 tools/call:
-   - 不阻塞等待
-   - 立即返回: {content: [{type: "text", text: "Tool call registered. Result will be provided in the next turn."}], isError: false}
-   - 同时把工具调用转成 Anthropic tool_use block,通过 SSE 发给客户端
+MCP 能传递 `inputSchema`，但传输 schema 不等于自动完成所有 JSON Schema
+校验。当前桥检查声明过的工具名和参数形状，并把 schema 原样交给 agy；真正
+执行工具的客户端仍必须校验参数和授权操作。桥本身尚未实现完整 JSON Schema
+2020-12 校验器，不能把它写成已有保证。
 
-5. 客户端执行工具 → 下一轮请求带 tool_result
+### 6. 原“已完成”列表也有两处失实
 
-6. 插件收到下一轮请求:
-   - 从 tool_result 提取结果
-   - 作为新的 user message 发给 agy: "[tool result id=...]\n...\n[end of tool result]"
-   - agy 继续对话
-```
+- 原图像测试接受的是 Response 已返回后的流错误，并不是文档声称的 HTTP
+  400。现在内容校验提前，测试明确检查状态码 400。
+- `agy models` 的真实输出可用单个 Tab 分隔，原正则要求至少两个空白字符，
+  因而会错误退回硬编码列表。解析器已修复，并有动态模型测试。
 
-**优点**:
-- 用真实的 MCP 协议（agy 原生支持）
-- 不依赖模型遵循文本约定
-- 工具调用的 schema 验证由 MCP 层保证
+### 7. 内置工具权限是安全边界，不是备选体验
 
-**缺点**:
-- agy 的 "thinking" 在工具调用处被打断（它以为工具立即返回了）
-- 需要多一次 HTTP 往返（客户端执行工具后）
+原实现使用 `--dangerously-skip-permissions`，却没有排除 agy 的 shell、写文件
+等内置工具。当前自定义 agent 使用 `tools: []`，仅配置客户端 MCP server；
+任何意外出现的非 bridge 工具步骤都会使回合失败并淘汰进程。不能仅凭提示词
+约定就声称 agy 不会执行本地工具。
 
-**实现要点**:
-1. **MCP server 实现**：用 `@modelcontextprotocol/sdk` 或手写 stdio JSON-RPC
-2. **临时 mcp_config.json**：每个 agy 进程一个，进程结束后删除
-3. **工具列表同步**：客户端 tools → MCP server 的 tools/list
-4. **调用关联**:MCP tools/call → 当前请求的 SSE stream（需要用 request-scoped state)
-5. **结果回传**：下一轮请求的 tool_result → 渲染成文本发给 agy
+### 8. 模型协议必须写在 `api.npm`
 
-#### 方案 D：只用 agy 内置工具（备选）
+原 Handoff 说模型的顶层 `npm: "@ai-sdk/anthropic"` 会启用 Anthropic Messages。
+真实 Magpie 0.1.1356 的 `internal/plugin/host.js` 却从 `m.api?.npm` 读取协议，
+顶层字段不会进入 `plugin.Model.NPM`，模型因此被错误地按 Chat 路由，工具也变成
+Chat 风格。现在 provider 和模型都补全 OpenCode 的 `api: {id, url, npm}`，并用真实
+网关确认路由恢复为 Anthropic。参考该发布版的
+[`host.js`](https://github.com/yetone/magpie/blob/v0.1.1356/internal/plugin/host.js)
+和 [`plugins.go`](https://github.com/yetone/magpie/blob/v0.1.1356/internal/provider/plugins.go)。
 
-agy 自己有一些内置工具（`run_command`, `read_file`, `write_file` 等），这些 agy 自己就能执行，不需要 MCP 回调。
+## 当前架构
 
-如果不透传客户端工具，只让 agy 用内置工具：
-- 实现简单
-- 但客户端的自定义工具（比如 Amp 的特定工具）不可用
-- 适合"把 agy 当独立 agent 用"的场景
+### 原生工具闭环
 
-## 技术栈
+1. `Proc.start()` 创建临时工作区和受限 agent，以每进程随机令牌配置
+   `mcp-server.mjs`。
+2. helper 通过 stdio 与 agy 说 MCP；通过仅监听 `127.0.0.1` 的 TCP 控制通道
+   向插件请求工具列表或提交工具调用。令牌只放在该进程的 MCP env 中。
+3. agy 的 ACTIVE tool step 与 MCP 调用按 `progressToken` 的 step index
+   关联；无该字段时按工具名和参数做无歧义匹配。
+4. 插件把调用转成 Anthropic `tool_use`，结束当前 SSE 响应，但保留 agy
+   turn、MCP pending 调用和事件队列。
+5. 下一请求按 `tool_use_id` 找到同一 turn。真实 `tool_result` 通过控制通道
+   返回给 helper，再作为 MCP result 返回 agy。
+6. 新 SSE 响应继续消费同一 agy turn；后续工具调用可再次暂停，最终结果
+   以 `end_turn` 结束。
 
-- **运行环境**:Magpie 的 Bun host 进程（兼容 Node.js API)
-- **插件协议**:OpenCode provider 插件（`auth` + `fetch` hooks)
-- **进程管理**:`node:child_process` 的 `spawn`，显式 `stdio: ["pipe", "pipe", "pipe"]`
-- **流式响应**:Web `ReadableStream`，输出 Anthropic SSE 格式
-- **agy 协议**:`--input-format stream-json --output-format stream-json`(NDJSON over stdio)
+`Turn` 持有事件队列和调用表，HTTP Response 只是它的临时订阅者。普通结束
+`tool_use` 响应不会取消 agy turn；客户端真正取消、进程崩溃或超时才清理。
+等待模型输出和等待客户端工具结果使用不同超时。
+
+### 进程及配置生命周期
+
+- 同一对话、模型、工具定义及工作目录不变时复用进程。
+- 复用前比较规范化完整历史：对象 key 无序、数组顺序保留。相同开场但实际回复
+  不同的会话必须重建并重放，不能直接复用另一个会话的 agy 上下文。
+- acquire 按对话串行化，启动中的进程也计入 `MAX_PROCS`，避免池覆盖和超容量。
+- 工具定义变化时重建进程并重放渲染历史，避免 MCP 工具注册不一致。
+- 等待工具结果或尚有未消费事件的 turn 不参与 LRU/idle 淘汰。
+- 进程停止时回复未完成的控制请求、结束子进程并删除临时工作区。
+- 不支持的输入在返回 Response 前校验，避免把 400 错写成 200 + 流错误。
 
 ## 关键文件
 
-### `index.mjs`(868 行）
+- `index.mjs`：插件入口、进程池、turn 状态、控制通道、Anthropic SSE、
+  Anthropic 内容转换及模型发现。
+- `mcp-server.mjs`：无外部依赖的 stdio JSON-RPC helper，支持 modern/legacy
+  MCP、并发 pending 调用、取消和断线处理。
+- `test-smoke.mjs`：fake agy + 真实 MCP helper 的端到端烟雾测试。
+- `package.json`：发布文件包含 `index.mjs`、`mcp-server.mjs` 和 README。
 
-单文件插件，包含：
-- `findAgy()`：查找 agy 二进制（PATH、常见安装位置）
-- `Proc` 类：一个 agy 进程的生命周期管理
-- 进程池：`Map<convKey, Proc>`，带 idle 回收和 LRU 淘汰
-- `conversationKey(body, model)`：对话标识（system prompt + 第一条 user message 的 hash)
-- `renderInitialPrompt(body)` / `renderContinuedTurn(body)`:Anthropic Messages → agy 文本格式
-- `makeAnthropicStream(proc, body, msgId)`:agy stream-json → Anthropic SSE
-- 插件导出：`auth`(keyless sign-in)+ `provider`(models + fetch)
+## 已执行验证
 
-### `test-smoke.mjs`(220 行）
+基线的 `node --check index.mjs` 和原 15 项检查曾全部通过。
 
-烟雾测试，用 fake agy 脚本验证：
-- 进程启动 + init 握手
-- 单回合请求/响应
-- 跨回合会话复用
-- TOOL_CALL 文本约定 → tool_use block
-- agy 中途死亡 → SSE error 帧
-- 图像内容拒绝
+当前实现：
 
-运行：`node test-smoke.mjs`(15 项检查）
+- `node --check index.mjs`、`node --check mcp-server.mjs`、
+  `node --check test-smoke.mjs` 通过；
+- `node test-smoke.mjs`：**52 项全部通过**，覆盖原生工具闭环、并行/连续
+  调用、真实结果、原子化批量结果校验、相同开场会话隔离、同时启动、UTF-8
+  分块、工具错误、崩溃、超时、取消、临时目录清理、动态模型、`api.npm`
+  协议声明和真实 HTTP 400；
+- 真实 `agy 1.3.3` 协议探针确认了工作区自定义 agent、modern MCP 握手及
+  pending `tools/call` 会阻塞原回合；
+- 通过插件 `loader.fetch` 对真实 agy 验证了无工具纯文本（`BRIDGE_PLAIN_OK`）
+  和合成 echo 闭环：第一响应 `tool_use`，第二响应 `end_turn`，真实客户端结果
+  `REAL_E2E_OK` 出现在最终文本中；
+- 安装官方 **Magpie CLI 0.1.1356**（校验发布 SHA-256），用隔离 XDG 配置和
+  HOME 加载本地插件。`magpie plugin add` 与 keyless `plugin login` 均通过，
+  真实 Bun host 列出 13 个模型；直接请求网关 `/v1/messages`，纯文本返回
+  `MAGPIE_HOST_PLAIN_OK`，原生 echo 完成 `tool_use → tool_result → end_turn`
+  并返回 `MAGPIE_HOST_TOOL_OK`。这次宿主验证还暴露了顶层 `npm` 被忽略的问题，
+  修正为 `api.npm` 后才通过。
 
-## 已知限制
+未发布 npm、未修改全局 agy MCP 配置。当前只验证了 CLI 登录和直接 HTTP
+请求，没有宣称 GUI、所有客户端或 host 重启场景已经覆盖。
 
-1. **单 Google 账号**:agy 不支持 `AGY_HOME` 环境变量（见 [google-antigravity/antigravity-cli#155](https://github.com/google-antigravity/antigravity-cli/issues/155))，所有进程共享 `~/.gemini/antigravity-cli` 的登录态。
+## 后续工作
 
-2. **不支持图像**:agy 的 stream-json 输入只接受文本 block（见 [agy headless 文档](https://antigravity.google/docs/cli/headless))。
+1. 在 Amp / Claude Code 等真实客户端中验证连续工具调用、请求取消、host 重启
+   和客户端改写 tool_use id 的兼容性。
+2. 如需严格满足 MCP 服务端输入校验要求，引入经过评估的 JSON Schema
+   2020-12 校验方案；不要声称手写 shape check 等同于完整校验。
+3. 支持 live `tool_result` 旁的用户文本，且不能把它误当作工具输出。
+4. 根据真实 CLI 版本兼容性决定是否声明最低 agy 版本。
+5. 完成客户端兼容性验证后再考虑 npm 发布和社区插件 PR。
 
-3. **工具调用体验**:agy 的 "thinking" 在工具调用处被打断（方案 B 的固有限制）。
-
-## 参考资料
-
-### Magpie 内部机制
-
-- **Claude 订阅桥**:[docs/subsystems/claude-subscription-bridge.md](https://github.com/yetone/magpie/blob/main/docs/subsystems/claude-subscription-bridge.md)
-  - 如何启动真实 `claude` 进程
-  - 如何通过 MCP 回调同步工具结果
-  - 会话保持/恢复机制
-
-- **Provider 插件协议**:[docs/subsystems/provider-plugins.md](https://github.com/yetone/magpie/blob/main/docs/subsystems/provider-plugins.md)
-  - `auth` hook 的 `keyless: true` 机制
-  - `fetch` hook 的输入输出格式
-  - 模型列表的 `npm` 字段（`@ai-sdk/anthropic` 表示 Anthropic Messages 协议）
-
-- **插件 host**:[internal/plugin/host.js](https://github.com/yetone/magpie/blob/main/internal/plugin/host.js)
-  - 插件如何启动子进程（`Bun.spawn` 的 guard 机制）
-  - `authorize` 的返回格式：`{type:"success", key}` 或 `{type:"failed", error}`
-
-### agy CLI
-
-- **Headless 模式**:[agy headless 文档](https://antigravity.google/docs/cli/headless)
-  - `--input-format stream-json --output-format stream-json`
-  - 输入：`{"event":"user","message":{"content":"..."}}`
-  - 输出：`init` / `step_update` / `result` 事件
-  - 工具调用：`step_type:"tool"`,`tool_info:{name, parameters, output}`
-
-- **MCP 支持**:[agy MCP 文档](https://antigravity.google/docs/mcp)
-  - agy 是 MCP 客户端
-  - 配置文件：`~/.gemini/antigravity-cli/mcp_config.json`
-  - 支持 stdio 和 HTTP MCP server
-
-### 类似项目
-
-- **[agy-mcp](https://pkg.go.dev/github.com/tphakala/agy-mcp/v2@v2.9.0)**:Go 实现的 agy MCP server 包装器，把 agy 作为 MCP server 暴露给其他 MCP 客户端。**参考其进程管理和 stream-json 解析**。
-
-- **[magpie-community/plugins](https://github.com/magpie-community/plugins)**：社区插件仓库
-  - `packages/grok`：启动 `grok` CLI 做登录/token 刷新（但推理用 HTTP)
-  - `packages/zen-free`：唯一用 `keyless: true` 的例子
-
-## 下一步工作
-
-### 优先级 1：实现方案 B（异步 MCP 透传）
-
-**任务清单**:
-1. [ ] 实现 stdio MCP server(`mcp-server.mjs`)
-   - 支持 `initialize` / `tools/list` / `tools/call`
-   - 用 `@modelcontextprotocol/sdk` 或手写 JSON-RPC
-2. [ ] 修改 `Proc.start()`:
-   - 生成临时 `mcp_config.json`，指向我们的 MCP server
-   - 启动 agy 时设置 `AGY_MCP_CONFIG` 环境变量（或 agy 支持的 flag)
-3. [ ] 实现工具调用转发：
-   - MCP server 收到 `tools/call` → 立即返回占位结果
-   - 同时把调用信息写入 request-scoped state
-4. [ ] 修改 `makeAnthropicStream`:
-   - 从 state 读取工具调用 → 转成 `tool_use` block
-   - 处理 `tool_result` → 渲染成文本发给 agy
-5. [ ] 测试：
-   - 端到端：客户端声明工具 → agy 调用 → 客户端执行 → 结果回传
-   - 并发：多个对话同时调工具
-   - 错误：工具执行失败、agy 进程崩溃
-
-**关键挑战**:
-- MCP server 和 `fetch` 之间的 state 共享（需要用 request ID 关联）
-- agy 的 `mcp_config.json` 位置（可能需要 `--config` flag 或环境变量，需查证）
-- 工具结果的超时处理（客户端可能不返回）
-
-### 优先级 2：修复当前版本的基础问题
-
-用户报告"完全无法使用"，除了 sign-in 问题（已修复）外，可能还有：
-- [ ] 进程启动失败（agy 不在 PATH?)
-- [ ] 协议解析错误（agy 版本差异？)
-- [ ] 流式响应格式问题（magpie 的 Anthropic 解码器兼容性？)
-
-需要用户在真实环境测试，收集错误日志。
-
-### 优先级 3：发布准备
-
-- [ ] 发布到 npm:`npm publish --access public`
-- [ ] 贡献给 [magpie-community/plugins](https://github.com/magpie-community/plugins)（需要遵循其 PR 流程）
-- [ ] 写用户文档（安装、配置、故障排查）
-
-## 联系方式
-
-- 当前开发者：在 magpie 的 Discord / GitHub Issues 找 `DylanLIiii`
-- magpie 作者：yetone(GitHub)
-- agy CLI 问题：[google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli)
-
-## 开发环境
+## 开发命令
 
 ```sh
-# 克隆仓库
 git clone https://github.com/DylanLIiii/opencode-antigravity-bridge
 cd opencode-antigravity-bridge
-
-# 语法检查
 node --check index.mjs
-
-# 烟雾测试(用 fake agy)
+node --check mcp-server.mjs
 node test-smoke.mjs
+npm pack --dry-run
 
-# 本地测试(需要真实 magpie + agy)
+# 真实宿主验证（需要 magpie + 已登录 agy）
 magpie plugin add ./opencode-antigravity-bridge
 ```
 
-## 关键技术债务
-
-1. **方案 B 的 state 管理**：需要设计 request-scoped state 机制，让 MCP server 能把工具调用关联到当前 HTTP 请求的 SSE stream。可能的方案：
-   - 用 `AsyncLocalStorage`(Node.js 原生支持）
-   - 或在 `Proc` 对象上挂 `currentRequest` 字段
-
-2. **agy 的 MCP 配置方式**：需要确认 agy 是否支持：
-   - 命令行 flag 指定 `mcp_config.json` 路径
-   - 环境变量（如 `AGY_MCP_CONFIG`)
-   - 还是必须写 `~/.gemini/antigravity-cli/mcp_config.json`（这会污染用户全局配置）
-
-3. **工具结果的超时**:MCP server 返回"结果将在下一轮提供"后，如果客户端一直不返回结果，agy 会一直等。需要：
-   - 在 agy 侧设置超时（如果 agy 支持）
-   - 或在下一轮请求超时后，主动给 agy 发一个"工具失败"的消息
-
 ---
 
-**文档版本**:2026-10-23
-**当前 commit**: [`e786876`](https://github.com/DylanLIiii/opencode-antigravity-bridge/commit/e786876)
+**复核及文档版本**：2026-10-24

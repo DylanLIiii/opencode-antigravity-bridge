@@ -1,83 +1,53 @@
-// Magpie provider plugin: Antigravity subscription bridged through a real
-// `agy` CLI subprocess.
-//
-// Why: magpie's built-in Antigravity provider impersonates the Antigravity
-// IDE's User-Agent over HTTPS to Google Code Assist. Google flags that as
-// subscription abuse and bans the account. The safe path is the one
-// magpie's Claude subscription bridge already uses: run the real vendor
-// binary and let IT talk to the vendor. This plugin does that for
-// Antigravity by holding one `agy --input-format stream-json
-// --output-format stream-json` process per conversation and translating
-// between Anthropic Messages and agy's stream-json protocol.
-//
-// Scope (intentional):
-//   - Text-only. agy's stream-json input accepts text blocks alone; a
-//     request carrying an image/document/tool_use block is refused with a
-//     400 rather than silently dropped.
-//   - Single account. agy reads exactly one Google sign-in from
-//     ~/.gemini/antigravity-cli (no AGY_HOME env var; see
-//     google-antigravity/antigravity-cli#155). Signing in again replaces
-//     the previous one. The plugin keeps one process pool.
-//   - Client-side tool execution. Client tools are advertised to agy as a
-//     textual "TOOL_CALL <name> <json>" convention (agy has no separate
-//     tool_use input in stream-json). agy's tool calls come back as
-//     Anthropic tool_use blocks for the CLIENT to execute; the client sends
-//     tool_result on the next turn, which the plugin renders back into the
-//     agy conversation as text. agy itself never runs the client's tools:
-//     that would require magpie's internal MCP callback channel, which is
-//     private to the built-in Claude bridge.
-//
-// Process model (mirrors magpie's claudeRoom / subscriptionBridge):
-//   - One agy process per conversation, keyed by a stable hash of the
-//     system prompt, model, and first user message.
-//   - A process is reused across turns of its conversation (via stdio).
-//   - A request arriving while the process is busy gets a 503, not a
-//     silently broken stream.
-//   - A process that errors mid-turn is killed, never reused: agy's stream
-//     position is unrecoverable from the bridge's side.
-//   - Idle processes are reaped after IDLE_MS; the pool is bounded by
-//     MAX_PROCS with LRU eviction.
-
 import { spawn } from "node:child_process"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
 import fs from "node:fs"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+import { fileURLToPath } from "node:url"
 
 const PROVIDER_ID = "antigravity-bridge"
+const MCP_SERVER_NAME = "magpie_bridge"
+const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 const IDLE_MS = 10 * 60 * 1000
 const MAX_PROCS = 4
 const PROC_START_TIMEOUT_MS = 30_000
-const TURN_TIMEOUT_MS = 5 * 60 * 1000
+const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
+const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
 const STDERR_TAIL = 32 * 1024
+const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = 15_000
-
-// ---------------------------------------------------------------------------
-// Fallback model list (used when agy is missing or `agy models` fails)
-// ---------------------------------------------------------------------------
 
 const FALLBACK_MODELS = [
   { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
   { id: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)", effort: "medium" },
+  { id: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)", effort: "low" },
   { id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)", effort: "high" },
   { id: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)", effort: "medium" },
-  { id: "gemini-3.7-flash-high", name: "Gemini 3.7 Flash (High)", effort: "high" },
-  { id: "gemini-3.7-flash-medium", name: "Gemini 3.7 Flash (Medium)", effort: "medium" },
-  { id: "gemini-3.1-pro-high", name: "Gemini 3.1 Pro (High)", effort: "high" },
-  { id: "gemini-3.1-pro-medium", name: "Gemini 3.1 Pro (Medium)", effort: "medium" },
+  { id: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)", effort: "low" },
+  { id: "claude-opus-5-5-high", name: "Claude Opus 5.5 (High)", effort: "high" },
+  { id: "claude-opus-5-5-medium", name: "Claude Opus 5.5 (Medium)", effort: "medium" },
+  { id: "claude-opus-5-5-low", name: "Claude Opus 5.5 (Low)", effort: "low" },
+  { id: "claude-sonnet-5-5-high", name: "Claude Sonnet 5.5 (High)", effort: "high" },
+  { id: "claude-sonnet-5-5-medium", name: "Claude Sonnet 5.5 (Medium)", effort: "medium" },
+  { id: "claude-sonnet-5-5-low", name: "Claude Sonnet 5.5 (Low)", effort: "low" },
+  { id: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)", effort: "medium" },
 ]
 
-// ---------------------------------------------------------------------------
-// agy discovery (negative result is NOT cached: agy may be installed later)
-// ---------------------------------------------------------------------------
+const pool = new Map()
+const allProcs = new Set()
+const sessions = new Map()
+const toolCalls = new Map()
+let cachedAgyPath
+let controlServer
+let controlServerPromise
 
-let cachedAgyPath // string | undefined; absence of the binary is not cached
+function positiveTimeout(value, fallback) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
 
 function findAgy() {
   if (cachedAgyPath) return cachedAgyPath
@@ -93,11 +63,11 @@ function findAgy() {
     "/usr/local/bin/agy",
     "/opt/homebrew/bin/agy",
   )
-  for (const c of candidates) {
+  for (const candidate of candidates) {
     try {
-      fs.accessSync(c, fs.constants.X_OK)
-      cachedAgyPath = c
-      return c
+      fs.accessSync(candidate, fs.constants.X_OK)
+      cachedAgyPath = candidate
+      return candidate
     } catch {}
   }
   return null
@@ -112,7 +82,8 @@ function execOnce(file, args, opts = {}) {
         ...opts,
       })
     } catch (err) {
-      return resolve({ err, stdout: "", stderr: "", code: null, timedOut: false })
+      resolve({ err, stdout: "", stderr: "", code: null, timedOut: false })
+      return
     }
     let stdout = ""
     let stderr = ""
@@ -121,8 +92,8 @@ function execOnce(file, args, opts = {}) {
       timedOut = true
       try { child.kill("SIGKILL") } catch {}
     }, opts.timeoutMs ?? 30_000)
-    child.stdout.on("data", (d) => { stdout += d })
-    child.stderr.on("data", (d) => { stderr += d })
+    child.stdout.on("data", (data) => { stdout += data })
+    child.stderr.on("data", (data) => { stderr += data })
     child.on("error", (err) => {
       clearTimeout(timer)
       resolve({ err, stdout, stderr, code: null, timedOut })
@@ -141,474 +112,957 @@ async function listAgyModels(agyPath) {
   for (const raw of stdout.split("\n")) {
     const line = raw.trim()
     if (!line) continue
-    const m = /^(\S+)\s{2,}(.+)$/.exec(line)
-    if (!m) continue
-    const id = m[1]
-    const name = m[2].trim()
-    const effort = /-(high|medium|low|minimal|xhigh)$/i.exec(id)?.[1]?.toLowerCase()
+    const match = /^(\S+)\s+(.+)$/.exec(line)
+    if (!match) continue
+    const id = match[1]
+    const name = match[2].trim()
+    const effort = /-(high|medium|low|minimal|xhigh|max)$/i.exec(id)?.[1]?.toLowerCase()
     out.push({ id, name, effort })
   }
   return out.length ? out : FALLBACK_MODELS
 }
 
-// ---------------------------------------------------------------------------
-// Process pool
-// ---------------------------------------------------------------------------
+class BusyError extends Error {
+  constructor(message) {
+    super(message)
+    this.statusCode = 503
+  }
+}
+
+class UnsupportedContent extends Error {
+  constructor(what) {
+    super(`agy bridge: ${what} is not supported`)
+    this.statusCode = 400
+  }
+}
+
+class Turn {
+  constructor(proc) {
+    this.proc = proc
+    this.events = []
+    this.waiters = []
+    this.calls = []
+    this.steps = new Map()
+    this.attached = false
+    this.done = false
+    this.finalized = false
+    this.sawTextDelta = false
+    this.cleanupTimer = null
+  }
+
+  attach() {
+    if (this.finalized) throw new BusyError("agy bridge: this response has already completed")
+    if (this.attached) throw new BusyError("agy bridge: this conversation already has an active response")
+    this.attached = true
+  }
+
+  detach() {
+    this.attached = false
+  }
+
+  push(event) {
+    if (this.finalized) return
+    const waiter = this.waiters.shift()
+    if (waiter) waiter.resolve(event)
+    else this.events.push(event)
+  }
+
+  next() {
+    if (this.events.length) return Promise.resolve(this.events.shift())
+    if (this.finalized) return Promise.reject(new Error("agy bridge: response is closed"))
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }))
+  }
+
+  complete(result) {
+    if (this.done) return
+    this.done = true
+    this.push({ type: "result", result })
+  }
+
+  fail(error) {
+    if (this.done || this.finalized) return
+    this.done = true
+    this.push({ type: "error", error })
+    clearTimeout(this.cleanupTimer)
+    this.cleanupTimer = setTimeout(() => {
+      this.proc.abandonTurn(this)
+    }, IDLE_MS)
+    this.cleanupTimer.unref()
+  }
+
+  hasPendingMcp() {
+    return this.calls.some((call) => call.mcpSeen && !call.mcpResponded)
+  }
+}
 
 class Proc {
   constructor(agyPath, convKey, opts) {
     this.agyPath = agyPath
     this.convKey = convKey
     this.model = opts.model
+    this.tools = opts.tools
+    this.toolsSignature = JSON.stringify(opts.tools)
+    this.workDir = opts.workDir
+    this.token = randomUUID()
     this.conversationId = null
     this.child = null
+    this.workspace = null
     this.lastUsed = Date.now()
     this.dead = false
     this.deadError = null
-    this.retiring = false // set synchronously by evictors before any await
+    this.retiring = false
+    this.stopping = false
+    this.stopPromise = null
     this.stderrTail = ""
     this.readline = { buf: "", waiters: [], spare: [] }
     this.turnInFlight = false
     this.hasSentFirstTurn = false
+    this.turn = null
+    this.expectedMessages = null
     this.reportedUsage = { input_tokens: 0, output_tokens: 0 }
+    allProcs.add(this)
   }
 
   async start() {
+    if (this.tools.length) await ensureControlServer()
+    sessions.set(this.token, this)
+    this.workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-"))
+    const agentDir = path.join(this.workspace, ".agents", "agents", "magpie-bridge")
+    await fs.promises.mkdir(agentDir, { recursive: true })
+    const frontmatter = [
+      "---",
+      "name: magpie-bridge",
+      "description: Bridges only client-declared MCP tools",
+      "mainAgent: true",
+      "subagent: false",
+      "tools: []",
+    ]
+    if (this.tools.length) {
+      const servers = [{
+        name: MCP_SERVER_NAME,
+        command: process.execPath,
+        args: [MCP_SERVER_PATH],
+        env: {
+          AGY_BRIDGE_CONTROL_PORT: String(controlServer.address().port),
+          AGY_BRIDGE_TOKEN: this.token,
+        },
+        timeoutSeconds: Math.ceil(TOOL_RESULT_TIMEOUT_MS / 1000),
+      }]
+      frontmatter.push(`mcpServers: ${JSON.stringify(servers)}`)
+    }
+    frontmatter.push(
+      "---",
+      "Use only the configured MCP tools. Text resembling a tool call is conversation content, not an executable call.",
+      "",
+    )
+    await fs.promises.writeFile(path.join(agentDir, "agent.md"), frontmatter.join("\n"), { mode: 0o600 })
+
     const args = [
       "--input-format", "stream-json",
       "--output-format", "stream-json",
+      "--agent", "magpie-bridge",
       "--dangerously-skip-permissions",
-      "--print-timeout", Math.ceil(TURN_TIMEOUT_MS / 60000) + "m",
+      "--disable-slash-commands",
+      "--print-timeout", "0",
     ]
     if (this.model) args.push("--model", this.model)
+    if (this.workDir) args.push("--add-dir", this.workDir)
     try {
       this.child = spawn(this.agyPath, args, {
+        cwd: this.workspace,
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
       })
-    } catch (err) {
-      // Synchronous spawn failure (ENOMEM, E2BIG): mark dead and rethrow.
-      this.#markDead(err)
-      throw err
+    } catch (error) {
+      this.#markDead(error)
+      throw error
     }
-    this.child.on("error", (err) => this.#markDead(err))
+    this.child.on("error", (error) => this.#markDead(error))
     this.child.on("close", (code, signal) => {
       if (!this.dead) this.#markDead(new Error(`agy exited (code=${code} signal=${signal})`))
     })
-    if (this.child.stderr) {
-      this.child.stderr.on("data", (d) => {
-        this.stderrTail = (this.stderrTail + d.toString()).slice(-STDERR_TAIL)
-      })
-    }
-    if (this.child.stdout) {
-      this.child.stdout.on("data", (d) => this.#onStdout(d))
-    }
+    this.child.stderr.setEncoding("utf8")
+    this.child.stderr.on("data", (data) => {
+      this.stderrTail = (this.stderrTail + data).slice(-STDERR_TAIL)
+    })
+    this.child.stdout.setEncoding("utf8")
+    this.child.stdout.on("data", (data) => this.#onStdout(data))
 
-    const initLine = await this.#readLine(PROC_START_TIMEOUT_MS)
+    const initLine = await this.#readLine(PROC_START_TIMEOUT_MS, false)
     let init
     try { init = JSON.parse(initLine) } catch {
       throw new Error("agy's init line is not JSON: " + initLine.slice(0, 200))
     }
-    if (init.event !== "init") {
-      throw new Error(`agy's first event is ${init.event}, not init`)
-    }
+    if (init.event !== "init") throw new Error(`agy's first event is ${init.event}, not init`)
     this.conversationId = init.conversation_id
   }
 
-  #markDead(err) {
-    if (this.dead) return
-    this.dead = true
-    this.deadError = err
-    for (const w of this.readline.waiters.splice(0)) {
-      clearTimeout(w.timer)
-      w.reject(err)
-    }
-  }
-
-  #onStdout(chunk) {
-    this.readline.buf += chunk.toString()
-    for (;;) {
-      const nl = this.readline.buf.indexOf("\n")
-      if (nl < 0) return
-      const line = this.readline.buf.slice(0, nl)
-      this.readline.buf = this.readline.buf.slice(nl + 1)
-      const w = this.readline.waiters.shift()
-      if (w) {
-        clearTimeout(w.timer)
-        w.resolve(line)
-      } else {
-        this.readline.spare.push(line)
-      }
-    }
-  }
-
-  #readLine(timeoutMs) {
-    if (this.readline.spare.length) return Promise.resolve(this.readline.spare.shift())
-    if (this.dead) return Promise.reject(this.deadError)
-    return new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, timer: null }
-      waiter.timer = setTimeout(() => {
-        const i = this.readline.waiters.indexOf(waiter)
-        if (i >= 0) this.readline.waiters.splice(i, 1)
-        reject(new Error(
-          `agy read timeout after ${timeoutMs}ms; stderr tail: ${this.stderrTail.trim() || "(empty)"}`,
-        ))
-      }, timeoutMs)
-      this.readline.waiters.push(waiter)
-    })
-  }
-
-  // sendUserMessage yields each event of one turn. On ANY error the caller
-  // must kill the proc (see makeAnthropicStream's catch): agy's stream
-  // position is unrecoverable, and the spare-lines buffer may hold events
-  // of the dead turn that a next turn would misread as its own.
-  async *sendUserMessage(content) {
+  startTurn(content, messages) {
     if (this.dead) throw this.deadError
-    if (this.retiring) throw new Error("agy bridge: this conversation's process is being retired")
-    if (this.turnInFlight) throw new Error("agy bridge: a turn is already in flight on this conversation")
+    if (this.retiring) throw new BusyError("agy bridge: this conversation's process is being retired")
+    if (this.turn) throw new BusyError("agy bridge: this conversation still has an unfinished response")
+    const turn = new Turn(this)
+    this.turn = turn
+    this.expectedMessages = messages.map((message) => ({ ...message }))
     this.turnInFlight = true
     this.lastUsed = Date.now()
+    this.#runTurn(turn, content).catch(() => {})
+    return turn
+  }
+
+  matchesHistory(messages) {
+    if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
+    const normalize = (value) => {
+      if (Array.isArray(value)) return value.map(normalize)
+      if (value && typeof value === "object") {
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalize(value[key])]))
+      }
+      return value
+    }
+    return JSON.stringify(normalize(this.expectedMessages)) === JSON.stringify(normalize(messages))
+  }
+
+  recordToolResult(turn, message) {
+    if (this.turn === turn && this.expectedMessages) this.expectedMessages.push({ ...message })
+  }
+
+  recordAssistantResponse(turn, content) {
+    if (this.turn === turn && this.expectedMessages) {
+      this.expectedMessages.push({ role: "assistant", content })
+    }
+  }
+
+  async #runTurn(turn, content) {
     try {
-      const msg = JSON.stringify({ event: "user", message: { content } }) + "\n"
+      const message = JSON.stringify({ event: "user", message: { content } }) + "\n"
       if (!this.child?.stdin?.writable) throw new Error("agy's stdin is closed")
-      this.child.stdin.write(msg)
+      this.child.stdin.write(message)
       for (;;) {
-        const line = await this.#readLine(TURN_TIMEOUT_MS)
-        let ev
-        try { ev = JSON.parse(line) } catch { continue }
-        if (ev.event === "result") {
-          yield { type: "result", result: ev.result }
-          return
+        const line = await this.#readLine(TURN_TIMEOUT_MS, true)
+        if (!line.trim()) continue
+        let event
+        try { event = JSON.parse(line) } catch {
+          throw new Error("agy emitted a non-JSON event: " + line.slice(0, 200))
         }
-        if (ev.event === "step_update") {
-          yield { type: "step", step: ev.step_update }
+        if (event.event === "step_update") {
+          const step = event.step_update
+          if (step?.step_type === "agent_response" && typeof step.text_delta === "string" && step.text_delta) {
+            turn.sawTextDelta = true
+            turn.push({ type: "text", text: step.text_delta })
+          } else if (step?.step_type === "tool") {
+            if (step.state === "ACTIVE") this.#registerToolStep(turn, step)
+            if (step.state === "DONE") this.#checkToolStep(turn, step)
+          }
           continue
         }
+        if (event.event === "result") {
+          const result = event.result
+          if (result?.status !== "SUCCESS") {
+            throw new Error(`agy run ${result?.status ?? "UNKNOWN"}: ${result?.error || "(no error message)"}`)
+          }
+          this.hasSentFirstTurn = true
+          turn.complete(result)
+          return
+        }
       }
+    } catch (error) {
+      turn.fail(error)
+      dropFromPool(this)
+      await this.stop().catch(() => {})
     } finally {
       this.turnInFlight = false
       this.lastUsed = Date.now()
     }
   }
 
-  async stop() {
-    if (this.dead && this.child == null) return
-    this.#markDead(new Error("stopped"))
-    if (!this.child) return
-    try { this.child.stdin?.end() } catch {}
-    const alive = () => this.child.exitCode === null && this.child.signalCode === null
-    if (alive()) {
-      const closed = once(this.child, "close").catch(() => {})
-      await Promise.race([closed, new Promise((r) => setTimeout(r, 5_000))])
-      if (alive()) {
-        try { this.child.kill("SIGTERM") } catch {}
-        await new Promise((r) => setTimeout(r, 2_000))
-        if (alive()) {
-          try { this.child.kill("SIGKILL") } catch {}
-        }
+  #registerToolStep(turn, step) {
+    const parameters = step.tool_info?.parameters
+    if (!parameters || parameters.ServerName !== MCP_SERVER_NAME) {
+      throw new Error(`agy bridge: unexpected non-bridge tool ${step.tool_name || "unknown"}`)
+    }
+    const stepIndex = String(step.step_index)
+    let call = turn.steps.get(stepIndex)
+    if (!call) {
+      const candidates = turn.calls.filter((item) => (
+        !item.stepSeen && item.stepIndex == null && item.name === parameters.ToolName &&
+        JSON.stringify(item.arguments) === JSON.stringify(parameters.Arguments ?? {})
+      ))
+      if (candidates.length > 1) {
+        throw new Error(`agy bridge: cannot correlate parallel MCP calls for ${parameters.ToolName}`)
+      }
+      call = candidates[0] || this.#newCall(turn, parameters.ToolName, parameters.Arguments ?? {})
+      call.stepIndex = stepIndex
+      turn.steps.set(stepIndex, call)
+    }
+    if (call.name !== parameters.ToolName || JSON.stringify(call.arguments) !== JSON.stringify(parameters.Arguments ?? {})) {
+      throw new Error(`agy bridge: MCP call does not match tool step ${stepIndex}`)
+    }
+    call.stepSeen = true
+    this.#pairCall(turn, call)
+  }
+
+  #checkToolStep(turn, step) {
+    const parameters = step.tool_info?.parameters
+    if (!parameters || parameters.ServerName !== MCP_SERVER_NAME) return
+    const call = turn.steps.get(String(step.step_index))
+    if (!call?.ready) throw new Error(`agy bridge: MCP tool ${parameters.ToolName} finished without a client handoff`)
+  }
+
+  acceptMcpCall(message, socket) {
+    const turn = this.turn
+    if (!turn || turn.done || turn.finalized) throw new Error("agy bridge: no active turn for MCP call")
+    const name = message.name
+    if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
+    const args = message.arguments ?? {}
+    const token = message.meta?.progressToken
+    const indexed = typeof token === "string" ? /:(\d+)$/.exec(token)?.[1] : null
+    let call
+    if (indexed != null) {
+      call = turn.steps.get(indexed)
+      if (call && (
+        call.name !== name || call.mcpSeen || JSON.stringify(call.arguments) !== JSON.stringify(args)
+      )) {
+        throw new Error("agy bridge: duplicate or mismatched MCP call")
+      }
+    }
+    if (!call && indexed == null) {
+      const candidates = turn.calls.filter((item) => (
+        !item.mcpSeen && item.name === name && JSON.stringify(item.arguments) === JSON.stringify(args)
+      ))
+      if (candidates.length > 1) throw new Error(`agy bridge: ambiguous MCP call ${name}`)
+      call = candidates[0]
+    }
+    if (!call) {
+      call = this.#newCall(turn, name, args)
+      if (indexed != null) {
+        call.stepIndex = indexed
+        turn.steps.set(indexed, call)
+      }
+    }
+    if (call.mcpSeen) throw new Error("agy bridge: duplicate MCP call")
+    call.mcpSeen = true
+    call.socket = socket
+    call.meta = message.meta ?? {}
+    this.#refreshReadTimeouts()
+    this.#pairCall(turn, call)
+    socket.once("close", () => {
+      if (!call.mcpResponded && !this.stopping) {
+        turn.fail(new Error(`agy bridge: MCP helper disconnected during ${name}`))
+        dropFromPool(this)
+        this.stop().catch(() => {})
+      }
+    })
+    return call
+  }
+
+  #newCall(turn, name, args) {
+    const call = {
+      id: null,
+      name,
+      arguments: args,
+      stepIndex: null,
+      stepSeen: false,
+      mcpSeen: false,
+      mcpResponded: false,
+      ready: false,
+      socket: null,
+      result: null,
+    }
+    turn.calls.push(call)
+    return call
+  }
+
+  #pairCall(turn, call) {
+    if (call.ready || !call.stepSeen || !call.mcpSeen || turn.done || turn.finalized) return
+    call.ready = true
+    call.id = "toolu_" + randomUUID().replace(/-/g, "").slice(0, 24)
+    toolCalls.set(call.id, { proc: this, turn, call })
+    turn.push({ type: "tool", call })
+  }
+
+  continueWith(results) {
+    const turn = this.turn
+    if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
+    const unique = new Map()
+    for (const item of results) {
+      const id = item.block.tool_use_id
+      const serialized = JSON.stringify(item.result)
+      const previous = unique.get(id)
+      if ((previous && JSON.stringify(previous.result) !== serialized) ||
+        (item.call.mcpResponded && JSON.stringify(item.call.result) !== serialized)) {
+        const error = new Error(`agy bridge: conflicting duplicate result for ${id}`)
+        error.statusCode = 409
+        throw error
+      }
+      if (!previous) unique.set(id, item)
+    }
+    for (const { call, result } of unique.values()) {
+      if (call.mcpResponded || !call.ready || turn.done) continue
+      call.result = result
+      this.#respondMcp(call, { result })
+      this.#refreshReadTimeouts()
+    }
+    this.lastUsed = Date.now()
+  }
+
+  #respondMcp(call, payload) {
+    if (call.mcpResponded) return
+    call.mcpResponded = true
+    if (call.socket?.writable) call.socket.end(JSON.stringify(payload) + "\n")
+    else call.socket?.destroy()
+  }
+
+  finalizeTurn(turn) {
+    if (turn.finalized) return
+    turn.finalized = true
+    turn.detach()
+    for (const waiter of turn.waiters.splice(0)) {
+      waiter.reject(new Error("agy bridge: response closed"))
+    }
+    clearTimeout(turn.cleanupTimer)
+    for (const call of turn.calls) {
+      if (call.id && toolCalls.get(call.id)?.call === call) toolCalls.delete(call.id)
+      if (call.mcpSeen && !call.mcpResponded) {
+        this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
+      }
+    }
+    if (this.turn === turn) this.turn = null
+  }
+
+  abandonTurn(turn) {
+    this.finalizeTurn(turn)
+  }
+
+  fail(error) {
+    this.turn?.fail(error)
+    dropFromPool(this)
+    return this.stop()
+  }
+
+  #markDead(error) {
+    if (this.dead) return
+    this.dead = true
+    this.deadError = error
+    for (const waiter of this.readline.waiters.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+  }
+
+  #onStdout(chunk) {
+    this.readline.buf += chunk
+    for (;;) {
+      const newline = this.readline.buf.indexOf("\n")
+      if (newline < 0) return
+      const line = this.readline.buf.slice(0, newline)
+      this.readline.buf = this.readline.buf.slice(newline + 1)
+      const waiter = this.readline.waiters.shift()
+      if (waiter) {
+        clearTimeout(waiter.timer)
+        waiter.resolve(line)
+      } else {
+        this.readline.spare.push(line)
       }
     }
   }
+
+  #readLine(timeoutMs, dynamic) {
+    if (this.readline.spare.length) return Promise.resolve(this.readline.spare.shift())
+    if (this.dead) return Promise.reject(this.deadError)
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timeoutMs, dynamic, timer: null }
+      this.readline.waiters.push(waiter)
+      this.#armReadWaiter(waiter)
+    })
+  }
+
+  #armReadWaiter(waiter) {
+    clearTimeout(waiter.timer)
+    const waitingForTools = waiter.dynamic && this.turn?.hasPendingMcp()
+    const timeout = waitingForTools ? TOOL_RESULT_TIMEOUT_MS : waiter.timeoutMs
+    waiter.timer = setTimeout(() => {
+      const index = this.readline.waiters.indexOf(waiter)
+      if (index >= 0) this.readline.waiters.splice(index, 1)
+      const what = waitingForTools ? "waiting for a client tool result" : "reading agy output"
+      waiter.reject(new Error(
+        `agy bridge: timed out ${what} after ${timeout}ms; stderr tail: ${this.stderrTail.trim() || "(empty)"}`,
+      ))
+    }, timeout)
+  }
+
+  #refreshReadTimeouts() {
+    for (const waiter of this.readline.waiters) {
+      if (waiter.dynamic) this.#armReadWaiter(waiter)
+    }
+  }
+
+  stop() {
+    if (this.stopPromise) return this.stopPromise
+    this.stopPromise = this.#stop()
+    return this.stopPromise
+  }
+
+  async #stop() {
+    this.stopping = true
+    this.#markDead(new Error("stopped"))
+    this.turn?.fail(new Error("stopped"))
+    sessions.delete(this.token)
+    if (this.turn) {
+      for (const call of this.turn.calls) {
+        if (call.mcpSeen && !call.mcpResponded) {
+          this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: process stopped" } })
+        }
+      }
+    }
+    const child = this.child
+    if (child) {
+      try { child.stdin?.end() } catch {}
+      const alive = () => child.exitCode === null && child.signalCode === null
+      if (alive()) {
+        const closed = once(child, "close").catch(() => {})
+        await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 5_000))])
+        if (alive()) {
+          try { child.kill("SIGTERM") } catch {}
+          await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 2_000))])
+          if (alive()) {
+            try { child.kill("SIGKILL") } catch {}
+            await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 1_000))])
+          }
+        }
+      }
+    }
+    this.child = null
+    if (this.workspace) {
+      await fs.promises.rm(this.workspace, { recursive: true, force: true }).catch(() => {})
+    }
+    allProcs.delete(this)
+  }
 }
 
-// Pool: Map<convKey, Proc> — single Google account (agy owns the sign-in).
-const pool = new Map()
-
-function dropFromPool(p) {
-  if (pool.get(p.convKey) === p) pool.delete(p.convKey)
+function dropFromPool(proc) {
+  if (pool.get(proc.convKey) === proc) pool.delete(proc.convKey)
 }
 
 async function evictIdle() {
   const cutoff = Date.now() - IDLE_MS
   const victims = []
-  for (const [k, p] of pool) {
-    if (p.retiring) continue
-    if (p.dead || (!p.turnInFlight && p.lastUsed < cutoff)) {
-      p.retiring = true // synchronous with the check: no await in between
-      victims.push([k, p])
+  for (const [key, proc] of pool) {
+    if (proc.retiring) continue
+    if (proc.dead || (!proc.turn && proc.lastUsed < cutoff)) {
+      proc.retiring = true
+      victims.push([key, proc])
     }
   }
-  for (const [k, p] of victims) {
-    if (pool.get(k) === p) pool.delete(k)
-    await p.stop().catch(() => {})
+  for (const [key, proc] of victims) {
+    if (pool.get(key) === proc) pool.delete(key)
+    await proc.stop().catch(() => {})
   }
 }
 
 async function evictLRU() {
   let oldest = null
-  for (const [k, p] of pool) {
-    if (p.turnInFlight || p.retiring) continue
-    if (!oldest || p.lastUsed < oldest.p.lastUsed) oldest = { k, p }
+  for (const [key, proc] of pool) {
+    if (proc.turn || proc.retiring) continue
+    if (!oldest || proc.lastUsed < oldest.proc.lastUsed) oldest = { key, proc }
   }
   if (!oldest) return false
-  oldest.p.retiring = true
-  if (pool.get(oldest.k) === oldest.p) pool.delete(oldest.k)
-  await oldest.p.stop().catch(() => {})
+  oldest.proc.retiring = true
+  dropFromPool(oldest.proc)
+  await oldest.proc.stop().catch(() => {})
   return true
 }
 
 setInterval(() => { evictIdle().catch(() => {}) }, 60_000).unref()
 
-class BusyError extends Error {
-  constructor(msg) { super(msg); this.statusCode = 503 }
+const acquireLocks = new Map()
+
+async function withAcquireLock(key, fn) {
+  const previous = acquireLocks.get(key) || Promise.resolve()
+  let release
+  const current = new Promise((resolve) => { release = resolve })
+  acquireLocks.set(key, current)
+  await previous
+  try {
+    return await fn()
+  } finally {
+    release()
+    if (acquireLocks.get(key) === current) acquireLocks.delete(key)
+  }
 }
 
-async function acquireProc(agyPath, convKey, opts, isFreshConversation) {
-  await evictIdle()
-  const existing = pool.get(convKey)
-  if (existing && !existing.dead && !existing.retiring) {
-    // Model is fixed at spawn; a model switch mid-conversation respawns.
-    if (existing.model === opts.model) {
-      // A "fresh" conversation (single message) finding a proc that already
-      // ran a turn proves a key collision: two different conversations that
-      // start alike. Don't join the old one — fall through to a suffix key.
-      if (!(isFreshConversation && existing.hasSentFirstTurn)) {
-        if (existing.turnInFlight) {
-          throw new BusyError("agy bridge: this conversation's agy process is busy with a turn; send the next turn when this one ends")
-        }
-        return existing
+async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
+  return withAcquireLock(convKey, async () => {
+    await evictIdle()
+    const existing = pool.get(convKey)
+    if (existing) {
+      if (!existing.dead && existing.turn) {
+        throw new BusyError("agy bridge: this conversation still has an unfinished response")
+      }
+      const compatible = !forceNew && !existing.dead && !existing.retiring &&
+        existing.model === opts.model && existing.toolsSignature === JSON.stringify(opts.tools) &&
+        existing.workDir === opts.workDir && existing.matchesHistory(opts.history)
+      if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) return existing
+      existing.retiring = true
+      dropFromPool(existing)
+      await existing.stop().catch(() => {})
+    }
+    while (allProcs.size >= MAX_PROCS) {
+      if (!(await evictLRU())) {
+        throw new BusyError(`agy bridge: ${MAX_PROCS} agy processes are running and all have unfinished responses`)
       }
     }
-    existing.retiring = true
-    dropFromPool(existing)
-    await existing.stop().catch(() => {})
-  } else if (existing) {
-    dropFromPool(existing)
-    await existing.stop().catch(() => {})
-  }
-  while (pool.size >= MAX_PROCS) {
-    if (!(await evictLRU())) {
-      throw new BusyError(
-        `agy bridge: ${MAX_PROCS} agy processes are running and all are busy; try again in a moment`,
-      )
+    const proc = new Proc(agyPath, convKey, opts)
+    try {
+      await proc.start()
+    } catch (error) {
+      await proc.stop().catch(() => {})
+      throw error
     }
-  }
-  const p = new Proc(agyPath, convKey, opts)
-  try {
-    await p.start()
-  } catch (e) {
-    await p.stop().catch(() => {})
-    throw e
-  }
-  pool.set(convKey, p)
-  return p
+    pool.set(convKey, proc)
+    return proc
+  })
 }
-
-// ---------------------------------------------------------------------------
-// Conversation key: stable across turns of one conversation, distinct for
-// conversations that merely start alike (via the model and, when present,
-// the client's metadata user id).
-// ---------------------------------------------------------------------------
 
 function conversationKey(body, model) {
-  const sys = typeof body.system === "string" ? body.system : JSON.stringify(body.system || "")
+  const system = typeof body.system === "string" ? body.system : JSON.stringify(body.system || "")
   const first = body.messages?.[0]
   const firstText = first ? JSON.stringify(first.content) : ""
-  const discrim = body.metadata?.user_id || ""
-  const s = model + "\n" + discrim + "\n" + sys + "\n===\n" + firstText
-  // FNV-1a over the full string (no truncation).
-  let h = 0x811c9dc5
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-  return (h >>> 0).toString(36)
+  const discriminator = body.metadata?.user_id || ""
+  const source = model + "\n" + discriminator + "\n" + system + "\n===\n" + firstText
+  return createHash("sha256").update(source).digest("hex")
 }
 
-// ---------------------------------------------------------------------------
-// Anthropic Messages → agy content
-// ---------------------------------------------------------------------------
-
-class UnsupportedContent extends Error {
-  constructor(what) {
-    super(`agy bridge: ${what} is not supported by agy's stream-json input (text only)`)
-    this.statusCode = 400
+function normalizeTools(body) {
+  if (!Array.isArray(body.tools) || !body.tools.length) return []
+  const choice = body.tool_choice
+  if (choice === "none" || choice?.type === "none") return []
+  const selected = choice?.type === "tool" ? choice.name : null
+  const seen = new Set()
+  const tools = []
+  for (const tool of body.tools) {
+    if (!tool || typeof tool.name !== "string" || !tool.name) {
+      throw new UnsupportedContent("a tool without a valid name")
+    }
+    if (seen.has(tool.name)) throw new UnsupportedContent(`duplicate tool ${tool.name}`)
+    seen.add(tool.name)
+    if (selected && tool.name !== selected) continue
+    const inputSchema = tool.input_schema ?? { type: "object", properties: {} }
+    if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
+      throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
+    }
+    tools.push({
+      name: tool.name,
+      description: typeof tool.description === "string" ? tool.description : "",
+      inputSchema,
+    })
   }
+  if (selected && !tools.length) throw new UnsupportedContent(`tool_choice names undeclared tool ${selected}`)
+  return tools
 }
 
 function blockText(block) {
   if (typeof block === "string") return block
-  if (!block || typeof block !== "object") throw new UnsupportedContent("a non-object content block")
-  if (block.type === "text") return block.text || ""
+  if (!block || typeof block !== "object" || Array.isArray(block)) {
+    throw new UnsupportedContent("a non-object content block")
+  }
+  if (block.type === "text") return typeof block.text === "string" ? block.text : ""
   if (block.type === "tool_result") {
-    const inner = Array.isArray(block.content) ? block.content.map(blockText).join("") : String(block.content ?? "")
+    const inner = Array.isArray(block.content)
+      ? block.content.map((part) => {
+        if (part?.type === "image") return "[image returned by tool]"
+        return blockText(part)
+      }).join("")
+      : String(block.content ?? "")
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
   }
   if (block.type === "image" || block.type === "document") {
-    throw new UnsupportedContent(`an image/document block`)
+    throw new UnsupportedContent("an image/document block in stream-json input")
   }
-  if (block.type === "tool_use") {
-    throw new UnsupportedContent(`a tool_use block in a user message`)
-  }
+  if (block.type === "tool_use") throw new UnsupportedContent("a tool_use block in a user message")
   throw new UnsupportedContent(`a content block of type ${JSON.stringify(block.type)}`)
 }
 
-function messageText(msg) {
-  if (typeof msg.content === "string") return msg.content
-  if (Array.isArray(msg.content)) return msg.content.map(blockText).join("")
-  return String(msg.content ?? "")
+function messageText(message) {
+  if (typeof message.content === "string") return message.content
+  if (Array.isArray(message.content)) return message.content.map(blockText).join("")
+  return String(message.content ?? "")
 }
 
-function renderAssistantTurn(msg) {
+function renderAssistantTurn(message) {
   const parts = []
-  const blocks = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: String(msg.content ?? "") }]
+  const blocks = Array.isArray(message.content)
+    ? message.content
+    : [{ type: "text", text: String(message.content ?? "") }]
   for (const block of blocks) {
-    if (block.type === "text") parts.push(block.text)
+    if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
-      parts.push(`TOOL_CALL ${block.name} ${JSON.stringify(block.input)}`)
+      parts.push(`[tool call ${block.name} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`)
     }
   }
   return parts.join("\n")
 }
 
 function renderInitialPrompt(body) {
-  const msgs = body.messages || []
-  if (msgs.length === 0) throw new Error("agy bridge: request has no messages")
-  const last = msgs[msgs.length - 1]
-  if (last.role !== "user") throw new Error("agy bridge: last message is not a user message")
-  const history = msgs.slice(0, -1)
+  const messages = body.messages || []
+  const last = messages[messages.length - 1]
+  const history = messages.slice(0, -1)
   const out = []
   if (body.system) {
-    const sysText = typeof body.system === "string"
+    const systemText = typeof body.system === "string"
       ? body.system
-      : body.system.map((b) => b.text || "").join("")
-    if (sysText.trim()) {
-      out.push(`<external_system_instructions>\n${sysText}\n</external_system_instructions>\n`)
-    }
+      : body.system.map((block) => block.text || "").join("")
+    if (systemText.trim()) out.push(`<external_system_instructions>\n${systemText}\n</external_system_instructions>\n`)
   }
-  if (body.tools?.length) out.push(renderToolPreamble(body.tools))
   if (history.length) {
     out.push("<conversation_history>\n")
-    for (const m of history) {
-      if (m.role === "user") out.push(`Human: ${messageText(m)}\n`)
-      else if (m.role === "assistant") out.push(`Assistant: ${renderAssistantTurn(m)}\n`)
+    for (const message of history) {
+      if (message.role === "user") out.push(`Human: ${messageText(message)}\n`)
+      else if (message.role === "assistant") out.push(`Assistant: ${renderAssistantTurn(message)}\n`)
     }
+    out.push("Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
     out.push("</conversation_history>\n\n")
   }
-  out.push("<current_turn>\n")
-  out.push(messageText(last))
-  out.push("\n</current_turn>")
+  out.push("<current_turn>\n", messageText(last), "\n</current_turn>")
   return out.join("")
 }
 
 function renderContinuedTurn(body) {
-  const last = body.messages[body.messages.length - 1]
-  if (last.role !== "user") throw new Error("agy bridge: last message is not a user message")
-  // Re-send the tool preamble every turn: the client's tool list may have
-  // changed since the turn the proc started on, and agy keeps no separate
-  // tool registry we could update.
-  const preamble = body.tools?.length ? renderToolPreamble(body.tools) + "\n" : ""
-  return preamble + messageText(last)
+  return messageText(body.messages[body.messages.length - 1])
 }
 
-function renderToolPreamble(tools) {
-  const lines = []
-  lines.push("You may call these tools by name. To call one, output a single line of the form:")
-  lines.push("")
-  lines.push("TOOL_CALL <name> <json-arguments>")
-  lines.push("")
-  lines.push("and nothing else on that line. Available tools:")
-  for (const t of tools) {
-    const schema = t.input_schema ? ` ${JSON.stringify(t.input_schema)}` : ""
-    lines.push(`- ${t.name}: ${t.description || "(no description)"}${schema}`)
+function validateBody(body) {
+  if (!Array.isArray(body?.messages) || !body.messages.length) {
+    throw new UnsupportedContent("a request without messages")
   }
-  lines.push("")
-  return lines.join("\n")
+  if (body.messages[body.messages.length - 1]?.role !== "user") {
+    throw new UnsupportedContent("a request whose last message is not from the user")
+  }
+  if (body.system && typeof body.system !== "string") {
+    if (!Array.isArray(body.system) || body.system.some((block) => block?.type !== "text")) {
+      throw new UnsupportedContent("a non-text system prompt")
+    }
+  }
+  for (const message of body.messages) {
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (["text", "tool_use", "thinking", "redacted_thinking"].includes(block?.type)) continue
+        throw new UnsupportedContent(`an assistant content block of type ${JSON.stringify(block?.type)}`)
+      }
+    } else if (message.role === "user") {
+      if (Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (block?.type === "tool_result") toolResult(block)
+          else if (block?.type === "text" || typeof block === "string") continue
+          else blockText(block)
+        }
+      } else if (typeof message.content !== "string") {
+        messageText(message)
+      }
+    }
+  }
 }
 
-// ---------------------------------------------------------------------------
-// agy events → Anthropic SSE
-// ---------------------------------------------------------------------------
+function toolResult(block) {
+  if (!block || typeof block.tool_use_id !== "string" || !block.tool_use_id) {
+    throw new UnsupportedContent("a tool_result without tool_use_id")
+  }
+  let content
+  if (typeof block.content === "string") {
+    content = [{ type: "text", text: block.content }]
+  } else if (Array.isArray(block.content)) {
+    content = block.content.map((part) => {
+      if (part?.type === "text" && typeof part.text === "string") return { type: "text", text: part.text }
+      if (part?.type === "image" && part.source?.type === "base64" && part.source.data) {
+        return {
+          type: "image",
+          data: part.source.data,
+          mimeType: part.source.media_type || "application/octet-stream",
+        }
+      }
+      throw new UnsupportedContent("this tool_result content")
+    })
+  } else if (block.content == null) {
+    content = [{ type: "text", text: "" }]
+  } else {
+    throw new UnsupportedContent("non-text tool_result content")
+  }
+  return { content, isError: block.is_error === true }
+}
+
+function extractToolResults(body) {
+  const content = body.messages[body.messages.length - 1]?.content
+  if (!Array.isArray(content)) return []
+  return content.filter((block) => block?.type === "tool_result")
+}
+
+function hasTextBesideResults(body) {
+  const content = body.messages[body.messages.length - 1]?.content
+  return Array.isArray(content) && content.some((block) => block?.type !== "tool_result")
+}
+
+function workDirectory(init) {
+  const raw = new Headers(init.headers || {}).get("x-magpie-work-dir")
+  if (!raw) return null
+  let decoded = raw
+  try { decoded = decodeURIComponent(raw) } catch {}
+  try {
+    if (fs.statSync(decoded).isDirectory()) return path.resolve(decoded)
+  } catch {}
+  return null
+}
+
+function ensureControlServer() {
+  if (controlServerPromise) return controlServerPromise
+  controlServerPromise = new Promise((resolve, reject) => {
+    const server = net.createServer((socket) => handleControlConnection(socket))
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", () => {
+      controlServer = server
+      server.unref()
+      resolve(server.address().port)
+    })
+  })
+  return controlServerPromise
+}
+
+function tokenMatches(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false
+  const a = createHash("sha256").update(left).digest()
+  const b = createHash("sha256").update(right).digest()
+  return timingSafeEqual(a, b)
+}
+
+function handleControlConnection(socket) {
+  socket.setEncoding("utf8")
+  let buffer = ""
+  let handled = false
+  socket.on("data", (data) => {
+    if (handled) return
+    buffer += data
+    if (buffer.length > CONTROL_LINE_LIMIT) {
+      socket.destroy()
+      return
+    }
+    const newline = buffer.indexOf("\n")
+    if (newline < 0) return
+    handled = true
+    let message
+    try { message = JSON.parse(buffer.slice(0, newline)) } catch {
+      socket.end(JSON.stringify({ error: { code: -32700, message: "invalid control JSON" } }) + "\n")
+      return
+    }
+    const proc = sessions.get(message.token)
+    if (!proc || !tokenMatches(message.token, proc.token)) {
+      socket.end(JSON.stringify({ error: { code: -32603, message: "invalid or expired bridge session" } }) + "\n")
+      return
+    }
+    try {
+      if (message.kind === "list") {
+        socket.end(JSON.stringify({ result: { tools: proc.tools } }) + "\n")
+        return
+      }
+      if (message.kind === "call") {
+        proc.acceptMcpCall(message, socket)
+        return
+      }
+      socket.end(JSON.stringify({ error: { code: -32601, message: "unknown control request" } }) + "\n")
+    } catch (error) {
+      socket.end(JSON.stringify({ error: { code: -32603, message: String(error?.message ?? error) } }) + "\n")
+    }
+  })
+  socket.on("error", () => {})
+}
 
 function sseEvent(event, data) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
-// Leading whitespace is tolerated (models often indent inside code blocks),
-// and a line whose JSON doesn't parse is passed through as text rather than
-// turned into a tool call with empty arguments.
-const TOOL_CALL_LINE = /^\s*TOOL_CALL\s+(\S+)\s+(\{.*\})\s*$/
-
-function makeAnthropicStream(proc, body, msgId) {
+function makeAnthropicStream(proc, turn, body, msgId, signal) {
   const encoder = new TextEncoder()
+  const responseContent = []
+  let responseText = ""
   let blockIndex = 0
   let textBlockOpen = false
-  let pendingText = ""
-  let anyContentSent = false
   let pingTimer = null
+  let finished = false
+  let abortHandler = null
 
   return new ReadableStream({
     async start(controller) {
       const send = (event, data) => controller.enqueue(encoder.encode(sseEvent(event, data)))
-
-      const openTextBlock = () => {
-        if (textBlockOpen) return
-        send("content_block_start", {
-          type: "content_block_start",
-          index: blockIndex,
-          content_block: { type: "text", text: "" },
-        })
-        textBlockOpen = true
-        anyContentSent = true
-      }
-      const flushPendingAsText = () => {
-        if (!pendingText) return
-        send("content_block_delta", {
-          type: "content_block_delta",
-          index: blockIndex,
-          delta: { type: "text_delta", text: pendingText },
-        })
-        pendingText = ""
-      }
       const closeTextBlock = () => {
         if (!textBlockOpen) return
-        flushPendingAsText()
+        responseContent.push({ type: "text", text: responseText })
+        responseText = ""
         send("content_block_stop", { type: "content_block_stop", index: blockIndex })
         blockIndex++
         textBlockOpen = false
       }
-      const emitToolUse = (name, input) => {
+      const emitText = (text) => {
+        if (!text) return
+        if (!textBlockOpen) {
+          send("content_block_start", {
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "text", text: "" },
+          })
+          textBlockOpen = true
+        }
+        responseText += text
+        send("content_block_delta", {
+          type: "content_block_delta",
+          index: blockIndex,
+          delta: { type: "text_delta", text },
+        })
+      }
+      const emitToolUse = (call) => {
         closeTextBlock()
-        const id = "toolu_" + randomUUID().replace(/-/g, "").slice(0, 24)
         send("content_block_start", {
           type: "content_block_start",
           index: blockIndex,
-          content_block: { type: "tool_use", id, name, input: {} },
+          content_block: { type: "tool_use", id: call.id, name: call.name, input: {} },
         })
         send("content_block_delta", {
           type: "content_block_delta",
           index: blockIndex,
-          delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(call.arguments) },
         })
         send("content_block_stop", { type: "content_block_stop", index: blockIndex })
         blockIndex++
-        anyContentSent = true
+        responseContent.push({ type: "tool_use", id: call.id, name: call.name, input: call.arguments })
       }
-
-      // Refuse a busy proc BEFORE message_start goes out: an error thrown
-      // here becomes a clean HTTP error to the caller, not a truncated
-      // 200 stream.
-      if (proc.dead) { controller.error(proc.deadError); return }
-      if (proc.retiring || proc.turnInFlight) {
-        controller.error(new BusyError("agy bridge: conversation busy"))
+      const detach = () => {
+        finished = true
+        turn.detach()
+        if (pingTimer) clearInterval(pingTimer)
+        pingTimer = null
+        if (signal && abortHandler) signal.removeEventListener("abort", abortHandler)
+        abortHandler = null
+      }
+      const stopMessage = (stopReason, usage) => {
+        send("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage,
+        })
+        send("message_stop", { type: "message_stop" })
+      }
+      const abort = () => {
+        if (finished) return
+        detach()
+        dropFromPool(proc)
+        proc.abandonTurn(turn)
+        proc.stop().catch(() => {})
+        try { controller.error(signal?.reason || new Error("request aborted")) } catch {}
+      }
+      abortHandler = abort
+      signal?.addEventListener("abort", abort, { once: true })
+      if (signal?.aborted) {
+        abort()
         return
       }
 
-      // Render BEFORE sending message_start: rendering throws
-      // UnsupportedContent (400) for images etc., and that must surface as
-      // an HTTP error, not a broken stream.
-      let userContent
-      try {
-        userContent = proc.hasSentFirstTurn ? renderContinuedTurn(body) : renderInitialPrompt(body)
-      } catch (e) {
-        controller.error(e)
-        return
-      }
-
-      let finalUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }
-      let stopReason = "end_turn"
-      let sawToolUse = false
-
+      const emptyUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }
       try {
         send("message_start", {
           type: "message_start",
@@ -623,154 +1077,131 @@ function makeAnthropicStream(proc, body, msgId) {
             usage: { input_tokens: 0, output_tokens: 0 },
           },
         })
-        // Keepalive for long time-to-first-token.
         pingTimer = setInterval(() => {
           try { send("ping", { type: "ping" }) } catch {}
         }, PING_INTERVAL_MS)
 
-        for await (const ev of proc.sendUserMessage(userContent)) {
-          if (ev.type === "step") {
-            const s = ev.step
-            if (s.step_type === "agent_response" && typeof s.text_delta === "string") {
-              openTextBlock()
-              pendingText += s.text_delta
-              for (;;) {
-                const nl = pendingText.indexOf("\n")
-                if (nl < 0) break
-                const line = pendingText.slice(0, nl)
-                const m = TOOL_CALL_LINE.exec(line)
-                let input
-                if (m) {
-                  try { input = JSON.parse(m[2]) } catch { input = undefined }
-                }
-                if (m && input !== undefined) {
-                  flushPendingAsText()
-                  closeTextBlock()
-                  emitToolUse(m[1], input)
-                  sawToolUse = true
-                  pendingText = pendingText.slice(nl + 1)
-                } else {
-                  send("content_block_delta", {
-                    type: "content_block_delta",
-                    index: blockIndex,
-                    delta: { type: "text_delta", text: line + "\n" },
-                  })
-                  pendingText = pendingText.slice(nl + 1)
-                }
-              }
-            }
-            // step_type "tool" steps are agy's OWN tools; they are not the
-            // client's and are deliberately not surfaced in the reply.
+        for (;;) {
+          const event = await turn.next()
+          if (finished) return
+          if (event.type === "text") {
+            emitText(event.text)
             continue
           }
-          if (ev.type === "result") {
-            const r = ev.result
-            if (r.status !== "SUCCESS") {
-              throw new Error(`agy run ${r.status}: ${r.error || "(no error message)"}`)
-            }
-            // agy's result.usage is CUMULATIVE over the session; report only
-            // this turn's delta.
-            if (r.usage) {
-              const cum = translateUsage(r.usage)
-              finalUsage = {
-                input_tokens: Math.max(0, cum.input_tokens - proc.reportedUsage.input_tokens),
-                output_tokens: Math.max(0, cum.output_tokens - proc.reportedUsage.output_tokens),
-                cache_read_input_tokens: cum.cache_read_input_tokens,
+          if (event.type === "tool") {
+            emitToolUse(event.call)
+            closeTextBlock()
+            stopMessage("tool_use", emptyUsage)
+            proc.recordAssistantResponse(turn, responseContent)
+            detach()
+            controller.close()
+            return
+          }
+          if (event.type === "result") {
+            let usage = emptyUsage
+            if (event.result.usage) {
+              const cumulative = translateUsage(event.result.usage)
+              usage = {
+                input_tokens: Math.max(0, cumulative.input_tokens - proc.reportedUsage.input_tokens),
+                output_tokens: Math.max(0, cumulative.output_tokens - proc.reportedUsage.output_tokens),
+                cache_read_input_tokens: cumulative.cache_read_input_tokens,
               }
-              proc.reportedUsage = { input_tokens: cum.input_tokens, output_tokens: cum.output_tokens }
+              proc.reportedUsage = {
+                input_tokens: cumulative.input_tokens,
+                output_tokens: cumulative.output_tokens,
+              }
             }
-            // Fallback: if agy batched the whole turn into result.response
-            // (no text_deltas), use it.
-            if (!anyContentSent && typeof r.response === "string" && r.response) {
-              pendingText = r.response
-            }
-            if (pendingText || textBlockOpen) {
-              openTextBlock()
-              flushPendingAsText()
-              closeTextBlock()
-            }
-            if (sawToolUse) stopReason = "tool_use"
+            if (!turn.sawTextDelta && typeof event.result.response === "string") emitText(event.result.response)
+            closeTextBlock()
+            stopMessage("end_turn", usage)
+            proc.recordAssistantResponse(turn, responseContent)
+            proc.finalizeTurn(turn)
+            detach()
+            controller.close()
+            return
+          }
+          if (event.type === "error") {
+            closeTextBlock()
+            send("error", {
+              type: "error",
+              error: { type: "api_error", message: String(event.error?.message ?? event.error) },
+            })
+            dropFromPool(proc)
+            await proc.stop().catch(() => {})
+            if (finished) return
+            proc.finalizeTurn(turn)
+            detach()
+            controller.close()
+            return
           }
         }
-
-        // Mark only after the turn completed without throwing.
-        proc.hasSentFirstTurn = true
-
-        send("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: {
-            input_tokens: finalUsage.input_tokens,
-            output_tokens: finalUsage.output_tokens,
-            cache_read_input_tokens: finalUsage.cache_read_input_tokens,
-          },
-        })
-        send("message_stop", { type: "message_stop" })
-        controller.close()
-      } catch (err) {
-        // A failed turn leaves agy's stream position unknown: kill the proc
-        // so the next request starts fresh (history is replayed on a new
-        // proc's first turn by renderInitialPrompt).
+      } catch (error) {
+        if (finished) return
+        turn.fail(error)
         dropFromPool(proc)
         await proc.stop().catch(() => {})
-        // Stop the keepalive BEFORE emitting the terminal error frame, so a
-        // ping can't land after it.
-        if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
-        // If bytes already went out, the HTTP status is fixed at 200; the
-        // only way to signal failure downstream is an explicit SSE error
-        // frame, then close. If nothing went out yet, error the stream so
-        // the caller gets an HTTP failure.
+        if (finished) return
         try {
           closeTextBlock()
           send("error", {
             type: "error",
-            error: { type: "api_error", message: String(err?.message ?? err) },
+            error: { type: "api_error", message: String(error?.message ?? error) },
           })
+          proc.finalizeTurn(turn)
+          detach()
           controller.close()
         } catch {
-          try { controller.error(err) } catch {}
+          proc.finalizeTurn(turn)
+          detach()
+          try { controller.error(error) } catch {}
         }
-      } finally {
-        if (pingTimer) clearInterval(pingTimer)
       }
     },
     async cancel() {
+      if (finished) return
+      finished = true
+      turn.detach()
       if (pingTimer) clearInterval(pingTimer)
+      pingTimer = null
+      if (signal && abortHandler) signal.removeEventListener("abort", abortHandler)
+      abortHandler = null
       dropFromPool(proc)
+      proc.abandonTurn(turn)
       await proc.stop().catch(() => {})
     },
   })
 }
 
-function translateUsage(u) {
+function translateUsage(usage) {
   return {
-    input_tokens: u.input_tokens ?? 0,
-    output_tokens: u.output_tokens ?? 0,
-    cache_read_input_tokens: u.cache_read_tokens ?? 0,
+    input_tokens: usage.input_tokens ?? 0,
+    output_tokens: usage.output_tokens ?? 0,
+    cache_read_input_tokens: usage.cache_read_tokens ?? 0,
   }
 }
 
-// ---------------------------------------------------------------------------
-// The plugin
-// ---------------------------------------------------------------------------
+function streamResponse(proc, turn, body, signal) {
+  turn.attach()
+  const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
+  const stream = makeAnthropicStream(proc, turn, body, msgId, signal)
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  })
+}
 
-export const AntigravityBridgePlugin = async (input, options) => {
+export const AntigravityBridgePlugin = async () => {
   return {
     auth: {
       provider: PROVIDER_ID,
+      single: true,
       methods: [
         {
           type: "api",
-          // keyless tells magpie's UI to skip the API-key field entirely:
-          // the user just clicks "Sign in" and authorize() runs. agy owns
-          // the real Google sign-in; this method only verifies that agy is
-          // installed and signed in.
-          //
-          // The host expects authorize() to return {type:"success", key?}
-          // (or {type:"failed", error}); returning anything else — such as
-          // OpenCode's {type:"api"} — is treated as a failed sign-in. The
-          // key we supply is a placeholder: agy's own credential cache is
-          // what the spawned processes actually use.
           keyless: true,
           label: "Sign in with the agy CLI",
           authorize: async () => {
@@ -778,11 +1209,9 @@ export const AntigravityBridgePlugin = async (input, options) => {
             if (!agy) {
               return {
                 type: "failed",
-                error:
-                  "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
+                error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
               }
             }
-            // `agy models` fails fast when signed out and costs no quota.
             const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
             if (probe.err || probe.code !== 0 || !probe.stdout.trim()) {
               const why = probe.timedOut
@@ -797,60 +1226,104 @@ export const AntigravityBridgePlugin = async (input, options) => {
           },
         },
       ],
-      loader: async (getAuth) => {
+      loader: async () => {
         return {
           baseURL: "agy://local",
           apiKey: "agy",
           fetch: async (fetchInput, init) => {
             const agy = findAgy()
             if (!agy) return jsonError(503, "agy CLI not found on this machine")
-
             let body
             try {
               const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
               body = JSON.parse(raw)
-            } catch (e) {
-              return jsonError(400, "agy bridge: request body is not JSON: " + e.message)
+              validateBody(body)
+            } catch (error) {
+              return jsonError(error.statusCode ?? 400, error.message)
             }
 
             const rawModel = body.model || ""
             const model = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel
-
+            body = { ...body, model }
             const convKey = conversationKey(body, model)
-            const isFresh = (body.messages?.length ?? 0) <= 1
-            let proc
-            try {
-              proc = await acquireProc(agy, convKey, { model }, isFresh)
-            } catch (e) {
-              return jsonError(e.statusCode ?? 503, e.message)
-            }
+            const isFresh = body.messages.length <= 1
+            const resultBlocks = extractToolResults(body)
+            const workDir = workDirectory(init)
 
-            const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
-            const stream = makeAnthropicStream(proc, { ...body, model }, msgId)
-            return new Response(stream, {
-              status: 200,
-              headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-              },
-            })
+            try {
+              if (resultBlocks.length) {
+                const matches = resultBlocks.map((block) => ({ block, match: toolCalls.get(block.tool_use_id) }))
+                const found = matches.filter((item) => item.match)
+                if (found.length) {
+                  if (found.length !== matches.length) {
+                    return jsonError(409, "agy bridge: some tool results do not belong to the active response")
+                  }
+                  const proc = found[0].match.proc
+                  const turn = found[0].match.turn
+                  if (found.some((item) => item.match.proc !== proc || item.match.turn !== turn)) {
+                    return jsonError(409, "agy bridge: tool results from different conversations cannot be combined")
+                  }
+                  if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
+                  if (!proc.matchesHistory(body.messages.slice(0, -1))) {
+                    return jsonError(409, "agy bridge: conversation history changed before these tool results")
+                  }
+                  if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
+                  if (hasTextBesideResults(body)) {
+                    throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+                  }
+                  const results = matches.map(({ block, match }) => ({
+                    block,
+                    call: match.call,
+                    result: toolResult(block),
+                  }))
+                  if (!proc.dead && !turn.done) {
+                    proc.continueWith(results)
+                    proc.recordToolResult(turn, body.messages[body.messages.length - 1])
+                  } else {
+                    for (const { block, call, result } of results) {
+                      if (call.result && JSON.stringify(call.result) !== JSON.stringify(result)) {
+                        return jsonError(409, `agy bridge: conflicting duplicate result for ${block.tool_use_id}`)
+                      }
+                    }
+                  }
+                  return streamResponse(proc, turn, body, init.signal)
+                }
+                if (pool.get(convKey)?.turn) {
+                  return jsonError(409, "agy bridge: no active MCP call matches these tool results")
+                }
+              }
+
+              const tools = normalizeTools(body)
+              const proc = await acquireProc(
+                agy,
+                convKey,
+                { model, tools, workDir, history: body.messages.slice(0, -1) },
+                isFresh,
+                resultBlocks.length > 0,
+              )
+              const content = proc.hasSentFirstTurn ? renderContinuedTurn(body) : renderInitialPrompt(body)
+              const turn = proc.startTurn(content, body.messages)
+              return streamResponse(proc, turn, body, init.signal)
+            } catch (error) {
+              return jsonError(error.statusCode ?? 502, error.message)
+            }
           },
         }
       },
     },
-
     provider: {
       id: PROVIDER_ID,
+      npm: NPM_ANTHROPIC,
       models: async () => {
         const agy = findAgy()
         const list = agy ? await listAgyModels(agy) : FALLBACK_MODELS
         const out = {}
-        for (const m of list) {
-          out[m.id] = {
-            id: m.id,
-            name: m.name,
+        for (const model of list) {
+          out[model.id] = {
+            id: model.id,
+            name: model.name,
             npm: NPM_ANTHROPIC,
+            api: { id: model.id, url: "agy://local", npm: NPM_ANTHROPIC },
           }
         }
         return out
@@ -863,10 +1336,19 @@ function jsonError(status, message) {
   return new Response(
     JSON.stringify({
       type: "error",
-      error: { type: status === 400 ? "invalid_request_error" : "api_error", message },
+      error: { type: status === 400 ? "invalid_request_error" : "api_error", message: String(message || "unknown error") },
     }),
     { status, headers: { "Content-Type": "application/json" } },
   )
 }
+
+process.once("exit", () => {
+  for (const proc of allProcs) {
+    try { proc.child?.kill("SIGKILL") } catch {}
+    if (proc.workspace) {
+      try { fs.rmSync(proc.workspace, { recursive: true, force: true }) } catch {}
+    }
+  }
+})
 
 export default { id: PROVIDER_ID, server: AntigravityBridgePlugin }

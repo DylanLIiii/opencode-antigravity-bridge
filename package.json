@@ -6,6 +6,7 @@
   "main": "./index.mjs",
   "files": [
     "index.mjs",
+    "mcp-server.mjs",
     "README.md"
   ],
   "keywords": [

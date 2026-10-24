@@ -1,0 +1,344 @@
+import net from "node:net"
+
+const PROTOCOL_VERSION = "2026-07-28"
+const SERVER_INFO = { name: "magpie-antigravity-bridge", version: "0.1.0" }
+const CAPABILITIES = { tools: { listChanged: false } }
+const MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+const CONTROL_PORT = Number(process.env.AGY_BRIDGE_CONTROL_PORT)
+const CONTROL_TOKEN = process.env.AGY_BRIDGE_TOKEN
+const CONTROL_CONFIGURED = Number.isInteger(CONTROL_PORT)
+  && CONTROL_PORT >= 1
+  && CONTROL_PORT <= 65535
+  && typeof CONTROL_TOKEN === "string"
+  && CONTROL_TOKEN.length > 0
+
+const activeControls = new Set()
+const pendingCalls = new Map()
+let inputChunks = []
+let inputLength = 0
+let discardingInput = false
+let inputClosed = false
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function isValidId(value) {
+  return value === null
+    || typeof value === "string"
+    || (typeof value === "number" && Number.isFinite(value))
+}
+
+function internalError(message = "Internal error") {
+  return { code: -32603, message }
+}
+
+function closeAllControls() {
+  for (const request of [...activeControls]) request.cancel()
+}
+
+function closeInput() {
+  if (inputClosed) return
+  inputClosed = true
+  inputChunks = []
+  inputLength = 0
+  closeAllControls()
+}
+
+function handleStdoutError(error) {
+  closeInput()
+  process.exit(error?.code === "EPIPE" ? 0 : 1)
+}
+
+function send(message) {
+  if (inputClosed) return
+  try {
+    process.stdout.write(JSON.stringify(message) + "\n")
+  } catch (error) {
+    handleStdoutError(error)
+  }
+}
+
+function sendResult(id, result) {
+  send({ jsonrpc: "2.0", id, result })
+}
+
+function sendError(id, error) {
+  send({ jsonrpc: "2.0", id, error })
+}
+
+function configurationError() {
+  return internalError("Bridge control channel is not configured")
+}
+
+function controlRequest(payload) {
+  const request = {
+    socket: null,
+    cancelled: false,
+    settled: false,
+    cancel: () => {},
+    promise: null,
+  }
+
+  request.promise = new Promise(resolve => {
+    const failure = () => ({ error: internalError("Bridge control channel failure") })
+    const finish = outcome => {
+      if (request.settled) return
+      request.settled = true
+      activeControls.delete(request)
+      request.socket?.destroy()
+      resolve(outcome)
+    }
+
+    request.cancel = () => {
+      if (request.settled) return
+      request.cancelled = true
+      finish(failure())
+    }
+
+    activeControls.add(request)
+
+    let socket
+    try {
+      socket = net.createConnection({ host: "127.0.0.1", port: CONTROL_PORT })
+    } catch {
+      finish(failure())
+      return
+    }
+
+    request.socket = socket
+    socket.setEncoding("utf8")
+    let buffer = ""
+
+    socket.on("connect", () => {
+      try {
+        socket.write(JSON.stringify(payload) + "\n")
+      } catch {
+        finish(failure())
+      }
+    })
+
+    socket.on("data", chunk => {
+      if (request.settled) return
+      buffer += chunk
+      const newline = buffer.indexOf("\n")
+      if (newline < 0) return
+      let line = buffer.slice(0, newline)
+      if (line.endsWith("\r")) line = line.slice(0, -1)
+
+      let response
+      try {
+        response = JSON.parse(line)
+      } catch {
+        finish(failure())
+        return
+      }
+
+      if (!isObject(response)) {
+        finish(failure())
+        return
+      }
+
+      if (Object.hasOwn(response, "error")) {
+        const error = response.error
+        if (!isObject(error) || typeof error.code !== "number" || typeof error.message !== "string") {
+          finish(failure())
+          return
+        }
+        finish({ error })
+        return
+      }
+
+      if (!Object.hasOwn(response, "result")) {
+        finish(failure())
+        return
+      }
+
+      finish({ result: response.result })
+    })
+
+    socket.on("error", () => finish(failure()))
+    socket.on("close", () => finish(failure()))
+  })
+
+  return request
+}
+
+function cancelCall(params) {
+  if (!isObject(params) || !Object.hasOwn(params, "requestId")) return
+  const request = pendingCalls.get(params.requestId)
+  if (!request) return
+  pendingCalls.delete(params.requestId)
+  request.cancel()
+}
+
+async function listTools(message, hasId) {
+  if (!CONTROL_CONFIGURED) {
+    if (hasId) sendError(message.id, configurationError())
+    return
+  }
+
+  const request = controlRequest({ token: CONTROL_TOKEN, kind: "list" })
+  const outcome = await request.promise
+  if (inputClosed || !hasId) return
+  if (outcome.error) sendError(message.id, outcome.error)
+  else sendResult(message.id, outcome.result)
+}
+
+async function callTool(message, hasId) {
+  const params = message.params
+  if (!isObject(params)
+    || typeof params.name !== "string"
+    || params.name.length === 0
+    || (params.arguments !== undefined && !isObject(params.arguments))) {
+    if (hasId) sendError(message.id, { code: -32602, message: "Invalid params" })
+    return
+  }
+
+  if (!CONTROL_CONFIGURED) {
+    if (hasId) sendError(message.id, configurationError())
+    return
+  }
+
+  if (hasId && pendingCalls.has(message.id)) {
+    sendError(message.id, { code: -32600, message: "Duplicate request id" })
+    return
+  }
+
+  const request = controlRequest({
+    token: CONTROL_TOKEN,
+    kind: "call",
+    name: params.name,
+    arguments: params.arguments === undefined ? {} : params.arguments,
+    meta: params._meta || {},
+  })
+  if (hasId) pendingCalls.set(message.id, request)
+
+  try {
+    const outcome = await request.promise
+    if (inputClosed || request.cancelled || !hasId) return
+    if (outcome.error) sendError(message.id, outcome.error)
+    else sendResult(message.id, outcome.result)
+  } finally {
+    if (hasId && pendingCalls.get(message.id) === request) pendingCalls.delete(message.id)
+  }
+}
+
+async function handleMessage(message) {
+  const hasId = Object.hasOwn(message, "id")
+
+  switch (message.method) {
+    case "server/discover":
+      if (hasId) {
+        sendResult(message.id, {
+          supportedVersions: [PROTOCOL_VERSION],
+          capabilities: CAPABILITIES,
+          _meta: { "io.modelcontextprotocol/serverInfo": SERVER_INFO },
+        })
+      }
+      return
+    case "initialize": {
+      if (!hasId) return
+      const requestedVersion = isObject(message.params) && typeof message.params.protocolVersion === "string"
+        ? message.params.protocolVersion
+        : PROTOCOL_VERSION
+      sendResult(message.id, {
+        protocolVersion: requestedVersion,
+        capabilities: CAPABILITIES,
+        serverInfo: SERVER_INFO,
+      })
+      return
+    }
+    case "notifications/initialized":
+      return
+    case "notifications/cancelled":
+      cancelCall(message.params)
+      return
+    case "ping":
+      if (hasId) sendResult(message.id, {})
+      return
+    case "tools/list":
+      await listTools(message, hasId)
+      return
+    case "tools/call":
+      await callTool(message, hasId)
+      return
+    default:
+      if (hasId) sendError(message.id, { code: -32601, message: "Method not found" })
+  }
+}
+
+function dispatch(message) {
+  handleMessage(message).catch(() => {
+    if (Object.hasOwn(message, "id")) sendError(message.id, internalError())
+  })
+}
+
+function handleLine(line) {
+  if (line.length > 0 && line[line.length - 1] === 13) line = line.subarray(0, -1)
+  if (line.length === 0) return
+
+  const text = line.toString("utf8")
+  if (text.trim().length === 0) return
+
+  let message
+  try {
+    message = JSON.parse(text)
+  } catch {
+    sendError(null, { code: -32700, message: "Parse error" })
+    return
+  }
+
+  if (!isObject(message)
+    || message.jsonrpc !== "2.0"
+    || typeof message.method !== "string"
+    || (Object.hasOwn(message, "id") && !isValidId(message.id))) {
+    sendError(null, { code: -32600, message: "Invalid Request" })
+    return
+  }
+
+  dispatch(message)
+}
+
+function handleInput(chunk) {
+  let start = 0
+
+  while (start < chunk.length) {
+    const newline = chunk.indexOf(10, start)
+    const end = newline < 0 ? chunk.length : newline
+
+    if (!discardingInput && end > start) {
+      const piece = chunk.subarray(start, end)
+      if (inputLength + piece.length > MAX_MESSAGE_BYTES) {
+        inputChunks = []
+        inputLength = 0
+        discardingInput = true
+        sendError(null, { code: -32600, message: "Invalid Request: message exceeds 16 MiB" })
+      } else {
+        inputChunks.push(piece)
+        inputLength += piece.length
+      }
+    }
+
+    if (newline < 0) return
+
+    if (!discardingInput) {
+      const line = inputChunks.length === 1
+        ? inputChunks[0]
+        : Buffer.concat(inputChunks, inputLength)
+      inputChunks = []
+      inputLength = 0
+      handleLine(line)
+    } else {
+      discardingInput = false
+    }
+
+    start = newline + 1
+  }
+}
+
+process.stdin.on("data", handleInput)
+process.stdin.on("end", closeInput)
+process.stdin.on("close", closeInput)
+process.stdin.on("error", closeInput)
+process.stdout.on("error", handleStdoutError)

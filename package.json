@@ -13,12 +13,14 @@
     "opencode",
     "opencode-plugin",
     "magpie",
+    "magpie-plugin",
     "antigravity",
     "agy",
     "gemini"
   ],
   "license": "MIT",
   "magpie": {
+    "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
     "maxConcurrency": 4
   },
   "engines": {

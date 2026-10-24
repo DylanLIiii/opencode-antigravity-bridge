@@ -30,7 +30,7 @@ let cumulative = { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_
 const pending = new Map()
 
 if (process.argv.includes("models")) {
-  process.stdout.write("gemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
+  process.stdout.write("gemini-test-medium\tGemini Test (Medium)\ngemini-test-high\tGemini Test (High)\ngemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
   process.exit(0)
 }
 
@@ -68,7 +68,8 @@ async function setup() {
     const listed = await mcpRequest("tools/list", meta)
     tools = listed.tools
   }
-  log({ type: "init", pid: process.pid, convId, cwd: process.cwd(), tools })
+  const modelFlag = process.argv.indexOf("--model")
+  log({ type: "init", pid: process.pid, convId, cwd: process.cwd(), model: modelFlag < 0 ? "" : process.argv[modelFlag + 1], tools })
   send({ event: "init", conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: "always-proceed" } })
 }
 
@@ -308,13 +309,35 @@ const echoTool = {
     additionalProperties: false,
   },
 }
-const model = "antigravity-bridge/gemini-test-low"
+const model = "antigravity-bridge/gemini-test"
+const legacyModel = "antigravity-bridge/gemini-test-low"
 
 {
   const models = await plugin.provider.models()
-  check("dynamic models accept tab-separated agy output", !!models["gemini-test-low"])
+  check("dynamic models accept tab-separated agy output", !!models["gemini-test"])
   check("dynamic models do not fall back to stale list", !models["gemini-3.7-flash-high"])
-  check("models declare Anthropic through OpenCode api.npm", models["gemini-test-low"]?.api?.npm === "@ai-sdk/anthropic")
+  check("models declare Anthropic through OpenCode api.npm", models["gemini-test"]?.api?.npm === "@ai-sdk/anthropic")
+  check("effort variants collapse into one model", !models["gemini-test-low"] && !models["gemini-test-medium"] && !models["gemini-test-high"])
+  check("grouped model has a level-free display name", models["gemini-test"]?.name === "Gemini Test")
+  check("grouped model declares sorted variants", Object.keys(models["gemini-test"]?.variants || {}).join(",") === "low,medium,high")
+  check("grouped model declares Magpie and OpenCode reasoning", models["gemini-test"]?.capabilities?.reasoning === true && models["gemini-test"]?.reasoning === true)
+  check("single-effort models stay ungrouped", models["claude-test-medium"]?.name === "Claude Test (Medium)" && !models["claude-test-medium"]?.variants)
+}
+
+async function launchedModel(body) {
+  const response = await callFetch(body)
+  await readSSE(response)
+  return logs().filter(event => event.type === "init").at(-1)?.model
+}
+
+{
+  check("grouped model defaults to high", await launchedModel({ model, messages: [{ role: "user", content: "MODEL default effort" }] }) === "gemini-test-high")
+  check("thinking budget selects the matching agy model", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL low effort" }] }) === "gemini-test-low")
+  check("output effort selects the matching agy model", await launchedModel({ model, thinking: { type: "adaptive" }, output_config: { effort: "medium" }, messages: [{ role: "user", content: "MODEL medium effort" }] }) === "gemini-test-medium")
+  check("high thinking budget selects high", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 24000 }, messages: [{ role: "user", content: "MODEL high effort" }] }) === "gemini-test-high")
+  check("output effort without thinking keeps the default", await launchedModel({ model, output_config: { effort: "low" }, messages: [{ role: "user", content: "MODEL title request" }] }) === "gemini-test-high")
+  check("legacy effort ids pass through unchanged", await launchedModel({ model: legacyModel, thinking: { type: "enabled", budget_tokens: 10000 }, messages: [{ role: "user", content: "MODEL legacy id" }] }) === "gemini-test-low")
+  check("single-effort model requests pass through unchanged", await launchedModel({ model: "antigravity-bridge/claude-test-medium", thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL singleton" }] }) === "claude-test-medium")
 }
 
 {
@@ -323,6 +346,7 @@ const model = "antigravity-bridge/gemini-test-low"
   const { events } = await readSSE(response)
   const kinds = events.map(event => event.event)
   check("has message_start", kinds.includes("message_start"))
+  check("response preserves the grouped model id", events.find(event => event.event === "message_start")?.data?.message?.model === "gemini-test")
   check("has content_block_delta", kinds.includes("content_block_delta"))
   check("has message_delta", kinds.includes("message_delta"))
   check("has message_stop", kinds.includes("message_stop"))

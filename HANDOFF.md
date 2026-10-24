@@ -133,7 +133,7 @@ Chat 风格。现在 provider 和模型都补全 OpenCode 的 `api: {id, url, np
 ## 关键文件
 
 - `index.mjs`：插件入口、进程池、turn 状态、控制通道、Anthropic SSE、
-  Anthropic 内容转换及模型发现。
+  Anthropic 内容转换、模型发现及思考等级聚合与路由。
 - `mcp-server.mjs`：无外部依赖的 stdio JSON-RPC helper，支持 modern/legacy
   MCP、并发 pending 调用、取消和断线处理。
 - `test-smoke.mjs`：fake agy + 真实 MCP helper 的端到端烟雾测试。
@@ -147,10 +147,10 @@ Chat 风格。现在 provider 和模型都补全 OpenCode 的 `api: {id, url, np
 
 - `node --check index.mjs`、`node --check mcp-server.mjs`、
   `node --check test-smoke.mjs` 通过；
-- `node test-smoke.mjs`：**52 项全部通过**，覆盖原生工具闭环、并行/连续
+- `node test-smoke.mjs`：**65 项全部通过**，覆盖原生工具闭环、并行/连续
   调用、真实结果、原子化批量结果校验、相同开场会话隔离、同时启动、UTF-8
-  分块、工具错误、崩溃、超时、取消、临时目录清理、动态模型、`api.npm`
-  协议声明和真实 HTTP 400；
+  分块、工具错误、崩溃、超时、取消、临时目录清理、动态模型、思考等级聚合
+  与真实 agy ID 路由、旧完整模型 ID 兼容、`api.npm` 协议声明和真实 HTTP 400；
 - 真实 `agy 1.3.3` 协议探针确认了工作区自定义 agent、modern MCP 握手及
   pending `tools/call` 会阻塞原回合；
 - 通过插件 `loader.fetch` 对真实 agy 验证了无工具纯文本（`BRIDGE_PLAIN_OK`）

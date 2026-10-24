@@ -46,7 +46,9 @@ magpie plugin add ./opencode-antigravity-bridge
 1. Run `agy` interactively once and sign in to your Google account.
 2. In magpie, choose Providers → Antigravity Bridge → Sign in. This verifies
    the CLI with `agy models`; agy owns the actual Google credentials.
-3. Pick a model reported by `agy models` and talk to the agent as usual.
+3. Pick a model and, when offered, a thinking level. Effort-specific IDs from
+   `agy models` are grouped into one model with variants, then mapped back to
+   the corresponding agy ID for each request.
 
 ## What works
 
@@ -103,12 +105,13 @@ node test-smoke.mjs
 npm pack --dry-run
 ```
 
-The smoke test uses a fake agy process and the real stdio MCP helper. Its 52
+The smoke test uses a fake agy process and the real stdio MCP helper. Its 65
 checks cover normal streaming, process reuse, same-opening conversation
 isolation, native tool round-trips, parallel/consecutive calls, atomic result
 validation, tool failures, simultaneous startup, process death, timeouts,
 cancellation, tool-list changes, UTF-8 chunk boundaries, workspace cleanup,
-dynamic model parsing, protocol declaration, and HTTP 400 behavior.
+dynamic model parsing, model-family aggregation, effort routing, legacy model
+IDs, protocol declaration, and HTTP 400 behavior.
 
 The plugin was also installed into **Magpie 0.1.1356** with its real Bun host.
 CLI keyless sign-in passed, and direct requests to the gateway's

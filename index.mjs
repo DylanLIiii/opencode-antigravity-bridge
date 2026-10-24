@@ -122,6 +122,100 @@ async function listAgyModels(agyPath) {
   return out.length ? out : FALLBACK_MODELS
 }
 
+const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
+let cachedModelCatalog
+
+function modelFamilyId(model) {
+  if (!model.effort) return ""
+  return model.id.slice(0, -(model.effort.length + 1))
+}
+
+function buildModelCatalog(list) {
+  const rawIds = new Set(list.map(model => model.id))
+  const families = new Map()
+  for (const model of list) {
+    const id = modelFamilyId(model)
+    if (!id) continue
+    if (!families.has(id)) families.set(id, [])
+    families.get(id).push(model)
+  }
+  for (const [id, variants] of families) {
+    const efforts = new Set(variants.map(model => model.effort))
+    if (variants.length < 2 || efforts.size !== variants.length || rawIds.has(id)) {
+      families.delete(id)
+    }
+  }
+
+  const models = []
+  const routes = new Map()
+  const added = new Set()
+  for (const model of list) {
+    const id = modelFamilyId(model)
+    const family = families.get(id)
+    if (!family) {
+      models.push(model)
+      continue
+    }
+    if (added.has(id)) continue
+    added.add(id)
+    const sorted = [...family].sort((a, b) => EFFORT_ORDER.indexOf(a.effort) - EFFORT_ORDER.indexOf(b.effort))
+    const efforts = sorted.map(variant => variant.effort)
+    const byEffort = new Map(sorted.map(variant => [variant.effort, variant.id]))
+    const defaultEffort = byEffort.has("high") ? "high" : efforts[efforts.length - 1]
+    const defaultModel = sorted.find(variant => variant.effort === defaultEffort)
+    const baseName = defaultModel.name.replace(/\s+\((?:minimal|low|medium|high|xhigh|max)\)$/i, "").trim()
+    models.push({
+      id,
+      name: baseName && baseName !== defaultModel.id ? baseName : id,
+      variants: efforts,
+    })
+    routes.set(id, { byEffort, efforts, defaultEffort })
+  }
+  return { models, routes }
+}
+
+async function loadModelCatalog(agyPath, refresh = false) {
+  if (!refresh && cachedModelCatalog?.agyPath === agyPath) return cachedModelCatalog.catalog
+  const catalog = buildModelCatalog(await listAgyModels(agyPath))
+  cachedModelCatalog = { agyPath, catalog }
+  return catalog
+}
+
+function requestedEffort(body) {
+  const thinking = body.thinking?.type
+  if (thinking !== "enabled" && thinking !== "adaptive") return ""
+  const direct = String(body.output_config?.effort || "").toLowerCase()
+  if (direct === "ultra") return "max"
+  if (EFFORT_ORDER.includes(direct)) return direct
+  const budget = Number(body.thinking?.budget_tokens)
+  if (!Number.isFinite(budget) || budget <= 0) return ""
+  if (budget <= 4096) return "low"
+  if (budget <= 12000) return "medium"
+  if (budget <= 24000) return "high"
+  return "xhigh"
+}
+
+function closestEffort(effort, efforts) {
+  const target = EFFORT_ORDER.indexOf(effort)
+  let best = efforts[0]
+  for (const candidate of efforts.slice(1)) {
+    const distance = Math.abs(EFFORT_ORDER.indexOf(candidate) - target)
+    const bestDistance = Math.abs(EFFORT_ORDER.indexOf(best) - target)
+    if (distance < bestDistance || distance === bestDistance && EFFORT_ORDER.indexOf(candidate) > EFFORT_ORDER.indexOf(best)) {
+      best = candidate
+    }
+  }
+  return best
+}
+
+function resolveAgyModel(catalog, model, body) {
+  const family = catalog.routes.get(model)
+  if (!family) return model
+  const requested = requestedEffort(body)
+  const effort = requested ? closestEffort(requested, family.efforts) : family.defaultEffort
+  return family.byEffort.get(effort)
+}
+
 class BusyError extends Error {
   constructor(message) {
     super(message)
@@ -1243,8 +1337,9 @@ export const AntigravityBridgePlugin = async () => {
             }
 
             const rawModel = body.model || ""
-            const model = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel
-            body = { ...body, model }
+            const requestedModel = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel
+            body = { ...body, model: requestedModel }
+            const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const convKey = conversationKey(body, model)
             const isFresh = body.messages.length <= 1
             const resultBlocks = extractToolResults(body)
@@ -1316,14 +1411,19 @@ export const AntigravityBridgePlugin = async () => {
       npm: NPM_ANTHROPIC,
       models: async () => {
         const agy = findAgy()
-        const list = agy ? await listAgyModels(agy) : FALLBACK_MODELS
+        const catalog = agy ? await loadModelCatalog(agy, true) : buildModelCatalog(FALLBACK_MODELS)
         const out = {}
-        for (const model of list) {
+        for (const model of catalog.models) {
           out[model.id] = {
             id: model.id,
             name: model.name,
             npm: NPM_ANTHROPIC,
             api: { id: model.id, url: "agy://local", npm: NPM_ANTHROPIC },
+            ...(model.variants ? {
+              reasoning: true,
+              capabilities: { reasoning: true },
+              variants: Object.fromEntries(model.variants.map(effort => [effort, {}])),
+            } : {}),
           }
         }
         return out

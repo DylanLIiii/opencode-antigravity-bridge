@@ -65,12 +65,23 @@ magpie plugin add ./opencode-antigravity-bridge
   `TOOL_CALL` convention is used.
 - **Token usage reporting**, converted from agy's session-cumulative usage to
   per-turn deltas.
+- **Client-compatible continuation**: cache markers, string/block text,
+  split assistant messages and outer text whitespace do not invalidate a turn.
+  Client-renamed tool IDs are matched only when history, tool names and arguments
+  identify one pending response. Actual history edits/compaction with known call
+  IDs retire the old process and replay the current history and real results.
+- **Background task notifications** beside tool results, including trailing
+  user/system/developer messages, reach MCP inside a separate `system-reminder`.
+  Recognized hook/token-count notices are not treated as user messages.
 - **Conversation pooling**: at most four agy processes, ten-minute idle
   reaping, LRU eviction, and HTTP 503 for conflicting concurrent responses.
 - **Isolated tool configuration**: a custom agent with `tools: []` and only
   the client-declared MCP server. Unexpected non-bridge tool steps fail the
-  turn instead of being silently executed. The client's working directory is
-  added with `--add-dir` when magpie supplies it.
+  turn instead of being silently executed. An available absolute client directory
+  from `x-magpie-work-dir` or the caller's environment text is added with
+  `--add-dir`. agy still starts in its isolated agent workspace; the prompt
+  identifies the caller's environment as the place where client tools execute,
+  including when the client is on another machine.
 - **Actual HTTP 400 errors** for unsupported request content detected before
   streaming starts.
 
@@ -84,9 +95,14 @@ its arguments and authorize the operation.
 - **User images and documents** are rejected with HTTP 400 because agy's
   stream-json input accepts text blocks only. Base64 images returned inside a
   `tool_result` are passed through as MCP image content.
-- **Text beside a live `tool_result`** is rejected with HTTP 400. Send that
-  text after the tool continuation completes rather than misattributing it to
-  the tool output.
+- **User instructions beside a live `tool_result`** are still rejected with
+  HTTP 400. Task notifications and recognized hook/token-count notices are
+  supported, but agy's mid-turn user-message queue has not been verified.
+  Send user instructions after the tool continuation completes.
+- **Ambiguous or unrecognized rewritten tool IDs** are not guessed. Ambiguous
+  matches return 503; unrecognized results that conflict with a pending pooled
+  conversation return 409. Conflicting duplicates and mixed-conversation result
+  batches also remain 409 errors.
 - **One Google account.** agy owns one sign-in, and the magpie provider is
   declared as a single-account provider.
 - **No automatic agy installation** and no support guarantee for CLI protocol
@@ -105,18 +121,45 @@ node test-smoke.mjs
 npm pack --dry-run
 ```
 
-The smoke test uses a fake agy process and the real stdio MCP helper. Its 65
-checks cover normal streaming, process reuse, same-opening conversation
-isolation, native tool round-trips, parallel/consecutive calls, atomic result
-validation, tool failures, simultaneous startup, process death, timeouts,
-cancellation, tool-list changes, UTF-8 chunk boundaries, workspace cleanup,
-dynamic model parsing, model-family aggregation, effort routing, legacy model
-IDs, protocol declaration, and HTTP 400 behavior.
+The smoke test uses a fake agy process and the real stdio MCP helper. Its 106
+checks pass under both Node and Bun. They cover streaming, process reuse,
+conversation isolation, native tool round-trips, parallel/consecutive calls,
+atomic result validation, failures, startup, death, timeouts, cancellation,
+model/tool changes, UTF-8, cleanup, model discovery/effort routing, protocol
+selection, HTTP errors, reformatted histories, renamed tool IDs (including
+ambiguity and changed arguments), compaction replay, task notifications and
+local/remote caller environments.
 
 The plugin was also installed into **Magpie 0.1.1356** with its real Bun host.
 CLI keyless sign-in passed, and direct requests to the gateway's
 `/v1/messages` verified both a plain-text response and a native
 `tool_use → tool_result → end_turn` round-trip using agy 1.3.3.
+
+## Official Claude Bridge alignment (2026-10-26)
+
+Compared against [Magpie's source at e5dd869](https://github.com/yetone/magpie/tree/e5dd86965b56a8a176790e2c1ade09f9ef554208),
+whose latest reachable release tag was `v0.1.1566`:
+
+- Content-based continuation, safe tool-ID remapping and replay on changed
+  history follow the official bridge's `match`, `remap`, `follows` and
+  `serveSubscription` approach. This plugin retains stricter checks on tool
+  arguments and internal text whitespace.
+- [Background task notices](https://github.com/yetone/magpie/commit/9a2106220c6d89708db158048ac2b7ebbb5ef082)
+  are forwarded as reminders alongside real results. User mid-turn instructions
+  still need agy-specific queue support.
+- [Caller environment clarification](https://github.com/yetone/magpie/commit/13f9c7fca11b8ccb2aa7fb1b397e26d4f7b3bc3a)
+  and directory recognition are adapted. Unlike Claude Code, agy must keep its
+  isolated workspace to discover the restricted custom agent; this plugin uses
+  `--add-dir` instead of moving the process into the caller's directory.
+- Claude's named-account transition, `--json-schema` workaround, and
+  memory-budget eviction with on-disk session resume are Claude-specific and
+  are not implemented here. MCP input schemas remain intact. Live tool-list
+  changes rebuild/replay instead of using Claude's dynamic registration.
+
+The continuation/environment changes above have been checked with fake agy and
+real MCP under Node and Bun, **not yet with a real Mac Mini, agy account or the
+latest Magpie host**. The earlier real-host verification described above does
+not cover these new changes.
 
 ## License
 

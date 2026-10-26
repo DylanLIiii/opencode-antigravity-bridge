@@ -1,5 +1,40 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-10-26：工具续接修复与官方对齐（工作区修改）
+
+用户报告 `agy bridge: conversation history changed before these tool results`。
+旧实现对包含插件生成的 assistant 回复在内的完整 JSON 做严格比较，仅忽略对象
+key 顺序。已复现：客户端增加 cache_control、转换 string/text blocks、拆分回复、
+裁去末尾换行时返回 409；改写 tool ID 或压缩历史也无法正确续接。没有用户原始
+请求，因此不能断言这次 Mac Mini 报错具体是哪一个字段变化。
+
+当前改动：
+
+- 按内容比较历史，忽略传输元数据，合并连续同角色/文本块，保留工具参数、结果
+  和文本内部空白；工具 ID 按调用位置比较。
+- ID 不变时直接定位调用；客户端改写 ID 时只接受历史、名称、参数和顺序唯一
+  匹配的 pending response。歧义不猜测；不同会话混合结果及冲突重复仍拒绝。
+- 已知调用的真实历史或模型/工具/目录变化时关闭旧进程，重放当前历史和实际
+  工具结果，不再因该变化返回原来的 409；接续成功后保存客户端实际历史。
+- 支持结果旁及随后 user/system/developer 消息里的 task-notification，放入
+  MCP 结果的独立 system-reminder。普通用户插话依旧 400，尚未验证 agy 队列语义。
+- 识别 header 或调用方环境文字中的目录，存在的绝对目录使用 --add-dir；提示
+  模型工具在调用方环境执行。继续使用隔离 agent 工作区，不写用户项目配置。
+
+对照了 Magpie `e5dd86965b56a8a176790e2c1ade09f9ef554208`（最近可达 tag
+`v0.1.1566`）的 match/remap/follows/serveSubscription，以及 10 月 24 日任务
+通知、10 月 26 日调用方目录/环境相关提交。Claude 专用的多账户命名转换、
+--json-schema 修复、内存预算与落盘 session resume 未照搬；MCP schema 不删字段。
+详细来源和仍有差异的行为见 README 的 Official Claude Bridge alignment。
+
+验证：旧代码加回归场景出现 5 个失败断言；修复后 Node 和 Bun 分别运行
+`test-smoke.mjs`，**106 checks 全部通过**，三个 mjs 的语法检查通过。当前 orb
+没有真实 agy/Magpie；以下旧记录中的真实 agy 1.3.3 / Magpie 0.1.1356 验证不涵盖
+本次修改。本次未提交、推送、发布或更新用户 Mac Mini 的安装。
+
+以下是 2026-10-24 的实现背景与历史验证记录；涉及严格历史比较、通知支持和
+测试数量的旧描述以上文为准。
+
 ## 项目目标
 
 为 [magpie](https://github.com/yetone/magpie) 提供 npm provider 插件，把

@@ -406,18 +406,11 @@ class Proc {
 
   matchesHistory(messages) {
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    const normalize = (value) => {
-      if (Array.isArray(value)) return value.map(normalize)
-      if (value && typeof value === "object") {
-        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalize(value[key])]))
-      }
-      return value
-    }
-    return JSON.stringify(normalize(this.expectedMessages)) === JSON.stringify(normalize(messages))
+    return historyKey(this.expectedMessages) === historyKey(messages)
   }
 
-  recordToolResult(turn, message) {
-    if (this.turn === turn && this.expectedMessages) this.expectedMessages.push({ ...message })
+  recordToolResults(turn, messages) {
+    if (this.turn === turn) this.expectedMessages = messages.map((message) => ({ ...message }))
   }
 
   recordAssistantResponse(turn, content) {
@@ -574,23 +567,27 @@ class Proc {
     turn.push({ type: "tool", call })
   }
 
-  continueWith(results) {
-    const turn = this.turn
-    if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
+  validateResults(results) {
     const unique = new Map()
     for (const item of results) {
       const id = item.block.tool_use_id
       const serialized = JSON.stringify(item.result)
       const previous = unique.get(id)
       if ((previous && JSON.stringify(previous.result) !== serialized) ||
-        (item.call.mcpResponded && JSON.stringify(item.call.result) !== serialized)) {
+        (item.call.result && JSON.stringify(item.call.result) !== serialized)) {
         const error = new Error(`agy bridge: conflicting duplicate result for ${id}`)
         error.statusCode = 409
         throw error
       }
       if (!previous) unique.set(id, item)
     }
-    for (const { call, result } of unique.values()) {
+    return unique
+  }
+
+  continueWith(results) {
+    const turn = this.turn
+    if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
+    for (const { call, result } of this.validateResults(results).values()) {
       if (call.mcpResponded || !call.ready || turn.done) continue
       call.result = result
       this.#respondMcp(call, { result })
@@ -817,10 +814,88 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   })
 }
 
+function stableJSON(value) {
+  return JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]))
+    : item)
+}
+
+// Compare conversation content, not transport metadata or client-assigned IDs.
+// Keep argument values, result contents and internal whitespace significant.
+function historyKey(messages) {
+  const rows = []
+  const ids = new Map()
+  for (const message of messages) {
+    const blocks = Array.isArray(message.content) ? message.content : [{ type: "text", text: message.content ?? "" }]
+    for (const block of blocks) {
+      if (block.type === "thinking" || block.type === "redacted_thinking") continue
+      let value
+      if (typeof block === "string" || block.type === "text") {
+        value = { type: "text", text: typeof block === "string" ? block : block.text || "" }
+      } else if (block.type === "tool_use") {
+        const ordinal = ids.size + 1
+        ids.set(block.id, ordinal)
+        value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
+      } else if (block.type === "tool_result") {
+        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
+      } else {
+        value = block
+      }
+      let row = rows.at(-1)
+      if (!row || row.role !== message.role) {
+        row = { role: message.role, content: [] }
+        rows.push(row)
+      }
+      const last = row.content.at(-1)
+      if (last?.type === "text" && value.type === "text") last.text += value.text
+      else row.content.push(value)
+    }
+  }
+  for (const row of rows) {
+    row.content = row.content.filter(block => block.type !== "text" || (block.text = block.text.trim()) !== "")
+  }
+  return stableJSON(rows.filter(row => row.content.length))
+}
+
+function trailingMessages(body) {
+  let start = body.messages.length
+  while (start > 0 && body.messages[start - 1].role !== "assistant") start--
+  return { history: body.messages.slice(0, start), messages: body.messages.slice(start) }
+}
+
+function lastAssistantCalls(messages) {
+  let start = messages.length
+  while (start > 0 && messages[start - 1].role === "assistant") start--
+  return messages.slice(start).flatMap(message => Array.isArray(message.content)
+    ? message.content.filter(block => block.type === "tool_use") : [])
+}
+
+function matchToolResults(body, model, blocks) {
+  const direct = blocks.map(block => ({ block, match: toolCalls.get(block.tool_use_id) }))
+  if (direct.some(item => item.match)) return direct
+  const { history } = trailingMessages(body)
+  const calls = lastAssistantCalls(history)
+  const byID = new Map(calls.map((call, index) => [call.id, index]))
+  if (!calls.length || byID.size !== calls.length || calls.some(call => !call.id) ||
+    blocks.some(block => !byID.has(block.tool_use_id))) return direct
+  let found = null
+  for (const proc of allProcs) {
+    if (!proc.turn || proc.turn.finalized || proc.model !== model || !proc.matchesHistory(history)) continue
+    const shown = lastAssistantCalls(proc.expectedMessages)
+    if (shown.length !== calls.length || shown.some((call, index) =>
+      call.name !== calls[index].name || stableJSON(call.input ?? {}) !== stableJSON(calls[index].input ?? {}))) continue
+    const mapped = blocks.map(block => ({ block, match: toolCalls.get(shown[byID.get(block.tool_use_id)].id) }))
+    if (mapped.some(item => !item.match) || !mapped.some(item => !item.match.call.mcpResponded)) continue
+    if (found) throw new BusyError("agy bridge: renamed tool IDs match more than one pending conversation")
+    found = mapped
+  }
+  return found || direct
+}
+
 function conversationKey(body, model) {
-  const system = typeof body.system === "string" ? body.system : JSON.stringify(body.system || "")
+  const system = historyKey([{ role: "system", content: body.system || "" }])
   const first = body.messages?.[0]
-  const firstText = first ? JSON.stringify(first.content) : ""
+  const firstText = first ? historyKey([first]) : ""
   const discriminator = body.metadata?.user_id || ""
   const source = model + "\n" + discriminator + "\n" + system + "\n===\n" + firstText
   return createHash("sha256").update(source).digest("hex")
@@ -896,10 +971,11 @@ function renderAssistantTurn(message) {
   return parts.join("\n")
 }
 
-function renderInitialPrompt(body) {
+function renderInitialPrompt(body, callerWorkDir) {
   const messages = body.messages || []
-  const last = messages[messages.length - 1]
-  const history = messages.slice(0, -1)
+  const split = extractToolResults(body).length ? messages.length - trailingMessages(body).messages.length : messages.length - 1
+  const history = messages.slice(0, split)
+  const current = messages.slice(split)
   const out = []
   if (body.system) {
     const systemText = typeof body.system === "string"
@@ -907,16 +983,21 @@ function renderInitialPrompt(body) {
       : body.system.map((block) => block.text || "").join("")
     if (systemText.trim()) out.push(`<external_system_instructions>\n${systemText}\n</external_system_instructions>\n`)
   }
+  if (callerWorkDir) {
+    out.push(`\nThe caller's working directory is ${JSON.stringify(callerWorkDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; use the caller's environment for tool paths and commands.\n\n`)
+  }
   if (history.length) {
     out.push("<conversation_history>\n")
     for (const message of history) {
       if (message.role === "user") out.push(`Human: ${messageText(message)}\n`)
       else if (message.role === "assistant") out.push(`Assistant: ${renderAssistantTurn(message)}\n`)
+      else out.push(`${message.role}: ${messageText(message)}\n`)
     }
     out.push("Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
     out.push("</conversation_history>\n\n")
   }
-  out.push("<current_turn>\n", messageText(last), "\n</current_turn>")
+  out.push("<current_turn>\n", current.map(message => message.role === "user"
+    ? messageText(message) : `${message.role}: ${messageText(message)}`).join("\n\n"), "\n</current_turn>")
   return out.join("")
 }
 
@@ -928,8 +1009,8 @@ function validateBody(body) {
   if (!Array.isArray(body?.messages) || !body.messages.length) {
     throw new UnsupportedContent("a request without messages")
   }
-  if (body.messages[body.messages.length - 1]?.role !== "user") {
-    throw new UnsupportedContent("a request whose last message is not from the user")
+  if (body.messages.at(-1)?.role !== "user" && !extractToolResults(body).length) {
+    throw new UnsupportedContent("a request whose last message is not from the user or a tool-result notification")
   }
   if (body.system && typeof body.system !== "string") {
     if (!Array.isArray(body.system) || body.system.some((block) => block?.type !== "text")) {
@@ -941,6 +1022,11 @@ function validateBody(body) {
       for (const block of message.content) {
         if (["text", "tool_use", "thinking", "redacted_thinking"].includes(block?.type)) continue
         throw new UnsupportedContent(`an assistant content block of type ${JSON.stringify(block?.type)}`)
+      }
+    } else if (message.role === "system" || message.role === "developer") {
+      if (typeof message.content !== "string" && (!Array.isArray(message.content) ||
+        message.content.some(block => block?.type !== "text" || typeof block.text !== "string"))) {
+        throw new UnsupportedContent("a non-text system/developer message")
       }
     } else if (message.role === "user") {
       if (Array.isArray(message.content)) {
@@ -984,23 +1070,72 @@ function toolResult(block) {
 }
 
 function extractToolResults(body) {
-  const content = body.messages[body.messages.length - 1]?.content
-  if (!Array.isArray(content)) return []
-  return content.filter((block) => block?.type === "tool_result")
+  return trailingMessages(body).messages.flatMap(message => message.role === "user" && Array.isArray(message.content)
+    ? message.content.filter(block => block?.type === "tool_result") : [])
 }
 
-function hasTextBesideResults(body) {
-  const content = body.messages[body.messages.length - 1]?.content
-  return Array.isArray(content) && content.some((block) => block?.type !== "tool_result")
+// Match Magpie's task-notification forwarding without turning user messages
+// into tool output. agy has no verified mid-turn user-message queue here.
+function withTaskNotices(results, body) {
+  const notices = []
+  let seenResult = false
+  const taskNotice = /(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
+  for (const message of trailingMessages(body).messages) {
+    const blocks = Array.isArray(message.content) ? message.content : [message.content]
+    for (const block of blocks) {
+      if (block?.type === "tool_result") {
+        seenResult = true
+        continue
+      }
+      const text = blockText(block)
+      if (!seenResult && text.trim()) {
+        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+      notices.push(...Array.from(text.matchAll(taskNotice), match => match[0]))
+      const rest = text.replace(taskNotice, "").replace(/<\/?system-reminder(?:\s[^>]*)?>/g, "").trim()
+      if (/The user sent (?:a new message while you were working|the following message):/.test(rest) ||
+        (rest && !/^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/.test(rest) &&
+        !/^[A-Z][A-Za-z]+(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/.test(rest))) {
+        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+    }
+  }
+  if (!notices.length) return results
+  const last = results.at(-1)
+  return [...results.slice(0, -1), { ...last, result: {
+    ...last.result,
+    content: [...last.result.content, { type: "text", text: `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>` }],
+  } }]
 }
 
-function workDirectory(init) {
+function namedWorkDirectory(body, init) {
   const raw = new Headers(init.headers || {}).get("x-magpie-work-dir")
-  if (!raw) return null
-  let decoded = raw
-  try { decoded = decodeURIComponent(raw) } catch {}
+  if (raw) {
+    try { return decodeURIComponent(raw) } catch { return raw }
+  }
+  const texts = []
+  for (const message of [{ role: "system", content: body.system }, ...body.messages]) {
+    if (message.role === "assistant") continue
+    if (typeof message.content === "string") texts.push(message.content)
+    else if (Array.isArray(message.content)) {
+      for (const block of message.content) if (block?.type === "text") texts.push(block.text || "")
+    }
+  }
+  let directory = null
+  const pattern = /(?:Primary working directory|^\s*(?:-\s*)?Working directory|Current working directory): *([^\r\n]+)$|<cwd>([^<\r\n]+)<\/cwd>/gm
+  for (const text of texts) {
+    for (const match of text.matchAll(pattern)) {
+      const value = (match[1] || match[2]).trim().replace(/^[`'"]+|[`'"]+$/g, "")
+      if (value) directory = value
+    }
+  }
+  return directory
+}
+
+function workDirectory(directory) {
+  if (!directory || !path.isAbsolute(directory)) return null
   try {
-    if (fs.statSync(decoded).isDirectory()) return path.resolve(decoded)
+    if (fs.statSync(directory).isDirectory()) return path.resolve(directory)
   } catch {}
   return null
 }
@@ -1343,11 +1478,13 @@ export const AntigravityBridgePlugin = async () => {
             const convKey = conversationKey(body, model)
             const isFresh = body.messages.length <= 1
             const resultBlocks = extractToolResults(body)
-            const workDir = workDirectory(init)
+            const callerWorkDir = namedWorkDirectory(body, init)
+            const workDir = workDirectory(callerWorkDir)
 
             try {
+              const tools = normalizeTools(body)
               if (resultBlocks.length) {
-                const matches = resultBlocks.map((block) => ({ block, match: toolCalls.get(block.tool_use_id) }))
+                const matches = matchToolResults(body, model, resultBlocks)
                 const found = matches.filter((item) => item.match)
                 if (found.length) {
                   if (found.length !== matches.length) {
@@ -1359,36 +1496,33 @@ export const AntigravityBridgePlugin = async () => {
                     return jsonError(409, "agy bridge: tool results from different conversations cannot be combined")
                   }
                   if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
-                  if (!proc.matchesHistory(body.messages.slice(0, -1))) {
-                    return jsonError(409, "agy bridge: conversation history changed before these tool results")
-                  }
                   if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
-                  if (hasTextBesideResults(body)) {
-                    throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
-                  }
-                  const results = matches.map(({ block, match }) => ({
+                  const results = withTaskNotices(matches.map(({ block, match }) => ({
                     block,
                     call: match.call,
                     result: toolResult(block),
-                  }))
-                  if (!proc.dead && !turn.done) {
-                    proc.continueWith(results)
-                    proc.recordToolResult(turn, body.messages[body.messages.length - 1])
+                  })), body)
+                  proc.validateResults(results)
+                  if (!proc.matchesHistory(trailingMessages(body).history) || proc.model !== model ||
+                    proc.toolsSignature !== JSON.stringify(tools) || proc.workDir !== workDir) {
+                    // A changed context/configuration needs a new process. Replay
+                    // the real results without resolving the old process's calls.
+                    dropFromPool(proc)
+                    proc.abandonTurn(turn)
+                    await proc.stop()
                   } else {
-                    for (const { block, call, result } of results) {
-                      if (call.result && JSON.stringify(call.result) !== JSON.stringify(result)) {
-                        return jsonError(409, `agy bridge: conflicting duplicate result for ${block.tool_use_id}`)
-                      }
+                    if (!proc.dead && !turn.done) {
+                      proc.continueWith(results)
+                      proc.recordToolResults(turn, body.messages)
                     }
+                    return streamResponse(proc, turn, body, init.signal)
                   }
-                  return streamResponse(proc, turn, body, init.signal)
                 }
                 if (pool.get(convKey)?.turn) {
                   return jsonError(409, "agy bridge: no active MCP call matches these tool results")
                 }
               }
 
-              const tools = normalizeTools(body)
               const proc = await acquireProc(
                 agy,
                 convKey,
@@ -1396,7 +1530,7 @@ export const AntigravityBridgePlugin = async () => {
                 isFresh,
                 resultBlocks.length > 0,
               )
-              const content = proc.hasSentFirstTurn ? renderContinuedTurn(body) : renderInitialPrompt(body)
+              const content = proc.hasSentFirstTurn ? renderContinuedTurn(body) : renderInitialPrompt(body, callerWorkDir)
               const turn = proc.startTurn(content, body.messages)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {

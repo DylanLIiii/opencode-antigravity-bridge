@@ -69,7 +69,8 @@ async function setup() {
     tools = listed.tools
   }
   const modelFlag = process.argv.indexOf("--model")
-  log({ type: "init", pid: process.pid, convId, cwd: process.cwd(), model: modelFlag < 0 ? "" : process.argv[modelFlag + 1], tools })
+  const addDirFlag = process.argv.indexOf("--add-dir")
+  log({ type: "init", pid: process.pid, convId, cwd: process.cwd(), addDir: addDirFlag < 0 ? null : process.argv[addDirFlag + 1], model: modelFlag < 0 ? "" : process.argv[modelFlag + 1], tools })
   send({ event: "init", conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: "always-proceed" } })
 }
 
@@ -109,9 +110,10 @@ async function invoke(call, early = false) {
 }
 
 async function handleUser(message) {
-  const text = typeof message.message.content === "string" ? message.message.content : ""
+  const prompt = typeof message.message.content === "string" ? message.message.content : ""
+  const text = prompt.includes("<current_turn>\n") ? prompt.split("<current_turn>\n").at(-1).replace(/\n<\/current_turn>$/, "") : prompt
   turn++
-  log({ type: "user", convId, turn, text })
+  log({ type: "user", convId, turn, text: prompt })
   if (text.includes("DIE")) {
     step({ step_index: ++stepIndex, state: "ACTIVE", step_type: "agent_response", text_delta: "before death" })
     process.exit(2)
@@ -206,10 +208,10 @@ function check(name, condition, detail = "") {
   }
 }
 
-async function callFetch(body) {
+async function callFetch(body, headers = {}) {
   return loader.fetch("agy://local/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   })
 }
@@ -400,6 +402,21 @@ async function launchedModel(body) {
   check("UTF-8 split inside a code point preserves text", textOf(events).includes("中文😀"), textOf(events))
 }
 
+for (const [name, system, headers, expectedDir, named] of [
+  ["local prompt", `Working directory: ${os.tmpdir()}`, {}, path.resolve(os.tmpdir()), os.tmpdir()],
+  ["remote prompt", "<cwd>/remote-mac/project</cwd>", {}, null, "/remote-mac/project"],
+  ["header precedence", "Current working directory: /remote-mac/project", { "x-magpie-work-dir": encodeURIComponent(os.tmpdir()) }, path.resolve(os.tmpdir()), os.tmpdir()],
+  ["relative prompt", "Primary working directory: relative-project", {}, null, "relative-project"],
+]) {
+  const body = { model, system, messages: [{ role: "user", content: `environment ${name}` }] }
+  const final = (await readSSE(await callFetch(body, headers))).events
+  const init = logs().filter(event => event.type === "init").at(-1)
+  const prompt = logs().filter(event => event.type === "user").at(-1).text
+  check(`${name} uses only an available absolute add-dir`, stopOf(final) === "end_turn" && init.addDir === expectedDir)
+  check(`${name} identifies where client tools run`, prompt.includes(JSON.stringify(named)) && prompt.includes("where every tool runs"))
+  check(`${name} keeps agent configuration isolated`, init.cwd !== expectedDir && init.cwd.includes("magpie-agy-bridge-"))
+}
+
 let nativeBody
 let nativeEvents
 let nativeConv
@@ -431,6 +448,68 @@ let nativeConv
   check("MCP receives actual result without placeholder", delivered?.result?.content?.[0]?.text === "native-result")
   check("continuation sends no new agy user turn", logs().filter(event => event.type === "user" && event.convId === nativeConv).length === 1)
   check("native tool reuses the same agy conversation", logs().filter(event => event.type === "init" && event.convId === nativeConv).length === 1)
+}
+
+{
+  const first = { model, messages: [{ role: "user", content: "TWOSTEP formatted history" }], tools: [echoTool] }
+  const before = logs().filter(event => event.type === "init").length
+  const events = (await readSSE(await callFetch(first))).events
+  const second = continuation(first, events, "formatted-one")
+  second.messages[0].content = [{ type: "text", text: first.messages[0].content, cache_control: { type: "ephemeral" } }]
+  const blocks = second.messages[1].content
+  second.messages.splice(1, 1,
+    { role: "assistant", content: blocks.filter(block => block.type === "text").map(block => ({ ...block, text: block.text.trimEnd() })) },
+    { role: "assistant", content: blocks.filter(block => block.type === "tool_use").map(block => ({ ...block, cache_control: { type: "ephemeral" } })) })
+  const response = await callFetch(second)
+  check("client formatting and cache markers do not reject results", response.status === 200, `got ${response.status}`)
+  const next = (await readSSE(response)).events
+  if (toolCall(next)) {
+    const final = (await readSSE(await callFetch(continuation(second, next, "formatted-two")))).events
+    check("formatted history survives another tool round", stopOf(final) === "end_turn")
+  } else {
+    await readSSE(await callFetch(continuation(first, events, "cleanup")))
+  }
+  check("formatting-only changes keep the live process", logs().filter(event => event.type === "init").length === before + 1)
+}
+
+{
+  const first = { model, messages: [{ role: "user", content: "TWOSTEP renamed calls" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = logs().filter(event => event.type === "init").at(-1).convId
+  const second = continuation(first, events, "remapped-one")
+  second.messages[1].content.find(block => block.type === "tool_use").id = "TU-client-first"
+  second.messages[2].content[0].tool_use_id = "TU-client-first"
+  const response = await callFetch(second)
+  check("client-renamed tool ID finds its pending call", response.status === 200, `got ${response.status}`)
+  const next = (await readSSE(response)).events
+  if (toolCall(next)) {
+    const third = continuation(second, next, "remapped-two")
+    third.messages.at(-2).content.find(block => block.type === "tool_use").id = "TU-client-second"
+    third.messages.at(-1).content[0].tool_use_id = "TU-client-second"
+    const final = (await readSSE(await callFetch(third))).events
+    check("renamed IDs survive consecutive rounds", stopOf(final) === "end_turn")
+    const results = logs().filter(event => event.type === "mcpResult" && event.convId === convId)
+    check("renamed results reach the original MCP calls", results.map(event => event.result.content[0].text).join(",") === "remapped-one,remapped-two")
+  } else {
+    const cleanup = continuation(first, events, "cleanup")
+    const next = (await readSSE(await callFetch(cleanup))).events
+    if (toolCall(next)) await readSSE(await callFetch(continuation(cleanup, next, "cleanup-two")))
+  }
+}
+
+{
+  const first = { model, messages: [{ role: "user", content: "TOOL before compaction" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const old = logs().filter(event => event.type === "init").at(-1)
+  const second = continuation(first, events, "already-executed-result")
+  second.messages[0].content = "Compacted summary of the conversation"
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  check("edited history replays instead of returning 409", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+  const replay = logs().filter(event => event.type === "user").at(-1)
+  check("replay includes current history and the real result", replay.convId !== old.convId && replay.text.includes("Compacted summary") && replay.text.includes("already-executed-result") && !replay.text.includes("TOOL before compaction"))
+  check("replaced pending process is cleaned up", !fs.existsSync(old.cwd))
+  if (response.status !== 200) await readSSE(await callFetch(continuation(first, events, "cleanup")))
 }
 
 {
@@ -491,6 +570,15 @@ let nativeConv
   const bodyB = { model, messages: [{ role: "user", content: "TOOL conversation B" }], tools: [echoTool] }
   const [responseA, responseB] = await Promise.all([callFetch(bodyA), callFetch(bodyB)])
   const [eventsA, eventsB] = await Promise.all([readSSE(responseA), readSSE(responseB)])
+  const mixed = continuation(bodyA, eventsA.events, "must-not-deliver")
+  mixed.messages.at(-1).content.push(continuation(bodyB, eventsB.events, "must-not-deliver").messages.at(-1).content[0])
+  check("mixed-conversation batch is rejected", (await callFetch(mixed)).status === 409)
+  const wrongArgs = continuation(bodyA, eventsA.events, "must-not-deliver")
+  const renamed = wrongArgs.messages.at(-2).content.find(block => block.type === "tool_use")
+  renamed.id = "TU-wrong-arguments"
+  renamed.input.text = "different-arguments"
+  wrongArgs.messages.at(-1).content[0].tool_use_id = renamed.id
+  check("ID remapping cannot ignore changed arguments", (await callFetch(wrongArgs)).status === 409)
   const [resultA, resultB] = await Promise.all([
     readSSE(await callFetch(continuation(bodyA, eventsA.events, "result-A"))),
     readSSE(await callFetch(continuation(bodyB, eventsB.events, "result-B"))),
@@ -499,6 +587,23 @@ let nativeConv
   check("concurrent conversations keep tool results isolated", delivered.includes("result-A") && delivered.includes("result-B"))
   check("concurrent conversations use independent processes", logs().filter(event => event.type === "init").length === before + 2)
   check("both concurrent conversations complete", stopOf(resultA.events) === "end_turn" && stopOf(resultB.events) === "end_turn")
+}
+
+{
+  const bodyA = { model, metadata: { user_id: "ambiguous-A" }, messages: [{ role: "user", content: "TOOL identical history" }], tools: [echoTool] }
+  const bodyB = { ...bodyA, metadata: { user_id: "ambiguous-B" } }
+  const [a, b] = await Promise.all([callFetch(bodyA), callFetch(bodyB)])
+  const [eventsA, eventsB] = await Promise.all([readSSE(a), readSSE(b)])
+  const ambiguous = continuation(bodyA, eventsA.events, "ambiguous-output")
+  ambiguous.messages.at(-2).content.find(block => block.type === "tool_use").id = "TU-ambiguous"
+  ambiguous.messages.at(-1).content[0].tool_use_id = "TU-ambiguous"
+  check("ambiguous renamed calls are never guessed", (await callFetch(ambiguous)).status === 503)
+  const finals = await Promise.all([
+    callFetch(continuation(bodyA, eventsA.events, "unambiguous-A")).then(readSSE),
+    callFetch(continuation(bodyB, eventsB.events, "unambiguous-B")).then(readSSE),
+  ])
+  const delivered = logs().filter(event => event.type === "mcpResult").slice(-2).map(event => event.result.content[0].text).sort()
+  check("ambiguity leaves both original calls intact", finals.every(final => stopOf(final.events) === "end_turn") && delivered.join(",") === "unambiguous-A,unambiguous-B")
 }
 
 {
@@ -541,6 +646,19 @@ let nativeConv
   check("replayed conversation answers after tool change", stopOf(secondEvents) === "end_turn")
 }
 
+for (const change of ["tools", "model"]) {
+  const first = { model, messages: [{ role: "user", content: `TOOL live configuration ${change}` }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const old = logs().filter(event => event.type === "init").at(-1)
+  const second = continuation(first, events, "completed-before-change")
+  if (change === "tools") second.tools = [...second.tools, { name: "other", input_schema: { type: "object" } }]
+  else second.model = legacyModel
+  const final = (await readSSE(await callFetch(second))).events
+  const init = logs().filter(event => event.type === "init").at(-1)
+  check(`live ${change} change replays the completed result`, stopOf(final) === "end_turn" && init.convId !== old.convId && logs().filter(event => event.type === "user").at(-1).text.includes("completed-before-change"))
+  check(`live ${change} change reaches the new process`, change === "tools" ? init.tools.some(tool => tool.name === "other") : init.model === "gemini-test-low")
+}
+
 {
   const response = await callFetch({ model, messages: [{ role: "user", content: "BUILTIN should be rejected" }] })
   const { events } = await readSSE(response)
@@ -564,11 +682,35 @@ let nativeConv
   const firstBody = { model, messages: [{ role: "user", content: "TOOL extra text" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
   const invalidBody = continuation(firstBody, firstEvents, "result", { extraText: true })
-  const invalid = await callFetch(invalidBody)
-  check("text beside a live tool result returns 400", invalid.status === 400, `got ${invalid.status}`)
+  invalidBody.messages.at(-1).content.at(-1).text += "\n<task-notification>background completed</task-notification>"
+  const beforeResult = continuation(firstBody, firstEvents, "result")
+  beforeResult.messages.at(-1).content.unshift({ type: "text", text: "<task-notification>too early</task-notification>" })
+  const hookAndUser = continuation(firstBody, firstEvents, "result")
+  hookAndUser.messages.at(-1).content.push({ type: "text", text: "PreToolUse:Read hook additional context: hook output\n\nThe user sent a new message while you were working:\nstop now" })
+  const rejected = await Promise.all([invalidBody, beforeResult, hookAndUser].map(body => callFetch(body)))
+  check("unsupported user text and pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
   const validBody = continuation(firstBody, firstEvents, "result")
   const validEvents = (await readSSE(await callFetch(validBody))).events
   check("valid result can continue after rejected extra text", stopOf(validEvents) === "end_turn")
+}
+
+for (const location of ["inline", "system", "developer", "user"]) {
+  const first = { model, messages: [{ role: "user", content: `TOOL task notice ${location}` }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = logs().filter(event => event.type === "init").at(-1).convId
+  const second = continuation(first, events, "real tool output")
+  const notice = { type: "text", text: "<system-reminder>[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>job-7</task-id><summary>subagent finished</summary></task-notification>\n<task-notification><task-id>job-8</task-id><summary>another subagent finished</summary></task-notification></system-reminder>" }
+  second.messages.at(-1).content.push({ type: "text", text: "<total_tokens>12345</total_tokens>" }, { type: "text", text: "PreToolUse:Read hook additional context: hook-only-output" })
+  if (location === "inline") second.messages.at(-1).content.push(notice)
+  else second.messages.push({ role: location, content: [notice] })
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  check(`${location} task notification continues the live turn`, response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+  const delivered = logs().find(event => event.type === "mcpResult" && event.convId === convId)
+  const content = delivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check(`${location} task notifications reach MCP without hook/token noise`, content.startsWith("real tool output") && content.includes("<system-reminder>") && content.includes("job-7") && content.includes("job-8") && !content.includes("12345") && !content.includes("hook-only-output"), content)
+  check(`${location} task notification does not add an agy user turn`, logs().filter(event => event.type === "user" && event.convId === convId).length === 1)
+  if (response.status !== 200) await readSSE(await callFetch(continuation(first, events, "cleanup")))
 }
 
 {

@@ -12,7 +12,7 @@ const MCP_SERVER_NAME = "magpie_bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 const IDLE_MS = 10 * 60 * 1000
 const MAX_PROCS = 4
-const PROC_START_TIMEOUT_MS = 30_000
+const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
 const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
 const STDERR_TAIL = 32 * 1024
@@ -47,6 +47,12 @@ let controlServerPromise
 function positiveTimeout(value, fallback) {
   const parsed = Number(value)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function configuredTimeout(name, fallback) {
+  return Object.hasOwn(process.env, name)
+    ? positiveTimeout(process.env[name], fallback)
+    : fallback
 }
 
 function findAgy() {
@@ -382,12 +388,15 @@ class Proc {
     this.child.stdout.setEncoding("utf8")
     this.child.stdout.on("data", (data) => this.#onStdout(data))
 
-    const initLine = await this.#readLine(PROC_START_TIMEOUT_MS, false)
+    const initLine = await this.#readLine(configuredTimeout("AGY_BRIDGE_START_TIMEOUT_MS", DEFAULT_PROC_START_TIMEOUT_MS), false)
     let init
     try { init = JSON.parse(initLine) } catch {
       throw new Error("agy's init line is not JSON: " + initLine.slice(0, 200))
     }
-    if (init.event !== "init") throw new Error(`agy's first event is ${init.event}, not init`)
+    if (init.event === "result" && init.result?.status !== "SUCCESS") {
+      throw new Error(`agy failed before init: ${init.result?.error || init.result?.status || "unknown error"}`)
+    }
+    if (init.event !== "init") throw new Error(`agy's first event is ${init.event}, not init: ${initLine.slice(0, 1000)}`)
     this.conversationId = init.conversation_id
   }
 
@@ -1074,12 +1083,13 @@ function extractToolResults(body) {
     ? message.content.filter(block => block?.type === "tool_result") : [])
 }
 
-// Match Magpie's task-notification forwarding without turning user messages
-// into tool output. agy has no verified mid-turn user-message queue here.
-function withTaskNotices(results, body) {
+// Forward complete protocol-generated context notices without turning ordinary
+// user instructions into tool output. OpenCode can append a <system-update>
+// after a tool result when its dynamic tool catalog changes.
+function withContextNotices(results, body) {
   const notices = []
   let seenResult = false
-  const taskNotice = /(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
+  const contextNotice = /<system-update(?:\s[^>]*)?>[\s\S]*?<\/system-update>|(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
   for (const message of trailingMessages(body).messages) {
     const blocks = Array.isArray(message.content) ? message.content : [message.content]
     for (const block of blocks) {
@@ -1091,8 +1101,8 @@ function withTaskNotices(results, body) {
       if (!seenResult && text.trim()) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
-      notices.push(...Array.from(text.matchAll(taskNotice), match => match[0]))
-      const rest = text.replace(taskNotice, "").replace(/<\/?system-reminder(?:\s[^>]*)?>/g, "").trim()
+      notices.push(...Array.from(text.matchAll(contextNotice), match => match[0]))
+      const rest = text.replace(contextNotice, "").replace(/<\/?system-reminder(?:\s[^>]*)?>/g, "").trim()
       if (/The user sent (?:a new message while you were working|the following message):/.test(rest) ||
         (rest && !/^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/.test(rest) &&
         !/^[A-Z][A-Za-z]+(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/.test(rest))) {
@@ -1497,7 +1507,7 @@ export const AntigravityBridgePlugin = async () => {
                   }
                   if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
                   if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
-                  const results = withTaskNotices(matches.map(({ block, match }) => ({
+                  const results = withContextNotices(matches.map(({ block, match }) => ({
                     block,
                     call: match.call,
                     result: toolResult(block),

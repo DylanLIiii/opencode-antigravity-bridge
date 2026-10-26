@@ -70,9 +70,10 @@ magpie plugin add ./opencode-antigravity-bridge
   Client-renamed tool IDs are matched only when history, tool names and arguments
   identify one pending response. Actual history edits/compaction with known call
   IDs retire the old process and replay the current history and real results.
-- **Background task notifications** beside tool results, including trailing
+- **Protocol context notices** beside tool results, including trailing
   user/system/developer messages, reach MCP inside a separate `system-reminder`.
-  Recognized hook/token-count notices are not treated as user messages.
+  This covers OpenCode `<system-update>` messages, background task notifications,
+  and recognized hook/token-count notices without treating them as user messages.
 - **Conversation pooling**: at most four agy processes, ten-minute idle
   reaping, LRU eviction, and HTTP 503 for conflicting concurrent responses.
 - **Isolated tool configuration**: a custom agent with `tools: []` and only
@@ -96,9 +97,10 @@ its arguments and authorize the operation.
   stream-json input accepts text blocks only. Base64 images returned inside a
   `tool_result` are passed through as MCP image content.
 - **User instructions beside a live `tool_result`** are still rejected with
-  HTTP 400. Task notifications and recognized hook/token-count notices are
-  supported, but agy's mid-turn user-message queue has not been verified.
-  Send user instructions after the tool continuation completes.
+  HTTP 400. Complete `<system-update>` elements, task notifications, and
+  recognized hook/token-count notices are supported, but agy's mid-turn
+  user-message queue has not been verified. Send user instructions after the
+  tool continuation completes.
 - **Ambiguous or unrecognized rewritten tool IDs** are not guessed. Ambiguous
   matches return 503; unrecognized results that conflict with a pending pooled
   conversation return 409. Conflicting duplicates and mixed-conversation result
@@ -108,9 +110,11 @@ its arguments and authorize the operation.
 - **No automatic agy installation** and no support guarantee for CLI protocol
   changes. The helper supports agy's modern `server/discover` MCP handshake
   (`2026-07-28`) and legacy `initialize` handshakes.
-- **Timeouts**: model/output inactivity defaults to 5 minutes and waiting for
-  a client tool result to 30 minutes. Set `AGY_BRIDGE_TURN_TIMEOUT_MS` or
-  `AGY_BRIDGE_TOOL_TIMEOUT_MS` to override them.
+- **Timeouts**: process startup defaults to 60 seconds, model/output inactivity
+  to 5 minutes, and waiting for a client tool result to 30 minutes. Set
+  `AGY_BRIDGE_START_TIMEOUT_MS`, `AGY_BRIDGE_TURN_TIMEOUT_MS`, or
+  `AGY_BRIDGE_TOOL_TIMEOUT_MS` to override them. agy's eligibility/authentication
+  check runs before init and can still fail independently of the bridge.
 
 ## Development
 
@@ -121,14 +125,14 @@ node test-smoke.mjs
 npm pack --dry-run
 ```
 
-The smoke test uses a fake agy process and the real stdio MCP helper. Its 106
+The smoke test uses a fake agy process and the real stdio MCP helper. Its 121
 checks pass under both Node and Bun. They cover streaming, process reuse,
 conversation isolation, native tool round-trips, parallel/consecutive calls,
 atomic result validation, failures, startup, death, timeouts, cancellation,
 model/tool changes, UTF-8, cleanup, model discovery/effort routing, protocol
 selection, HTTP errors, reformatted histories, renamed tool IDs (including
-ambiguity and changed arguments), compaction replay, task notifications and
-local/remote caller environments.
+ambiguity and changed arguments), compaction replay, task/system-update notices,
+and local/remote caller environments.
 
 The plugin was also installed into **Magpie 0.1.1356** with its real Bun host.
 CLI keyless sign-in passed, and direct requests to the gateway's
@@ -156,10 +160,16 @@ whose latest reachable release tag was `v0.1.1566`:
   are not implemented here. MCP input schemas remain intact. Live tool-list
   changes rebuild/replay instead of using Claude's dynamic registration.
 
-The continuation/environment changes above have been checked with fake agy and
-real MCP under Node and Bun, **not yet with a real Mac Mini, agy account or the
-latest Magpie host**. The earlier real-host verification described above does
-not cover these new changes.
+On 2026-10-26, the continuation changes were also verified with real agy 1.3.5
+and Magpie 0.1.1564. An isolated local gateway served the plugin directly, and
+an actual OpenCode 2.1.2 session completed `shell (exit 18) → system-update →
+tool_result → second shell call → end_turn`. Local usage records confirmed that
+`antigravity-bridge`, not `remote-magpie`, served every request.
+
+Repeated real-agy probes also exposed intermittent pre-init eligibility failures
+(such as an `oauth2/v2/userinfo` EOF). These are upstream startup failures, not
+successful tool-continuation runs; startup errors now retain agy's actual error
+text instead of only reporting a missing init event.
 
 ## License
 

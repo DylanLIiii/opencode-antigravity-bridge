@@ -70,6 +70,11 @@ async function setup() {
   }
   const modelFlag = process.argv.indexOf("--model")
   const addDirFlag = process.argv.indexOf("--add-dir")
+  if (process.env.FAKE_AGY_INIT_MODE === "slow") await new Promise(resolve => setTimeout(resolve, 100))
+  if (process.env.FAKE_AGY_INIT_MODE === "early-error") {
+    send({ event: "result", result: { conversation_id: "", status: "ERROR", response: "", error: "Eligibility check failed: test EOF" } })
+    process.exit(1)
+  }
   log({ type: "init", pid: process.pid, convId, cwd: process.cwd(), addDir: addDirFlag < 0 ? null : process.argv[addDirFlag + 1], model: modelFlag < 0 ? "" : process.argv[modelFlag + 1], tools })
   send({ event: "init", conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: "always-proceed" } })
 }
@@ -651,12 +656,15 @@ for (const change of ["tools", "model"]) {
   const events = (await readSSE(await callFetch(first))).events
   const old = logs().filter(event => event.type === "init").at(-1)
   const second = continuation(first, events, "completed-before-change")
-  if (change === "tools") second.tools = [...second.tools, { name: "other", input_schema: { type: "object" } }]
-  else second.model = legacyModel
+  if (change === "tools") {
+    second.tools = [...second.tools, { name: "other", input_schema: { type: "object" } }]
+    second.messages.push({ role: "user", content: [{ type: "text", text: "<system-update>tool catalog changed</system-update>" }] })
+  } else second.model = legacyModel
   const final = (await readSSE(await callFetch(second))).events
   const init = logs().filter(event => event.type === "init").at(-1)
   check(`live ${change} change replays the completed result`, stopOf(final) === "end_turn" && init.convId !== old.convId && logs().filter(event => event.type === "user").at(-1).text.includes("completed-before-change"))
   check(`live ${change} change reaches the new process`, change === "tools" ? init.tools.some(tool => tool.name === "other") : init.model === "gemini-test-low")
+  if (change === "tools") check("system update survives a configuration replay", logs().filter(event => event.type === "user").at(-1).text.includes("tool catalog changed"))
 }
 
 {
@@ -664,6 +672,24 @@ for (const change of ["tools", "model"]) {
   const { events } = await readSSE(response)
   const error = events.find(event => event.event === "error")?.data?.error?.message || ""
   check("unexpected built-in tool fails closed", error.includes("non-bridge tool"), error)
+}
+
+{
+  process.env.AGY_BRIDGE_START_TIMEOUT_MS = "40"
+  process.env.FAKE_AGY_INIT_MODE = "slow"
+  const response = await callFetch({ model, messages: [{ role: "user", content: "slow init" }] })
+  const payload = await response.json()
+  check("startup timeout is configurable", response.status === 502 && payload.error?.message?.includes("after 40ms"), `got ${response.status}: ${payload.error?.message}`)
+  delete process.env.AGY_BRIDGE_START_TIMEOUT_MS
+  delete process.env.FAKE_AGY_INIT_MODE
+}
+
+{
+  process.env.FAKE_AGY_INIT_MODE = "early-error"
+  const response = await callFetch({ model, messages: [{ role: "user", content: "early init failure" }] })
+  const payload = await response.json()
+  check("pre-init result reports the actual agy error", response.status === 502 && payload.error?.message?.includes("failed before init: Eligibility check failed: test EOF"), `got ${response.status}: ${payload.error?.message}`)
+  delete process.env.FAKE_AGY_INIT_MODE
 }
 
 {
@@ -687,8 +713,14 @@ for (const change of ["tools", "model"]) {
   beforeResult.messages.at(-1).content.unshift({ type: "text", text: "<task-notification>too early</task-notification>" })
   const hookAndUser = continuation(firstBody, firstEvents, "result")
   hookAndUser.messages.at(-1).content.push({ type: "text", text: "PreToolUse:Read hook additional context: hook output\n\nThe user sent a new message while you were working:\nstop now" })
-  const rejected = await Promise.all([invalidBody, beforeResult, hookAndUser].map(body => callFetch(body)))
-  check("unsupported user text and pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
+  const systemBeforeResult = continuation(firstBody, firstEvents, "result")
+  systemBeforeResult.messages.at(-1).content.unshift({ type: "text", text: "<system-update>too early</system-update>" })
+  const systemAndUser = continuation(firstBody, firstEvents, "result")
+  systemAndUser.messages.at(-1).content.push({ type: "text", text: "<system-update>catalog changed</system-update>\n\nordinary user instruction" })
+  const unclosedSystem = continuation(firstBody, firstEvents, "result")
+  unclosedSystem.messages.at(-1).content.push({ type: "text", text: "<system-update>not a complete protocol notice" })
+  const rejected = await Promise.all([invalidBody, beforeResult, hookAndUser, systemBeforeResult, systemAndUser, unclosedSystem].map(body => callFetch(body)))
+  check("unsupported user text and malformed or pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
   const validBody = continuation(firstBody, firstEvents, "result")
   const validEvents = (await readSSE(await callFetch(validBody))).events
   check("valid result can continue after rejected extra text", stopOf(validEvents) === "end_turn")
@@ -710,6 +742,28 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const content = delivered?.result?.content?.map(part => part.text).join("\n") || ""
   check(`${location} task notifications reach MCP without hook/token noise`, content.startsWith("real tool output") && content.includes("<system-reminder>") && content.includes("job-7") && content.includes("job-8") && !content.includes("12345") && !content.includes("hook-only-output"), content)
   check(`${location} task notification does not add an agy user turn`, logs().filter(event => event.type === "user" && event.convId === convId).length === 1)
+  if (response.status !== 200) await readSSE(await callFetch(continuation(first, events, "cleanup")))
+}
+
+for (const location of ["inline", "system", "developer", "user"]) {
+  const first = { model, messages: [{ role: "user", content: `TOOL system update ${location}` }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = logs().filter(event => event.type === "init").at(-1).convId
+  const second = continuation(first, events, "real tool output")
+  const updates = [
+    { type: "text", text: "<system-update>\nThe Code Mode tool catalog has changed.\ncatalog-alpha\n</system-update>" },
+    { type: "text", text: "<system-update>catalog-beta</system-update>\n<task-notification><task-id>job-9</task-id></task-notification>" },
+  ]
+  second.messages.at(-1).content.push({ type: "text", text: "<total_tokens>12345</total_tokens>" })
+  if (location === "inline") second.messages.at(-1).content.push(...updates)
+  else second.messages.push({ role: location, content: location === "user" ? updates.map(block => block.text).join("\n") : updates })
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  check(`${location} system update continues the live turn`, response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+  const delivered = logs().find(event => event.type === "mcpResult" && event.convId === convId)
+  const content = delivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check(`${location} system updates reach MCP with other protocol notices`, content.startsWith("real tool output") && content.includes("<system-reminder>") && content.includes("catalog-alpha") && content.includes("catalog-beta") && content.includes("job-9") && !content.includes("12345"), content)
+  check(`${location} system update does not add an agy user turn`, logs().filter(event => event.type === "user" && event.convId === convId).length === 1)
   if (response.status !== 200) await readSSE(await callFetch(continuation(first, events, "cleanup")))
 }
 

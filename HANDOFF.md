@@ -1,5 +1,26 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-10-26：真实 OpenCode system-update 修复与本地验证
+
+真实 OpenCode 请求录制确认：动态 Code Mode 工具目录变化时，客户端会在 tool
+result 后追加独立的 `<system-update>` 用户消息。旧实现把它当普通用户插话，
+返回 `text beside a live tool_result`。现支持完整 system-update 元素，连同
+task-notification 放入独立 MCP system-reminder；普通插话、未闭合 update、
+result 前 update 仍返回 400。
+
+Node/Bun 各 121 项 smoke checks 通过。真实 agy 1.3.5 + Magpie 0.1.1564 +
+OpenCode 2.1.2 的隔离本地链路已完成两次 shell 调用：第一次实际 exit 18，
+system-update 后续接，第二次成功，最终 end_turn，OpenCode exit 0。usage 明确
+为 antigravity-bridge 本地 provider，不是 remote-magpie。
+
+主配置 `noAccountDiscovery: true` 会同时过滤插件账号，导致本地 provider 不在
+catalog，完整模型 ID 随后被 remote-magpie 的嵌套 bare model 匹配。验证使用独立
+XDG 配置和 `MAGPIE_ADDR=127.0.0.1:3426`，未改变主配置。
+
+真实重复探针发现 agy 偶发在 init 前因 Google eligibility/userinfo EOF 失败；
+这不同于工具续接。启动默认超时改为 60 秒（AGY_BRIDGE_START_TIMEOUT_MS 可覆盖），
+pre-init result ERROR 现在保留上游真实错误文本。
+
 ## 2026-10-26：工具续接修复与官方对齐（工作区修改）
 
 用户报告 `agy bridge: conversation history changed before these tool results`。

@@ -6,6 +6,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { createUsageReader } from "./usage.mjs"
 
 const PROVIDER_ID = "antigravity-bridge"
 const MCP_SERVER_NAME = "magpie_bridge"
@@ -1438,10 +1439,13 @@ function streamResponse(proc, turn, body, signal) {
 }
 
 export const AntigravityBridgePlugin = async () => {
+  const readUsage = createUsageReader(findAgy)
   return {
     auth: {
       provider: PROVIDER_ID,
       single: true,
+      // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
+      usage: async () => readUsage(),
       methods: [
         {
           type: "api",

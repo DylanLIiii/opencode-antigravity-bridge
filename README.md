@@ -64,9 +64,10 @@ magpie plugin add ./opencode-antigravity-bridge
   continues into the next response. No successful placeholder result or text
   `TOOL_CALL` convention is used.
 - **Token usage reporting**, converted from agy's session-cumulative usage to
-  per-turn deltas. When agy reports reasoning, `message_delta.usage` includes
-  Anthropic-compatible `output_tokens_details.thinking_tokens`. agy's public
-  output does not expose the corresponding visible thinking text or signatures.
+  per-turn deltas.
+- **Subscription quota reporting** in Magpie through `auth.usage`, using the
+  real CLI's structured `/usage` report. Includes Gemini and Claude/GPT weekly
+  and five-hour windows, plus separate model allowances when agy reports them.
 - **Client-compatible continuation**: cache markers, string/block text,
   split assistant messages and outer text whitespace do not invalidate a turn.
   Client-renamed tool IDs are matched only when history, tool names and arguments
@@ -92,6 +93,68 @@ The MCP transport forwards each declared `input_schema`, but that does not
 automatically execute full JSON Schema validation. The bridge validates tool
 names and argument shapes; the client that executes a tool must still validate
 its arguments and authorize the operation.
+
+## Subscription limits
+
+Open Magpie's **Usage / Allowances** page and refresh the Antigravity Bridge
+card, or query it from the terminal:
+
+```sh
+magpie quota antigravity-bridge --json
+magpie quota refresh antigravity-bridge --json
+```
+
+Magpie must be running this updated checkout (an older installed copy does not
+gain the hook automatically). This is Magpie's `auth.usage` extension, not a
+native OpenCode V2 quota UI. A current Magpie with plugin usage support is
+required; the hook was verified with the **0.1.1599** host.
+
+The plugin runs `agy --version`, then `agy -p /usage --output-format json`
+with a restricted custom agent and a bounded print timeout. It reads the
+**current agy sign-in**, not a Google account separately added to Magpie. It
+does not read, copy, or save Google tokens, impersonate the IDE, scrape the TUI,
+or send a model prompt. `agy` remains responsible for authentication and quota
+requests. An unrecognized version, or one older than **1.1.11**, is rejected
+before print mode because older slash-command implementations could treat
+`/usage` as a model prompt.
+
+- Each returned group/cadence becomes a named window with percent used and,
+  when available, its absolute reset time. Weekly-only plans do not gain a
+  fictional five-hour allowance. Separate model groups retain their names.
+- Disabled buckets are omitted. Missing or invalid fractions are **unknown**,
+  not 0% or 100%; reset-only rows say `Limits not available`. If no enabled
+  bucket has measured quota, the card reports an error instead of fake bars.
+- The report supplies no verified email or plan, so the hook does not invent
+  either. Token counts in inference responses are separate from these limits.
+- Windows are **display-only** (`aside: true`): this update does not change
+  routing or automatically stop requests when a window is exhausted.
+- Concurrent reads share one query; sequential reads query agy again. Magpie
+  can apply its own quota cache and refresh cooldown.
+- Queries default to a **15-second total subprocess budget** and **1 MiB output
+  limit**. `AGY_BRIDGE_USAGE_TIMEOUT_MS` can shorten that budget or raise it up
+  to 18 seconds, below Magpie's 20-second usage-hook deadline. Version probing
+  is capped at three seconds within that budget.
+- A private temporary workspace contains the custom agent (`tools: []`,
+  `mcpServers: []`) and failing `open`/`xdg-open`/`BROWSER` launchers, preventing
+  background usage refreshes from opening OAuth browser login. Queries set
+  `AGY_CLI_DISABLE_AUTO_UPDATE=true` only for their child processes. They do
+  not change global agy settings or the user's updater preferences.
+- On completion, failure, timeout, or cancellation, the query's owned POSIX
+  process group is stopped and its workspace removed. Processes that detach
+  into a different process group are outside this cleanup guarantee. Errors
+  show sanitized diagnostics, not raw stderr, tokens, or account URLs, and do
+  not mark the bridge's sentinel login as revoked. Run `agy` interactively to
+  repair an expired CLI sign-in.
+
+Quota probing currently supports **macOS and Linux**. Windows returns an
+explicit unsupported error rather than querying without browser/process guards.
+
+References: CodexBar's
+[CLI quota parser](https://github.com/steipete/CodexBar/blob/0aa34100b7a7ea397bcbf14eaab388d3f32aa4a1/Sources/CodexBarCore/Providers/Antigravity/AntigravityQuotaSummaryParser.swift)
+and [guarded print probe](https://github.com/steipete/CodexBar/blob/0aa34100b7a7ea397bcbf14eaab388d3f32aa4a1/Sources/CodexBarCore/Providers/Antigravity/AntigravityProviderDescriptor.swift),
+and Magpie's [usage hook](https://github.com/yetone/magpie/blob/5b4dec58e47d1eb961f5a3f4417c441f77662c7d/internal/plugin/host.js)
+and [official Antigravity quota pools](https://github.com/yetone/magpie/blob/5b4dec58e47d1eb961f5a3f4417c441f77662c7d/internal/provider/google.go).
+The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 
 ## Limitations
 
@@ -123,18 +186,29 @@ its arguments and authorize the operation.
 ```sh
 node --check index.mjs
 node --check mcp-server.mjs
-node test-smoke.mjs
+node --check usage.mjs
+npm test
 npm pack --dry-run
 ```
 
-The smoke test uses a fake agy process and the real stdio MCP helper. Its 123
+The smoke test uses a fake agy process and the real stdio MCP helper. Its 127
 checks pass under both Node and Bun. They cover streaming, process reuse,
 conversation isolation, native tool round-trips, parallel/consecutive calls,
 atomic result validation, failures, startup, death, timeouts, cancellation,
 model/tool changes, UTF-8, cleanup, model discovery/effort routing, protocol
 selection, HTTP errors, reformatted histories, renamed tool IDs (including
 ambiguity and changed arguments), compaction replay, task/system-update notices,
-and local/remote caller environments.
+and local/remote caller environments, plus the public quota hook. The 14 focused
+tests in `test-usage.mjs` cover quota parsing, version gating, browser/update
+guards, output/time budgets, cancellation, process-group and workspace cleanup,
+safe diagnostics, concurrency, and fresh sequential reads. Run those under Bun
+with `bun test ./test-usage.mjs`, and the smoke suite with `bun test-smoke.mjs`.
+
+The quota hook was verified on macOS using real agy **1.4.7**, directly and
+through the official **Magpie 0.1.1599 Bun host** in an isolated temporary
+configuration. Both returned five measured windows with reset timestamps,
+including the separate Gemini 4 Argon weekly allowance. This was a host/API
+verification, not a GUI visual test or Linux runtime verification.
 
 The plugin was also installed into **Magpie 0.1.1356** with its real Bun host.
 CLI keyless sign-in passed, and direct requests to the gateway's

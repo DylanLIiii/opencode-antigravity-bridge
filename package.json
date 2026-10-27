@@ -7,8 +7,12 @@
   "files": [
     "index.mjs",
     "mcp-server.mjs",
+    "usage.mjs",
     "README.md"
   ],
+  "scripts": {
+    "test": "node --test test-usage.mjs && node test-smoke.mjs"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",

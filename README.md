@@ -64,7 +64,9 @@ magpie plugin add ./opencode-antigravity-bridge
   continues into the next response. No successful placeholder result or text
   `TOOL_CALL` convention is used.
 - **Token usage reporting**, converted from agy's session-cumulative usage to
-  per-turn deltas.
+  per-turn deltas. When agy reports reasoning, `message_delta.usage` includes
+  Anthropic-compatible `output_tokens_details.thinking_tokens`. agy's public
+  output does not expose the corresponding visible thinking text or signatures.
 - **Client-compatible continuation**: cache markers, string/block text,
   split assistant messages and outer text whitespace do not invalidate a turn.
   Client-renamed tool IDs are matched only when history, tool names and arguments
@@ -125,7 +127,7 @@ node test-smoke.mjs
 npm pack --dry-run
 ```
 
-The smoke test uses a fake agy process and the real stdio MCP helper. Its 121
+The smoke test uses a fake agy process and the real stdio MCP helper. Its 123
 checks pass under both Node and Bun. They cover streaming, process reuse,
 conversation isolation, native tool round-trips, parallel/consecutive calls,
 atomic result validation, failures, startup, death, timeouts, cancellation,

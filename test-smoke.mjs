@@ -29,6 +29,18 @@ let turn = 0
 let cumulative = { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 }
 const pending = new Map()
 
+if (process.argv.includes("--version")) {
+  process.stdout.write("1.3.5\n")
+  process.exit(0)
+}
+if (process.argv.includes("/usage")) {
+  log({ type: "usage", cwd: process.cwd(), args: process.argv.slice(2) })
+  send({ status: "SUCCESS", command: { name: "usage", data: { groups: [{
+    name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.6, reset_time: "2026-10-27T00:00:00Z" }],
+  }] } } })
+  process.exit(0)
+}
+
 if (process.argv.includes("models")) {
   process.stdout.write("gemini-test-medium\tGemini Test (Medium)\ngemini-test-high\tGemini Test (High)\ngemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
   process.exit(0)
@@ -318,6 +330,17 @@ const echoTool = {
 }
 const model = "antigravity-bridge/gemini-test"
 const legacyModel = "antigravity-bridge/gemini-test-low"
+
+{
+  const usage = await plugin.auth.usage(async () => ({ key: "agy" }), {})
+  check("auth.usage exposes measured CLI quota", usage.windows?.[0]?.used === 40 && usage.windows[0].name === "Gemini · 7 days")
+  check("auth.usage preserves explicit cadence and reset", usage.windows?.[0]?.span === 604800 && usage.windows[0].resetsAt === "2026-10-27T00:00:00.000Z")
+  check("auth.usage is display-only and keeps bridge auth", usage.windows?.[0]?.aside === true && usage.signIn === "kept")
+  check("auth.usage does not invent Google account identity", !usage.user && !usage.plan)
+  const calls = logs().filter(event => event.type === "usage")
+  check("auth.usage uses a separate cleaned workspace", calls.length === 1 && !fs.existsSync(calls[0].cwd))
+  check("auth.usage runs only the native usage command", calls[0]?.args.includes("/usage") && calls[0]?.args.includes("magpie-usage"))
+}
 
 {
   const models = await plugin.provider.models()

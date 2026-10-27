@@ -1,5 +1,35 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-10-26：真实 agy 额度查询（本地新增）
+
+用户已确认使用真实 CLI 查询，而非直接请求 Google 内部 API。
+
+- 新增 `usage.mjs`：先验证 agy >= 1.1.11，再执行结构化 `/usage` 命令；
+  snake/camel case、nested/oneof fraction、模型独立分组、五小时/周窗口、
+  reset 时间均支持。缺失 fraction 不当作 0 或 1，disabled bucket 不展示。
+- `index.mjs` 增加 Magpie `auth.usage`，返回 display-only windows
+  (`aside: true`)；不改变请求路由、不读写 Google 凭据、不假定邮箱/套餐。
+- 临时受限 agent、浏览器失败启动器、child-only 禁用自动更新；默认 15 秒
+  总子进程预算（最高 18 秒）、version 最多 3 秒、输出最多 1 MiB；清理自有
+  POSIX 进程组和临时目录。已脱离该进程组的后代不在清理保证内。
+- 同时查询合并，完成后不缓存，重试或切换 agy 账号不会命中插件旧结果。
+  Magpie 自己可能缓存；错误为固定诊断且 `signIn: kept`，不误撤销桥接登录。
+- Windows 的额度查询明确报不支持；不影响现有推理桥接代码。
+
+参考 CodexBar `0aa34100` 的 CLI report/parser、browser guard、version gate，
+Magpie `5b4dec58` 的 host usage hook 及官方 Antigravity pools。设计和实现计划
+位于 `docs/plans/2026-10-26-agy-usage*.md`。
+
+验证：Node / Bun 各 **14 focused tests + 127 smoke checks** 通过。真实 agy
+1.4.7 直接 hook 查询成功；官方 Magpie v0.1.1599 `host.js`（与本机版本对应）
+在临时配置中识别 `usage: true` 并成功返回 5 个含 reset 时间的额度窗口，
+包括 Gemini 4 Argon 独立周额度。该 host 验证使用临时 sentinel auth，未复制
+Google 凭据、未改现有 Magpie/agy 配置。未做 GUI 截图或 Linux 真实验证。
+
+查询：`magpie quota antigravity-bridge --json` 或
+`magpie quota refresh antigravity-bridge --json`（需安装的是更新后的代码）。
+截至本记录未推送、发布或替换用户当前安装。
+
 ## 2026-10-26：真实 OpenCode system-update 修复与本地验证
 
 真实 OpenCode 请求录制确认：动态 Code Mode 工具目录变化时，客户端会在 tool

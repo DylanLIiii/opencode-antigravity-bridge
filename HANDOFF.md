@@ -38,7 +38,7 @@ result 后追加独立的 `<system-update>` 用户消息。旧实现把它当普
 task-notification 放入独立 MCP system-reminder；普通插话、未闭合 update、
 result 前 update 仍返回 400。
 
-Node/Bun 各 121 项 smoke checks 通过。真实 agy 1.3.5 + Magpie 0.1.1564 +
+Node/Bun 各 123 项 smoke checks 通过。真实 agy 1.3.5 + Magpie 0.1.1564 +
 OpenCode 2.1.2 的隔离本地链路已完成两次 shell 调用：第一次实际 exit 18，
 system-update 后续接，第二次成功，最终 end_turn，OpenCode exit 0。usage 明确
 为 antigravity-bridge 本地 provider，不是 remote-magpie。
@@ -50,6 +50,11 @@ XDG 配置和 `MAGPIE_ADDR=127.0.0.1:3426`，未改变主配置。
 真实重复探针发现 agy 偶发在 init 前因 Google eligibility/userinfo EOF 失败；
 这不同于工具续接。启动默认超时改为 60 秒（AGY_BRIDGE_START_TIMEOUT_MS 可覆盖），
 pre-init result ERROR 现在保留上游真实错误文本。
+
+真实 agy 探针确认：thinking_tokens 可大于零，但 stream-json/json 只暴露最终
+response，没有 thinking 文本或 signature。bridge 现按 per-turn delta 在
+message_delta.usage.output_tokens_details.thinking_tokens 回传真实计数，不伪造
+thinking blocks。
 
 ## 2026-10-26：工具续接修复与官方对齐（工作区修改）
 

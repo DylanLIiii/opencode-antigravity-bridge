@@ -320,7 +320,7 @@ class Proc {
     this.hasSentFirstTurn = false
     this.turn = null
     this.expectedMessages = null
-    this.reportedUsage = { input_tokens: 0, output_tokens: 0 }
+    this.reportedUsage = { input_tokens: 0, output_tokens: 0, thinking_tokens: 0 }
     allProcs.add(this)
   }
 
@@ -1341,14 +1341,17 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             let usage = emptyUsage
             if (event.result.usage) {
               const cumulative = translateUsage(event.result.usage)
+              const thinkingTokens = Math.max(0, cumulative.thinking_tokens - proc.reportedUsage.thinking_tokens)
               usage = {
                 input_tokens: Math.max(0, cumulative.input_tokens - proc.reportedUsage.input_tokens),
                 output_tokens: Math.max(0, cumulative.output_tokens - proc.reportedUsage.output_tokens),
                 cache_read_input_tokens: cumulative.cache_read_input_tokens,
+                ...(thinkingTokens > 0 ? { output_tokens_details: { thinking_tokens: thinkingTokens } } : {}),
               }
               proc.reportedUsage = {
                 input_tokens: cumulative.input_tokens,
                 output_tokens: cumulative.output_tokens,
+                thinking_tokens: cumulative.thinking_tokens,
               }
             }
             if (!turn.sawTextDelta && typeof event.result.response === "string") emitText(event.result.response)
@@ -1416,6 +1419,7 @@ function translateUsage(usage) {
   return {
     input_tokens: usage.input_tokens ?? 0,
     output_tokens: usage.output_tokens ?? 0,
+    thinking_tokens: usage.thinking_tokens ?? 0,
     cache_read_input_tokens: usage.cache_read_tokens ?? 0,
   }
 }

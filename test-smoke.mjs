@@ -94,6 +94,7 @@ async function setup() {
 function usage(reply) {
   cumulative.input_tokens += 10
   cumulative.output_tokens += reply.length
+  if (reply.includes("THINKING_USAGE")) cumulative.thinking_tokens += 7
   cumulative.total_tokens = cumulative.input_tokens + cumulative.output_tokens
 }
 
@@ -401,6 +402,24 @@ async function launchedModel(body) {
   const { events } = await readSSE(await callFetch(second))
   check("second turn gets reply", textOf(events).includes("second message"), textOf(events))
   check("conversation reuses one process", logs().filter(event => event.type === "init").length === initialInits + 1)
+}
+
+{
+  const first = { model, messages: [{ role: "user", content: "THINKING_USAGE first" }] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const firstUsage = firstEvents.find(event => event.event === "message_delta")?.data?.usage
+  check("thinking tokens use Anthropic output details", firstUsage?.output_tokens_details?.thinking_tokens === 7, JSON.stringify(firstUsage))
+  const second = {
+    ...first,
+    messages: [
+      ...first.messages,
+      { role: "assistant", content: assistantBlocks(firstEvents) },
+      { role: "user", content: "THINKING_USAGE second" },
+    ],
+  }
+  const secondEvents = (await readSSE(await callFetch(second))).events
+  const secondUsage = secondEvents.find(event => event.event === "message_delta")?.data?.usage
+  check("thinking usage is a per-turn delta", secondUsage?.output_tokens_details?.thinking_tokens === 7, JSON.stringify(secondUsage))
 }
 
 {

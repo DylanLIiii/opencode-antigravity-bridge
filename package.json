@@ -1,7 +1,7 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
   "version": "0.1.0",
-  "description": "Antigravity subscription provider that bridges to a real agy CLI subprocess via stream-json, avoiding HTTP impersonation",
+  "description": "Antigravity subscription provider that bridges to a real agy CLI over the Agent Client Protocol (agy acp), avoiding HTTP impersonation",
   "type": "module",
   "main": "./index.mjs",
   "files": [

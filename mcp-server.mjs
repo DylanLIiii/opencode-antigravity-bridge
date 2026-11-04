@@ -1,8 +1,10 @@
+import fs from "node:fs"
 import net from "node:net"
 
-const PROTOCOL_VERSION = "2026-07-28"
+const PROTOCOL_VERSION = "2025-11-25"
 const SERVER_INFO = { name: "magpie-antigravity-bridge", version: "0.1.0" }
-const CAPABILITIES = { tools: { listChanged: false } }
+// The bridge swaps tool catalogs in place and pushes list_changed over a watch channel.
+const CAPABILITIES = { tools: { listChanged: true } }
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 const CONTROL_PORT = Number(process.env.AGY_BRIDGE_CONTROL_PORT)
 const CONTROL_TOKEN = process.env.AGY_BRIDGE_TOKEN
@@ -43,6 +45,7 @@ function closeInput() {
   inputChunks = []
   inputLength = 0
   closeAllControls()
+  watchSocket?.destroy()
 }
 
 function handleStdoutError(error) {
@@ -50,8 +53,21 @@ function handleStdoutError(error) {
   process.exit(error?.code === "EPIPE" ? 0 : 1)
 }
 
+// Diagnostics only: AGY_BRIDGE_MCP_TRACE names a file that receives the MCP traffic.
+const TRACE_PATH = process.env.AGY_BRIDGE_MCP_TRACE
+function trace(direction, message) {
+  if (!TRACE_PATH) return
+  try {
+    const summary = message?.method === "tools/list" || message?.result?.tools
+      ? { ...message, result: message.result?.tools ? { tools: message.result.tools.map(tool => tool.name) } : message.result }
+      : message
+    fs.appendFileSync(TRACE_PATH, JSON.stringify({ at: Date.now(), pid: process.pid, direction, message: summary }) + "\n")
+  } catch {}
+}
+
 function send(message) {
   if (inputClosed) return
+  trace("out", message)
   try {
     process.stdout.write(JSON.stringify(message) + "\n")
   } catch (error) {
@@ -164,6 +180,46 @@ function controlRequest(payload) {
   return request
 }
 
+let watchSocket = null
+
+// One long-lived control connection; each line announces a changed tool catalog.
+function startWatch() {
+  if (!CONTROL_CONFIGURED || watchSocket || inputClosed) return
+  let socket
+  try {
+    socket = net.createConnection({ host: "127.0.0.1", port: CONTROL_PORT })
+  } catch {
+    return
+  }
+  watchSocket = socket
+  socket.setEncoding("utf8")
+  let buffer = ""
+  socket.on("connect", () => {
+    try { socket.write(JSON.stringify({ token: CONTROL_TOKEN, kind: "watch" }) + "\n") } catch {}
+  })
+  socket.on("data", chunk => {
+    buffer += chunk
+    if (buffer.length > MAX_MESSAGE_BYTES) {
+      socket.destroy()
+      return
+    }
+    let newline
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline)
+      buffer = buffer.slice(newline + 1)
+      let event
+      try { event = JSON.parse(line) } catch { continue }
+      if (isObject(event) && event.event === "tools_changed") {
+        send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })
+      }
+    }
+  })
+  socket.on("error", () => {})
+  socket.on("close", () => {
+    if (watchSocket === socket) watchSocket = null
+  })
+}
+
 function cancelCall(params) {
   if (!isObject(params) || !Object.hasOwn(params, "requestId")) return
   const request = pendingCalls.get(params.requestId)
@@ -229,13 +285,10 @@ async function handleMessage(message) {
 
   switch (message.method) {
     case "server/discover":
-      if (hasId) {
-        sendResult(message.id, {
-          supportedVersions: [PROTOCOL_VERSION],
-          capabilities: CAPABILITIES,
-          _meta: { "io.modelcontextprotocol/serverInfo": SERVER_INFO },
-        })
-      }
+      // Answer as a pre-2026 server. Under 2026-07-28 agy expects notifications
+      // through subscriptions/listen; the initialize flow delivers
+      // notifications/tools/list_changed directly, which agy 1.4 honours.
+      if (hasId) sendError(message.id, { code: -32601, message: "Method not found" })
       return
     case "initialize": {
       if (!hasId) return
@@ -250,6 +303,7 @@ async function handleMessage(message) {
       return
     }
     case "notifications/initialized":
+      startWatch()
       return
     case "notifications/cancelled":
       cancelCall(message.params)
@@ -258,6 +312,7 @@ async function handleMessage(message) {
       if (hasId) sendResult(message.id, {})
       return
     case "tools/list":
+      startWatch()
       await listTools(message, hasId)
       return
     case "tools/call":
@@ -297,6 +352,7 @@ function handleLine(line) {
     return
   }
 
+  trace("in", message)
   dispatch(message)
 }
 

@@ -1,5 +1,68 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-11-03：传输层重构为 ACP（`agy acp`），参考 T3 Code
+
+起因：stream-json 只给最终回复和 `thinking_tokens`，不给思考文本；`agy acp`
+（1.4.12 帮助里未列出）会发 `agent_thought_chunk`（思考总结）。参考
+pingdotgg/t3code `apps/server/src/provider/acp/`（`b7ab02e0f6`）：它用独立下载的
+`agy_acp_server.par` 1.4.5，本插件用 CLI 内置的 `agy acp`，协议相同。
+
+真实 agy 1.4.12 探针结论（脚本在会话临时目录，未入库）：
+
+- `clientInfo.name: "zed"` 才列出 Claude/GPT-OSS（照搬 T3）。不要调用 ACP
+  `authenticate`：`oauth-personal` 会换认证路径，随后报 `User location is not
+  supported`；不调用时沿用 CLI 登录正常。
+- 自定义 agent `tools: []` 并**不**限制内置工具，且会继承全局
+  `~/.gemini/config/mcp_config.json`（旧桥接把用户全局 MCP 暴露给了模型）。
+  `inheritMcp: false` + `inheritCustomizations: false` + `excludeDefaultComponents:
+  true`：首轮 input 8,357 → 509。`_meta.antigravity.disabledTools` 在 1.4.12 无效；
+  `systemPrompt.append` 有效。
+- `session/new.mcpServers` 和 frontmatter `mcpServers` 在 ACP 下会连接但**不进模型
+  工具目录**（T3 源码注释也承认，T3 兜底是让 agent 跑 `t3 acp-mcp-call`）。可用的是
+  `--ide-mcp-port`：agy 执行 `nc 127.0.0.1 <port>`，工具以 `mcp_ide-tools_<name>`
+  直接函数出现、无权限请求、`toolSummary` 不进入参数；名称 104 字符也可。
+  本机无 `nc`，所以桥接在 agy 的 PATH 前放私有 `nc` → 直接 exec `mcp-server.mjs`
+  （沿用 token 控制通道）。
+- MCP helper 若响应 `server/discover`，agy 走 2026-07-28 并发 `subscriptions/listen`，
+  `list_changed` 无效；返回 Method not found 回退 `initialize` 后 `list_changed`
+  立即重新 list。
+- IDE MCP 调用固定 180 s 超时，progress 通知不能延长。桥接 150 s 回 "still
+  running"；Gemini 不理会 await 工具、会用同参重调，所以同名同参重调被视为等待原调用
+  （不再转给客户端），agy 结束 turn 后到达的结果用同一响应内的追加 prompt 交付。
+- 上游错误是消息块 `⚠ Agent execution terminated due to error.` + `end_turn`
+  无 usage；真实原因只在 `--log-file`（`errorreport.go ... agent executor error:`）。
+- `session/cancel` 后会话可继续；`session/resume` 跨进程、换 cwd 可用，但模型回到
+  账户默认，需重新 `set_model`。ACP usage 为每 prompt：`inputTokens` 含
+  `cachedReadTokens`（`input+output+thought = total`），与 T3 注释相反，以实测为准。
+- 用户消息中的 ACP image 块模型收不到（未声明 promptCapabilities.image），保留 400。
+
+实现（`index.mjs` 重写传输层，历史匹配/续接/通知逻辑保留）：AcpConnection、
+思考块转发（ACP 不暴露模型签名，Gemini/Claude 的 thought chunk 都只有 text；
+桥接在块结束前发 `signature_delta`，`agyb1.` + 进程内随机密钥对会话与文本的
+HMAC-SHA256，客户端才会保留并回传；Anthropic API 不认此签名）、按 turn 的 usage 换算、权限一律拒绝（不再用
+`--dangerously-skip-permissions`）、会话内换模型（会话键不再含 model）、工具
+`list_changed`、idle/LRU park + resume、中断改 cancel、错误标记识别与日志取因、
+长工具等待。`mcp-server.mjs`：2025-11-25、watch 通道推 `list_changed`、
+`AGY_BRIDGE_MCP_TRACE` 诊断。
+
+验证：Node/Bun 各 **170 smoke checks + 14 usage tests** 通过（假 agy 讲 ACP、经
+桥接 `nc` 垫片连真实 helper）。真实 agy 1.4.12（Linux）经 fetch hook：思考+正文、
+工具往返、Gemini→Claude 会话内切换保留记忆、取消后续聊、对话中加工具、50 s 工具
+在 20 s deadline 下两次重调等待且客户端只执行一次、idle 回收后新进程 resume。
+三轮含一次工具往返的对话 input 合计 4,109 vs 保留默认组件 15,351。
+会话落盘（之后补）：每轮结束及回收时把会话记入 `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
+（0600，只存 sessionId、workDir、历史与指令的 SHA-256，`AGY_BRIDGE_STATE_FILE` 可改），重启后
+哈希一致即 `session/resume`；真实 agy 下新 Node 进程续聊成功。多个 bridge 进程合并写入。
+缓存：5.5k 稳定前缀经 bridge 4 轮。`gemini-4-argon-low` 第 2 轮起命中（input/cacheRead
+2,155/3,513、2,152/3,619、2,151/3,722）；`gemini-3.8-flash-low` 在 append / 首条消息 / 默认
+组件三种放法下都是 0。前缀稳定由桥接保证，命中与否取决于模型后端。argon 每轮命中 = 上一轮总量 − 2,049（第 2 轮
+差 2,054），即请求最后约 2k token 永远不走缓存；26k prompt 第 3 轮 23,944/26,097 = 91.7%，
+与预测完全一致。agy 请求是追加式的（`Local Time` 写在每条 user 消息内，之后不变），会话库
+`~/.gemini/antigravity-cli/conversations/<id>.db` 的 `gen_metadata` 里 `1.4.2`/`1.4.5` 是每轮
+未缓存/缓存 token，可用来核对。注意 `pgrep -f` 会匹配自身所在
+bash，检查遗留进程时别被它误导。
+未验证：Magpie GUI、OpenCode 端到端、macOS/Windows 上的 ACP 传输。未提交/推送。
+
 ## 2026-10-26：真实 agy 额度查询（本地新增）
 
 用户已确认使用真实 CLI 查询，而非直接请求 Google 内部 API。

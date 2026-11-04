@@ -55,8 +55,11 @@ HMAC-SHA256，客户端才会保留并回传；Anthropic API 不认此签名）�
 哈希一致即 `session/resume`；真实 agy 下新 Node 进程续聊成功。多个 bridge 进程合并写入。
 缓存：5.5k 稳定前缀经 bridge 4 轮。`gemini-4-argon-low` 第 2 轮起命中（input/cacheRead
 2,155/3,513、2,152/3,619、2,151/3,722）；`gemini-3.8-flash-low` 在 append / 首条消息 / 默认
-组件三种放法下都是 0。前缀稳定由桥接保证，命中与否取决于模型后端。agy 每次注入精确到秒
-的 `Local Time`，未见开关。注意 `pgrep -f` 会匹配自身所在
+组件三种放法下都是 0。前缀稳定由桥接保证，命中与否取决于模型后端。argon 每轮命中 = 上一轮总量 − 2,049（第 2 轮
+差 2,054），即请求最后约 2k token 永远不走缓存；26k prompt 第 3 轮 23,944/26,097 = 91.7%，
+与预测完全一致。agy 请求是追加式的（`Local Time` 写在每条 user 消息内，之后不变），会话库
+`~/.gemini/antigravity-cli/conversations/<id>.db` 的 `gen_metadata` 里 `1.4.2`/`1.4.5` 是每轮
+未缓存/缓存 token，可用来核对。注意 `pgrep -f` 会匹配自身所在
 bash，检查遗留进程时别被它误导。
 未验证：Magpie GUI、OpenCode 端到端、macOS/Windows 上的 ACP 传输。未提交/推送。
 

@@ -167,8 +167,17 @@ over four turns of one session:
 | `gemini-4-argon-low` | 5,567 / 0 | 2,155 / 3,513 · 2,152 / 3,619 · 2,151 / 3,722 |
 | `gemini-3.8-flash-low` | 5,528 / 0 | 0 cache read on every turn |
 
-Argon reuses the whole earlier prefix from the second turn on (about 62–64% of
-the prompt). Flash reported no cached tokens with `systemPrompt.append`, with
+Argon's cache read on each turn equals the previous turn's whole prompt minus
+a constant 2,049 tokens (2,054 on the second turn): the last ~2k tokens of a
+request are never served from cache, whatever they contain. agy's request is
+append-only (its per-turn local time sits inside each user message and never
+changes afterwards), so the shortfall is the backend's, not a moving part in
+the prefix. The hit rate therefore grows with prompt size: about 62–64% for
+the 5.5k prompt above, and 91.7% for a 26k prompt (turn 3 read 23,944 of
+26,097, exactly the previous 25,993 minus 2,049). OpenCode prompts with tool
+definitions are usually far longer, so expect 90%+ there. The 2,049 constant
+is inferred from these runs on `gemini-4-argon-low`; Google does not document
+it. Flash reported no cached tokens with `systemPrompt.append`, with
 the instructions in the first message, or with agy's default components kept,
 so that is the backend's behaviour for that model, not a prefix the bridge
 changes. Cached tokens appear as `cache_read_input_tokens`.

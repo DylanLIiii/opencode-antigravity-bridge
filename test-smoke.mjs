@@ -28,7 +28,7 @@ const log = value => fs.appendFileSync(process.env.FAKE_AGY_LOG, JSON.stringify(
 const send = value => process.stdout.write(JSON.stringify(value) + "\n")
 
 if (argv.includes("--version")) {
-  process.stdout.write("1.4.12\n")
+  process.stdout.write("1.5.0\n")
   process.exit(0)
 }
 if (argv.includes("/usage")) {
@@ -148,7 +148,7 @@ async function prompt(params) {
   const text = params.prompt.map(block => block.text || "").join("")
   session.prompts++
   saveState()
-  log({ type: "user", convId: session.id, prompt: session.prompts, text, model })
+  log({ type: "user", convId: session.id, prompt: session.prompts, text, content: params.prompt, model })
   if (text.includes("DIE")) {
     chunk("before death")
     process.exit(2)
@@ -251,6 +251,12 @@ async function prompt(params) {
     await reply("thinking usage")
     return finish("thinking usage", { thought: 7, cached: 3 })
   }
+  if (text.includes("CONFIGRESET")) {
+    await reply("configuration updated")
+    model = "gemini-test-low"
+    update({ sessionUpdate: "config_option_update", configOptions: configOptions() })
+    return finish("configuration updated")
+  }
   const prefix = text.includes("SAME") ? "You said [" + session.id + "]: " : "You said: "
   const answer = prefix + text.slice(-120).replace(/"/g, "'")
   await reply(answer)
@@ -259,6 +265,20 @@ async function prompt(params) {
 
 const pendingClient = new Map()
 
+function configOptions() {
+  if (process.env.FAKE_AGY_CONFIG === "omit" || process.env.FAKE_AGY_IMAGES === "omit") return []
+  const family = model.replace(/-(low|medium|high|xhigh|max)$/, "")
+  const configurable = family === "gemini-test" || family === "gemini-config-only"
+  const grouped = process.env.FAKE_AGY_CONFIG === "grouped"
+  const models = ["gemini-test", "gemini-config-only", "claude-test-medium"].map(value => ({ value, name: value }))
+  return [
+    { id: grouped ? "model-picker" : "model", name: "Model", category: "model", type: "select", currentValue: configurable ? family : model,
+      options: grouped ? [{ group: "Test models", options: models }] : models },
+    ...(configurable ? [{ id: grouped ? "thinking-picker" : "thought_level", name: "Thinking Level", category: "thought_level", type: "select", currentValue: model.slice(family.length + 1),
+      options: (family === "gemini-config-only" ? ["low", "high", "max"] : ["low", "medium", "high"]).map(value => ({ value, name: value })) }] : []),
+  ]
+}
+
 async function handle(message) {
   const params = message.params || {}
   switch (message.method) {
@@ -266,8 +286,13 @@ async function handle(message) {
       clientInfo = params.clientInfo
       return {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {} }, _meta: { antigravity: { systemPrompt: { append: true } } } },
-        agentInfo: { name: "Antigravity ACP Server", version: "1.4.12" },
+        agentCapabilities: {
+          loadSession: true,
+          ...(process.env.FAKE_AGY_IMAGES === "omit" ? {} : { promptCapabilities: { image: process.env.FAKE_AGY_IMAGES !== "0", audio: false, embeddedContext: true } }),
+          sessionCapabilities: { resume: {}, close: {} },
+          _meta: { antigravity: { systemPrompt: { append: true } } },
+        },
+        agentInfo: { name: "Antigravity ACP Server", version: process.env.FAKE_AGY_IMAGES === "omit" ? "1.4.12" : "1.5.0" },
         authMethods: [],
       }
     case "session/new":
@@ -287,7 +312,19 @@ async function handle(message) {
         cwd: process.cwd(), addDir, agentConfig, clientInfo, systemAppend: params._meta?.antigravity?.systemPrompt?.append ?? null,
         tools, idePort,
       })
-      return { sessionId: session.id, models: { currentModelId: model, availableModels: [] }, configOptions: [] }
+      return { sessionId: session.id, models: { currentModelId: model, availableModels: [] }, configOptions: configOptions() }
+    }
+    case "session/set_config_option": {
+      log({ type: "setConfig", convId: session.id, configId: params.configId, value: params.value })
+      if (process.env.FAKE_AGY_CONFIG === "unimplemented") throw { code: -32601, message: "Method not found" }
+      if (process.env.FAKE_AGY_CONFIG === "error") throw { code: -32602, message: "Configuration rejected by test account" }
+      if (process.env.FAKE_AGY_SET_MODEL_DELAY) await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_AGY_SET_MODEL_DELAY)))
+      if (params.configId === "model" || params.configId === "model-picker") model = params.value === "claude-test-medium" ? params.value : params.value + "-low"
+      else if (params.configId === "thought_level" || params.configId === "thinking-picker") model = model.replace(/-(low|medium|high|max)$/, "") + "-" + params.value
+      else throw { code: -32602, message: "Unknown configId" }
+      const options = configOptions()
+      update({ sessionUpdate: "config_option_update", configOptions: options })
+      return { configOptions: options }
     }
     case "session/set_model":
       if (process.env.FAKE_AGY_SET_MODEL_DELAY) await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_AGY_SET_MODEL_DELAY)))
@@ -497,6 +534,7 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
   check("grouped model has a level-free display name", models["gemini-test"]?.name === "Gemini Test")
   check("grouped model declares sorted variants", Object.keys(models["gemini-test"]?.variants || {}).join(",") === "low,medium,high")
   check("grouped model declares Magpie and OpenCode reasoning", models["gemini-test"]?.capabilities?.reasoning === true && models["gemini-test"]?.reasoning === true)
+  check("Gemini and Claude models expose image input to the host", models["gemini-test"]?.capabilities?.input?.image === true && models["claude-test-medium"]?.capabilities?.input?.image === true)
   check("single-effort models stay ungrouped", models["claude-test-medium"]?.name === "Claude Test (Medium)" && !models["claude-test-medium"]?.variants)
 }
 
@@ -514,6 +552,51 @@ async function launchedModel(body) {
   check("output effort without thinking keeps the default", await launchedModel({ model, output_config: { effort: "low" }, messages: [{ role: "user", content: "MODEL title request" }] }) === "gemini-test-high")
   check("legacy effort ids pass through unchanged", await launchedModel({ model: legacyModel, thinking: { type: "enabled", budget_tokens: 10000 }, messages: [{ role: "user", content: "MODEL legacy id" }] }) === "gemini-test-low")
   check("single-effort model requests pass through unchanged", await launchedModel({ model: "antigravity-bridge/claude-test-medium", thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL singleton" }] }) === "claude-test-medium")
+  check("modern sessions select models and levels through ACP config options", logs().some(event => event.type === "setConfig" && event.configId === "model") && logs().some(event => event.type === "setConfig" && event.configId === "thought_level" && event.value === "low"))
+  check("modern model selection does not call legacy set_model", !logs().some(event => event.type === "setModel"), JSON.stringify(logs().filter(event => event.type === "setModel")))
+}
+
+{
+  process.env.FAKE_AGY_CONFIG = "grouped"
+  const first = { model: "gemini-config-only", metadata: { user_id: "grouped-config" }, thinking: { type: "adaptive" }, output_config: { effort: "max" }, messages: [{ role: "user", content: "config only maximum" }] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  check("grouped ACP options can select a model absent from the CLI list", lastOf("user").model === "gemini-config-only-max" && stopOf(firstEvents) === "end_turn")
+  check("ACP config category selects custom option IDs", logs().some(event => event.type === "setConfig" && event.convId === convId && event.configId === "model-picker") && logs().some(event => event.type === "setConfig" && event.convId === convId && event.configId === "thinking-picker"))
+  const second = { ...nextTurn(first, firstEvents, "lower the level"), output_config: { effort: "low" } }
+  const secondEvents = (await readSSE(await callFetch(second))).events
+  check("changing only ACP effort updates the same model in the same session", lastOf("user").convId === convId && lastOf("user").model === "gemini-config-only-low")
+  const switched = { ...nextTurn(second, secondEvents, "switch families"), model: "gemini-test", output_config: { effort: "max" } }
+  await readSSE(await callFetch(switched))
+  check("model switches refresh available thinking levels before setting effort", lastOf("user").model === "gemini-test-high" && lastOf("user").convId === convId)
+  check("grouped config selection never falls back to legacy model IDs", !logs().some(event => event.type === "setModel" && event.convId === convId))
+  delete process.env.FAKE_AGY_CONFIG
+
+  for (const mode of ["omit", "unimplemented"]) {
+    process.env.FAKE_AGY_CONFIG = mode
+    const body = { model, metadata: { user_id: "legacy-config-" + mode }, messages: [{ role: "user", content: "legacy config " + mode }] }
+    const events = (await readSSE(await callFetch(body))).events
+    const convId = inits().at(-1).convId
+    check(`config ${mode} falls back to legacy set_model`, lastOf("user").model === "gemini-test-high" && logs().some(event => event.type === "setModel" && event.convId === convId))
+    await readSSE(await callFetch({ ...nextTurn(body, events, "legacy level change"), model: legacyModel }))
+    check(`config ${mode} keeps in-session legacy model switching`, lastOf("user").convId === convId && lastOf("user").model === "gemini-test-low")
+    check(`config ${mode} does not repeatedly probe an unsupported method`, logs().filter(event => event.type === "setConfig" && event.convId === convId).length === (mode === "omit" ? 0 : 1))
+    delete process.env.FAKE_AGY_CONFIG
+  }
+
+  process.env.FAKE_AGY_CONFIG = "error"
+  const before = logs().filter(event => event.type === "setModel").length
+  const rejected = await callFetch({ model, messages: [{ role: "user", content: "rejected config" }] })
+  const error = await rejected.json()
+  check("real config errors remain visible before streaming", rejected.status === 400 && error.error?.message.includes("Configuration rejected"))
+  check("real config errors do not trigger a legacy fallback", logs().filter(event => event.type === "setModel").length === before)
+  delete process.env.FAKE_AGY_CONFIG
+
+  const body = { model, messages: [{ role: "user", content: "CONFIGRESET first turn" }] }
+  const events = (await readSSE(await callFetch(body))).events
+  const resetConvId = inits().at(-1).convId
+  await readSSE(await callFetch(nextTurn(body, events, "restore requested level")))
+  check("config_option_update invalidates cached selection between turns", lastOf("user").model === "gemini-test-high" && lastOf("user").convId === resetConvId)
 }
 
 {
@@ -815,19 +898,70 @@ let nativeConv
 }
 
 {
-  const response = await callFetch({
-    model,
-    messages: [{
-      role: "user",
-      content: [
-        { type: "text", text: "what is in this image?" },
-        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
-      ],
-    }],
-  })
-  const payload = await response.json()
-  check("image content returns actual HTTP 400", response.status === 400, `got ${response.status}`)
-  check("image HTTP error explains unsupported content", payload.error?.message?.includes("not supported"), payload.error?.message)
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aXioAAAAASUVORK5CYII=" } }
+  const secondImage = { ...image, source: { ...image.source, data: "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", media_type: "image/gif" } }
+  const acpImage = value => ({ type: "image", data: value.source.data, mimeType: value.source.media_type })
+  const first = { model, messages: [{ role: "user", content: [{ type: "text", text: "compare pictures " }, image, { type: "text", text: " and " }, secondImage] }] }
+  const response = await callFetch(first)
+  const { events } = await readSSE(response)
+  const firstSession = inits().at(-1).convId
+  check("image input completes with an image-capable server", response.status === 200 && stopOf(events) === "end_turn")
+  check("text and multiple images keep their order in ACP", JSON.stringify(lastOf("user").content) === JSON.stringify([
+    { type: "text", text: "compare pictures " }, acpImage(image), { type: "text", text: " and " }, acpImage(secondImage),
+  ]))
+  check("image bytes are not interpolated into prompt text", !lastOf("user").text.includes(image.source.data))
+
+  const followup = nextTurn(first, events, [secondImage, { type: "text", text: "describe this next picture" }])
+  followup.messages[0] = structuredClone(followup.messages[0])
+  followup.messages[0].content[1].cache_control = { type: "ephemeral" }
+  const nextEvents = (await readSSE(await callFetch(followup))).events
+  check("image continuation keeps the same session", lastOf("user").convId === firstSession && stopOf(nextEvents) === "end_turn")
+  check("image continuation sends only new content", JSON.stringify(lastOf("user").content) === JSON.stringify([acpImage(secondImage), { type: "text", text: "describe this next picture" }]))
+
+  const changed = structuredClone(followup)
+  changed.messages[0].content[1] = secondImage
+  await readSSE(await callFetch(changed))
+  const replay = lastOf("user")
+  check("changing historical image content starts a new session", replay.convId !== firstSession)
+  check("history replay preserves historical and current images", replay.content.filter(block => block.type === "image").length === 3 && replay.content.filter(block => block.type === "image").every(block => block.data === secondImage.source.data))
+  check("history replay retains role and turn boundaries around images", replay.text.includes("Human: compare pictures") && replay.text.includes("</conversation_history>") && replay.text.includes("<current_turn>"))
+
+  const { default: imageRestartDefault } = await import("./index.mjs?image-restart")
+  const imageRestart = await imageRestartDefault.server({}, {})
+  const imageLoader = await imageRestart.auth.loader(async () => ({ key: "agy" }))
+  const resumed = await imageLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(nextTurn(followup, nextEvents, "recall the pictures")) })
+  await readSSE(resumed)
+  check("a restarted bridge resumes an image conversation", inits().at(-1).resumed && lastOf("user").convId === firstSession)
+  check("image resume does not replay previously sent images", lastOf("user").content.length === 1 && lastOf("user").text === "recall the pictures")
+  check("persisted session state contains no image data", !fs.readFileSync(bridgeStateFile, "utf8").includes(image.source.data))
+
+  for (const capability of ["0", "omit"]) {
+    process.env.FAKE_AGY_IMAGES = capability
+    const body = { ...first, metadata: { user_id: "legacy-image-" + capability } }
+    const before = logs().filter(event => event.type === "user").length
+    const rejected = await callFetch(body)
+    const error = await rejected.json()
+    check(`image capability ${capability} returns HTTP 400 before streaming`, rejected.status === 400 && error.error?.message.includes("image-capable"))
+    check(`image capability ${capability} sends no model prompt`, logs().filter(event => event.type === "user").length === before)
+    const textResponse = await callFetch({ ...body, messages: [{ role: "user", content: "legacy text still works " + capability }] })
+    check(`image capability ${capability} still allows text`, stopOf((await readSSE(textResponse)).events) === "end_turn")
+    delete process.env.FAKE_AGY_IMAGES
+  }
+
+  const invalid = [
+    { type: "image", source: { type: "url", url: "https://example.invalid/image.png" } },
+    { ...image, source: { ...image.source, data: "" } },
+    { ...image, source: { ...image.source, data: "not base64!" } },
+    { ...image, source: { ...image.source, media_type: "application/pdf" } },
+    { type: "document", source: { type: "base64", media_type: "application/pdf", data: "AAAA" } },
+  ]
+  const before = inits().length
+  for (const block of invalid) {
+    const rejected = await callFetch({ model, messages: [{ role: "user", content: [block] }] })
+    check(`invalid ${block.type} source ${block.source.type}/${block.source.media_type || "URL"} returns HTTP 400`, rejected.status === 400)
+    await rejected.text()
+  }
+  check("invalid image and document inputs start no agy process", inits().length === before)
 }
 
 {

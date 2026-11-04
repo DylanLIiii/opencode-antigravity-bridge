@@ -246,6 +246,37 @@ function resolveAgyModel(catalog, model, body) {
   return family.byEffort.get(effort)
 }
 
+function selectValues(options) {
+  return (Array.isArray(options) ? options : []).flatMap(option =>
+    Array.isArray(option?.options) ? selectValues(option.options)
+      : typeof option?.value === "string" ? [option] : [])
+}
+
+function configSelect(options, category) {
+  return options.find(option => option?.type === "select" && option.category === category)
+    || options.find(option => option?.type === "select" && option.id === category)
+}
+
+function configModelSelection(options, model, selection) {
+  const config = configSelect(options, "model")
+  if (!config) return null
+  const values = selectValues(config.options)
+  const requested = selection?.model || model
+  const target = values.find(option => option.value === requested)
+    || values.filter(option => model.startsWith(option.value + "-") &&
+      EFFORT_ORDER.includes(model.slice(option.value.length + 1)))
+      .sort((a, b) => b.value.length - a.value.length)[0]
+  if (!target) return null
+  const suffix = model.startsWith(target.value + "-") ? model.slice(target.value.length + 1) : ""
+  return {
+    config,
+    value: target.value,
+    // Explicit legacy IDs keep their level; grouped model requests can use
+    // levels advertised by ACP even if `agy models` lacks those suffixes.
+    effort: requested === target.value ? selection?.effort || suffix : suffix,
+  }
+}
+
 class BusyError extends Error {
   constructor(message) {
     super(message)
@@ -553,6 +584,7 @@ class Proc {
     this.agyPath = agyPath
     this.convKey = convKey
     this.model = opts.model
+    this.selection = opts.selection
     this.tools = opts.tools
     this.toolsSignature = JSON.stringify(opts.tools)
     this.workDir = opts.workDir
@@ -562,6 +594,10 @@ class Proc {
     this.sessionId = null
     this.currentModel = null
     this.agentVersion = null
+    this.supportsImages = false
+    this.configOptions = []
+    this.configMethodUnsupported = false
+    this.currentSelectionKey = null
     this.instructionsInSession = false
     this.resumed = false
     this.child = null
@@ -577,7 +613,7 @@ class Proc {
     this.stderrTail = ""
     this.hasSentFirstTurn = false
     this.historyInvalid = false
-    this.unsentPrompt = ""
+    this.unsentPrompt = null
     this.turn = null
     this.expectedMessages = null
     this.toolsVersion = 1
@@ -667,6 +703,7 @@ class Proc {
     })
     this.agentVersion = init?.agentInfo?.version ?? null
     const capabilities = init?.agentCapabilities ?? {}
+    this.supportsImages = capabilities.promptCapabilities?.image === true
     const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
@@ -698,19 +735,57 @@ class Proc {
     }
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
-    if (this.model && (this.resumed || this.model !== this.currentModel)) await this.#setModel(this.model)
+    this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
+    if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
   }
 
-  async #setModel(model) {
+  async #setConfig(config, value) {
+    const result = await this.conn.request("session/set_config_option", {
+      sessionId: this.sessionId, configId: config.id, value,
+    })
+    if (!Array.isArray(result?.configOptions)) throw new Error("agy returned no configOptions after setting a session option")
+    this.configOptions = result.configOptions
+    const updated = this.configOptions.find(option => option.id === config.id)
+    if (updated?.currentValue !== value) throw new Error(`agy did not apply session option ${config.id}`)
+  }
+
+  async #setModel(model, selection, force = false) {
+    const selectionKey = stableJSON({ model, selection })
+    if (!force && this.currentSelectionKey === selectionKey) return
     try {
-      await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model })
+      let configured = false
+      const target = this.configMethodUnsupported ? null : configModelSelection(this.configOptions, model, selection)
+      if (target) {
+        try {
+          if (force || target.config.currentValue !== target.value) await this.#setConfig(target.config, target.value)
+          // A model change can replace the thinking options and their values.
+          const thought = configSelect(this.configOptions, "thought_level")
+          const levels = selectValues(thought?.options).map(option => option.value).filter(value => EFFORT_ORDER.includes(value))
+          if (target.effort && levels.length) {
+            const level = closestEffort(target.effort, levels)
+            if (force || thought.currentValue !== level) await this.#setConfig(thought, level)
+            configured = true
+          } else {
+            // A standalone model is fully selected by its advertised value.
+            // A separate legacy level still needs the old model-ID route.
+            configured = !target.effort || target.value === model
+          }
+        } catch (error) {
+          if (error.acpError?.code !== -32601) throw error
+          this.configMethodUnsupported = true
+        }
+      }
+      if (!configured && (force || model !== this.currentModel || target)) {
+        await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model })
+      }
     } catch (error) {
       const wrapped = new Error(`agy bridge: model ${model} is unavailable to this agy account: ${error.message}`)
       wrapped.statusCode = 400
       throw wrapped
     }
     this.currentModel = model
+    this.currentSelectionKey = selectionKey
   }
 
   #waitForToolList(version) {
@@ -777,6 +852,11 @@ class Proc {
 
   #onNotification(method, params) {
     if (method !== "session/update" || params?.sessionId !== this.sessionId) return
+    if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
+      this.configOptions = params.update.configOptions
+      this.currentSelectionKey = null
+      return
+    }
     const turn = this.turn
     if (!turn || turn.done || turn.finalized) return
     const update = params.update ?? {}
@@ -791,16 +871,19 @@ class Proc {
     }
   }
 
-  startTurn(content, messages, model) {
+  startTurn(content, messages, model, selection) {
     if (this.dead) throw this.deadError
     if (this.retiring) throw new BusyError("agy bridge: this conversation's process is being retired")
     if (this.turn) throw new BusyError("agy bridge: this conversation still has an unfinished response")
+    if (content.some(block => block.type === "image") && !this.supportsImages) {
+      throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
+    }
     const turn = new Turn(this, messages)
     this.turn = turn
     this.expectedMessages = messages.map((message) => ({ ...message }))
     this.historyInvalid = false
     this.lastUsed = Date.now()
-    this.#runTurn(turn, content, model).catch(() => {})
+    this.#runTurn(turn, content, model, selection).catch(() => {})
     return turn
   }
 
@@ -820,18 +903,18 @@ class Proc {
     }
   }
 
-  async #runTurn(turn, content, model) {
+  async #runTurn(turn, content, model, selection) {
     try {
-      if (model && model !== this.currentModel) await this.#setModel(model)
+      if (model) await this.#setModel(model, selection)
       // Text a cancelled turn never delivered still belongs to the session.
-      let text = this.unsentPrompt ? this.unsentPrompt + "\n\n" + content : content
-      this.unsentPrompt = ""
+      let prompt = this.unsentPrompt ? [...this.unsentPrompt, { type: "text", text: "\n\n" }, ...content] : content
+      this.unsentPrompt = null
       let usage = null
       for (;;) {
         turn.logOffset = await fileSize(this.logPath)
         // A cancel that arrived before the prompt would be ignored by agy.
         if (turn.cancelRequested) {
-          if (this.hasSentFirstTurn) this.unsentPrompt = text
+          if (this.hasSentFirstTurn) this.unsentPrompt = prompt
           turn.complete({ stopReason: "cancelled" })
           return
         }
@@ -839,7 +922,7 @@ class Proc {
         this.hasSentFirstTurn = true
         const result = await this.conn.request("session/prompt", {
           sessionId: this.sessionId,
-          prompt: [{ type: "text", text }],
+          prompt,
         })
         usage = addUsage(usage, result?.usage)
         if (turn.cancelRequested) {
@@ -860,7 +943,7 @@ class Proc {
         turn.arm()
         await turn.waitLate()
         for (const call of late) call.lateDelivered = true
-        text = renderLateResults(late)
+        prompt = [{ type: "text", text: renderLateResults(late) }]
       }
     } catch (error) {
       if (turn.cancelRequested && !this.dead) {
@@ -1411,6 +1494,8 @@ function historyKey(messages) {
         value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
       } else if (block.type === "tool_result") {
         value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
+      } else if (block.type === "image") {
+        value = imageContent(block)
       } else {
         value = block
       }
@@ -1523,9 +1608,8 @@ function blockText(block) {
       : String(block.content ?? "")
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
   }
-  if (block.type === "image" || block.type === "document") {
-    throw new UnsupportedContent("an image/document block in a user message (agy's ACP prompt accepts text only)")
-  }
+  if (block.type === "image") throw new UnsupportedContent("an image beside a live tool_result; send it after the tool response completes")
+  if (block.type === "document") throw new UnsupportedContent("a document block in a user message")
   if (block.type === "tool_use") throw new UnsupportedContent("a tool_use block in a user message")
   throw new UnsupportedContent(`a content block of type ${JSON.stringify(block.type)}`)
 }
@@ -1534,6 +1618,41 @@ function messageText(message) {
   if (typeof message.content === "string") return message.content
   if (Array.isArray(message.content)) return message.content.map(blockText).join("")
   return String(message.content ?? "")
+}
+
+function imageContent(block) {
+  const source = block.source
+  if (source?.type !== "base64") {
+    throw new UnsupportedContent("an image source other than base64; provide inline image data instead of a URL")
+  }
+  if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(source.media_type)) {
+    throw new UnsupportedContent("an image media type other than PNG, JPEG, GIF or WebP")
+  }
+  if (typeof source.data !== "string" || !source.data ||
+    source.data.length % 4 !== 0 || /[^A-Za-z0-9+/]/.test(source.data.replace(/={1,2}$/, ""))) {
+    throw new UnsupportedContent("invalid base64 image data")
+  }
+  return { type: "image", data: source.data, mimeType: source.media_type }
+}
+
+// Keep text adjacent to its images, including when an old conversation has to
+// be replayed. Never interpolate image bytes into the text seen by the model.
+function appendPrompt(out, content) {
+  const blocks = typeof content === "string" ? [{ type: "text", text: content }] : content
+  for (const block of blocks) {
+    const last = out.at(-1)
+    if (last?.type === "text" && block.type === "text") last.text += block.text
+    else out.push({ ...block })
+  }
+}
+
+function messagePrompt(message) {
+  const blocks = Array.isArray(message.content) ? message.content : [message.content]
+  const out = []
+  for (const block of blocks) {
+    appendPrompt(out, block?.type === "image" ? [imageContent(block)] : blockText(block))
+  }
+  return out.length ? out : [{ type: "text", text: "" }]
 }
 
 function renderAssistantTurn(message) {
@@ -1571,29 +1690,36 @@ function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
   const out = []
   if (!instructionsInSession) {
     const system = systemText(body)
-    if (system.trim()) out.push(`<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
-    if (callerWorkDir) out.push(`\n${workDirNote(callerWorkDir)}\n\n`)
+    if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
+    if (callerWorkDir) appendPrompt(out, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   if (history.length) {
-    out.push("<conversation_history>\n")
+    appendPrompt(out, "<conversation_history>\n")
     for (const message of history) {
-      if (message.role === "user") out.push(`Human: ${messageText(message)}\n`)
-      else if (message.role === "assistant") out.push(`Assistant: ${renderAssistantTurn(message)}\n`)
-      else out.push(`${message.role}: ${messageText(message)}\n`)
+      if (message.role === "assistant") appendPrompt(out, `Assistant: ${renderAssistantTurn(message)}\n`)
+      else {
+        appendPrompt(out, message.role === "user" ? "Human: " : `${message.role}: `)
+        appendPrompt(out, messagePrompt(message))
+        appendPrompt(out, "\n")
+      }
     }
-    out.push("Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
-    out.push("</conversation_history>\n\n")
+    appendPrompt(out, "Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
+    appendPrompt(out, "</conversation_history>\n\n")
   }
-  const currentText = current.map(message => message.role === "user"
-    ? messageText(message) : `${message.role}: ${messageText(message)}`).join("\n\n")
+  const wrapped = out.length > 0
   // A fresh conversation needs no wrapper; it would only add tokens.
-  if (!out.length) return currentText
-  out.push("<current_turn>\n", currentText, "\n</current_turn>")
-  return out.join("")
+  if (wrapped) appendPrompt(out, "<current_turn>\n")
+  current.forEach((message, index) => {
+    if (index) appendPrompt(out, "\n\n")
+    if (message.role !== "user") appendPrompt(out, `${message.role}: `)
+    appendPrompt(out, messagePrompt(message))
+  })
+  if (wrapped) appendPrompt(out, "\n</current_turn>")
+  return out
 }
 
 function renderContinuedTurn(body) {
-  return messageText(body.messages[body.messages.length - 1])
+  return messagePrompt(body.messages[body.messages.length - 1])
 }
 
 function validateBody(body) {
@@ -1623,6 +1749,7 @@ function validateBody(body) {
       if (Array.isArray(message.content)) {
         for (const block of message.content) {
           if (block?.type === "tool_result") toolResult(block)
+          else if (block?.type === "image") imageContent(block)
           else if (block?.type === "text" || typeof block === "string") continue
           else blockText(block)
         }
@@ -2099,6 +2226,7 @@ export const AntigravityBridgePlugin = async () => {
             const requestedModel = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel
             body = { ...body, model: requestedModel }
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
+            const selection = { model: requestedModel, effort: requestedEffort(body) }
             const convKey = conversationKey(body)
             const isFresh = body.messages.length <= 1
             const resultBlocks = extractToolResults(body)
@@ -2154,14 +2282,14 @@ export const AntigravityBridgePlugin = async () => {
               const proc = await acquireProc(
                 agy,
                 convKey,
-                { model, tools, workDir, instructions, history: body.messages.slice(0, -1) },
+                { model, selection, tools, workDir, instructions, history: body.messages.slice(0, -1) },
                 isFresh,
                 resultBlocks.length > 0,
               )
               const content = proc.hasSentFirstTurn
                 ? renderContinuedTurn(body)
                 : renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession)
-              const turn = proc.startTurn(content, body.messages, model)
+              const turn = proc.startTurn(content, body.messages, model, selection)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
               return jsonError(error.statusCode ?? 502, error.message)
@@ -2178,14 +2306,18 @@ export const AntigravityBridgePlugin = async () => {
         const catalog = agy ? await loadModelCatalog(agy, true) : buildModelCatalog(FALLBACK_MODELS)
         const out = {}
         for (const model of catalog.models) {
+          const imageModel = /^(?:gemini-|claude-)/.test(model.id)
           out[model.id] = {
             id: model.id,
             name: model.name,
             npm: NPM_ANTHROPIC,
             api: { id: model.id, url: "agy://local", npm: NPM_ANTHROPIC },
+            capabilities: {
+              ...(imageModel ? { attachment: true, input: { text: true, image: true }, output: { text: true } } : {}),
+              ...(model.variants ? { reasoning: true } : {}),
+            },
             ...(model.variants ? {
               reasoning: true,
-              capabilities: { reasoning: true },
               variants: Object.fromEntries(model.variants.map(effort => [effort, {}])),
             } : {}),
           }

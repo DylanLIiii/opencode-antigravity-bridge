@@ -29,8 +29,9 @@ Google Code Assist backend
 
 ## Requirements
 
-- Antigravity CLI (`agy`) with the `acp` subcommand (verified with **1.4.12**),
-  signed in interactively at least once.
+- Antigravity CLI (`agy`) with the `acp` subcommand, signed in interactively at
+  least once. Text/tool transport was verified with **1.4.12** and **1.5.0**;
+  user image input requires an image-capable ACP server (verified with **1.5.0**).
 - magpie with OpenCode-style provider plugin support.
 - No global MCP configuration is required, and none is used: the plugin creates
   an isolated, temporary agent per agy process.
@@ -56,6 +57,11 @@ magpie plugin add ./opencode-antigravity-bridge
 
 - **Streaming responses** from ACP `agent_message_chunk` updates, with
   keepalive pings and explicit terminal error frames.
+- **User image input** as inline base64 PNG, JPEG, GIF or WebP. Text and images
+  keep their order in initial prompts, continued turns and history replay.
+  The server must advertise `promptCapabilities.image`; otherwise the request
+  returns HTTP 400 before streaming. Gemini and Claude model entries expose
+  image input to the host; the runtime capability check still applies.
 - **Thinking summaries.** agy's `agent_thought_chunk` summaries stream as
   Anthropic `thinking` blocks (`thinking_delta`), each closed by a
   `signature_delta`, so clients keep the block and replay it in history. agy's
@@ -65,8 +71,12 @@ magpie plugin add ./opencode-antigravity-bridge
   suppress them.
 - **All account models.** The ACP client identifies as an allowlisted client,
   which is how agy offers Claude and GPT-OSS models besides Gemini (as T3 Code
-  does). Changing the model, or the effort level, switches it inside the live
-  session with `session/set_model`; the conversation is not replayed.
+  does). Changing the model, or the effort level, uses the server's ACP
+  `model` and `thought_level` configuration options inside the live session.
+  Model changes refresh the available thinking levels; configuration update
+  notifications keep the selection current. Older servers without these
+  options or `session/set_config_option` use `session/set_model` instead.
+  Real configuration errors are surfaced, and the conversation is not replayed.
 - **Native client tools through MCP**, served as agy's IDE tools: JSON Schema
   declarations, parallel and consecutive calls, tool errors, image results and
   multiple tool rounds. The first response ends with `stop_reason: tool_use`
@@ -246,10 +256,10 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 
 ## Limitations
 
-- **User images and documents** are rejected with HTTP 400: agy 1.4.12 does not
-  advertise ACP image prompts, and its model does not receive them. Base64
-  images returned inside a `tool_result` are passed through as MCP image
-  content.
+- **Image URLs, malformed base64 and user documents** are rejected with HTTP
+  400. Provide image bytes inline; the bridge does not fetch remote URLs.
+  Older servers without ACP image capability reject user images. Base64
+  images returned inside a `tool_result` continue to use MCP image content.
 - **agy runs parallel IDE tool calls one after another.** Each call reaches the
   client in its own `tool_use` response; calls agy issues together still leave
   in one response.
@@ -308,7 +318,7 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. Its 170 checks pass under both Node and Bun. They cover the minimal
+exercised. Its 208 checks pass under Node. They cover the minimal
 agent and allowlisted client identity, session instructions, streaming, thought
 summaries with bridge-issued signatures, per-turn usage, session reuse, conversation isolation, native tool
 round-trips, parallel/consecutive calls, atomic result validation, failures,
@@ -319,11 +329,45 @@ with `session/resume`, resume after a simulated bridge restart from the hashed s
 UTF-8, cleanup, model discovery/effort routing, HTTP errors, reformatted
 histories, renamed tool IDs (including ambiguity and changed arguments),
 compaction replay, task/system-update notices, and local/remote caller
-environments, plus the public quota hook. The 14 focused tests in
+environments, plus the public quota hook. Image cases cover ordered multimodal
+prompts, continuations, replay, restart/resume, metadata normalization,
+capability rejection and invalid input. Configuration cases cover grouped
+selectors, model-dependent thinking levels, server notifications, legacy
+fallback and genuine errors. The 14 focused tests in
 `test-usage.mjs` cover quota parsing, version gating, browser/update guards,
 output/time budgets, cancellation, process-group and workspace cleanup, safe
 diagnostics, concurrency, and fresh sequential reads. Run those under Bun with
 `bun test ./test-usage.mjs`, and the smoke suite with `bun test-smoke.mjs`.
+The earlier 170-check suite passed on Bun; the new cases have not been run on
+Bun in this environment.
+
+Real CLI checks are opt-in and consume a small amount of the signed-in
+account's model quota:
+
+```sh
+AGY_BRIDGE_INTEGRATION=1 npm run test:integration
+# Optionally choose another image-capable model or include quota reporting:
+AGY_BRIDGE_INTEGRATION=1 AGY_BRIDGE_TEST_MODEL=gemini-4-argon AGY_BRIDGE_TEST_USAGE=1 npm run test:integration
+```
+
+The integration check uses private temporary bridge state and two separate
+Node processes. It checks image comprehension, a native MCP tool round trip,
+final text and token usage, then cross-process resume with the original image
+and tool context and a different thinking level. It uses the normal `AGY_PATH`
+and CLI environment. It does not change global model or proxy settings.
+
+On Linux with real **agy 1.5.0**, this check passed with `gemini-3.8-flash`
+and `gemini-4-argon`: each model identified the red test image, used the client
+tool once, and remembered the image color and tool result after a new bridge
+process resumed the same agy session. A separate control-plane probe verified ACP model
+configuration switches between Gemini and Claude and thinking-level changes.
+Neither model emitted a thinking summary in the checked first turn. An earlier
+Argon attempt exceeded the 60-second ACP startup budget; the control-plane
+probe and full integration retry passed without increasing that budget. The
+cause of the earlier timeout is unresolved. Real quota reporting on 1.5.0
+remains unverified: an earlier Google eligibility request returned EOF, and the
+final quota-hook retry timed out within its 18-second budget. The parser and
+host timeout budget are unchanged.
 
 The ACP transport was verified on Linux with real agy **1.4.12** through the
 plugin's fetch hook: thought summaries and text, a `tool_use → tool_result →

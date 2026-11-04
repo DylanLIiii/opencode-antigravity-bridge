@@ -1186,7 +1186,7 @@ function stillRunningText(call) {
 }
 
 function resultText(result) {
-  return (result?.content || []).map((part) => part?.type === "text" ? part.text : "[image returned by tool]").join("")
+  return (result?.content || []).map((part) => part?.type === "text" ? part.text : "[image returned by tool]").join("\n\n")
 }
 
 function renderLateResults(calls) {
@@ -1554,6 +1554,9 @@ function blockText(block) {
     throw new UnsupportedContent("a non-object content block")
   }
   if (block.type === "text") return typeof block.text === "string" ? block.text : ""
+  if (block.type === "tool_reference" && typeof block.tool_name === "string") {
+    return `Loaded tool: ${block.tool_name}`
+  }
   if (block.type === "tool_result") {
     const inner = Array.isArray(block.content)
       ? block.content.map((part) => {
@@ -1702,6 +1705,9 @@ function toolResult(block) {
   } else if (Array.isArray(block.content)) {
     content = block.content.map((part) => {
       if (part?.type === "text" && typeof part.text === "string") return { type: "text", text: part.text }
+      if (part?.type === "tool_reference" && typeof part.tool_name === "string") {
+        return { type: "text", text: `Loaded tool: ${part.tool_name}` }
+      }
       if (part?.type === "image" && part.source?.type === "base64" && part.source.data) {
         return {
           type: "image",
@@ -1724,16 +1730,74 @@ function extractToolResults(body) {
     ? message.content.filter(block => block?.type === "tool_result") : [])
 }
 
-// Forward complete protocol-generated context notices without turning ordinary
-// user instructions into tool output. OpenCode can append a <system-update>
-// after a tool result when its dynamic tool catalog changes.
+function findLastResultIndex(results, predicate) {
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (predicate(results[i])) return i
+  }
+  return -1
+}
+
+function isSkillResult(item) {
+  if (item.call?.name === "Skill") return true
+  const first = item.result?.content?.[0]
+  return first?.type === "text" &&
+    /^(?:Launching skill|Loaded skill instructions \(read-only\)): /.test(first.text || "")
+}
+
+function appendResultText(results, index, text) {
+  const target = index >= 0 ? index : results.length - 1
+  const targetCall = results[target]?.call
+  return results.map((item, i) => (targetCall ? item.call !== targetCall : i !== target) ? item : {
+    ...item,
+    result: {
+      ...item.result,
+      content: [...item.result.content, { type: "text", text }],
+    },
+  })
+}
+
+function isInterruptedToolTurn(body) {
+  let seenResult = false
+  for (const message of trailingMessages(body).messages) {
+    const blocks = Array.isArray(message.content) ? message.content : [message.content]
+    for (const block of blocks) {
+      if (block?.type === "tool_result") {
+        seenResult = true
+        continue
+      }
+      const text = blockText(block)
+      if (!seenResult && text.trim()) return false
+      if (seenResult && message.role === "user" &&
+        /^\[Request interrupted by user(?:\s+for tool use)?\]\s*$/.test(text)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// Forward complete protocol-generated context notices and tool-companion blocks
+// without turning ordinary user instructions into tool output. OpenCode can
+// append a <system-update> after a tool result when its dynamic tool catalog
+// changes; Claude Code appends turn-companion blocks for Skill bodies, image
+// coordinate dimensions, and ToolSearch confirmations.
 function withContextNotices(results, body) {
+  let out = results
   const notices = []
   let seenResult = false
-  const contextNotice = /<system-update(?:\s[^>]*)?>[\s\S]*?<\/system-update>|(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
+  const skillIndex = findLastResultIndex(out, isSkillResult)
+  const imageIndex = findLastResultIndex(out, (item) =>
+    item.result?.content?.some((part) => part?.type === "image"))
+  const toolSearchIndex = findLastResultIndex(out, (item) => item.call?.name === "ToolSearch")
+  const contextNotice = /<system-update(?:\s[^>]*)?>[\s\S]*?<\/system-update>|(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>|<teammate-message(?:\s[^>]*)?>[\s\S]*?<\/teammate-message>/g
   const systemReminder = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder>/g
-  const unclosedNotice = /<\/?(?:system-update|task-notification|system-reminder)\b/
+  const protocolNoticeStart = /^(?:<(?:system-update|task-notification|teammate-message|system-reminder)\b|\[SYSTEM NOTIFICATION - NOT USER INPUT\])/
+  const unclosedNotice = /<\/?(?:system-update|task-notification|teammate-message|system-reminder)\b/
   const userInterruption = /The user sent (?:a new message while you were working|the following message):/
+  const skillCompanion = /^\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) /
+  const imageCompanion = /^\[Image(?: source)?: [^\r\n]+\]$/
+  const toolLoadedCompanion = /^Tools? loaded\.(?:\n\[id:[^\]\n]+\])*$/
+  const loopNotice = /^\[\d+ prior \/loop wakeups? found nothing actionable; loop is healthy\.\]$/
   const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/
   const hookNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
   const structuredDelta = /<(?:deferred_tools_delta|mcp_instructions_delta|agent_listing_delta|skill_listing)\b|^# Environment\b/m
@@ -1746,11 +1810,35 @@ function withContextNotices(results, body) {
         continue
       }
       const text = blockText(block)
-      if (!seenResult && text.trim()) {
+      const trimmed = text.trim()
+      if (!seenResult && trimmed) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+      if (!trimmed) continue
+      if (message.role === "user" && skillCompanion.test(text)) {
+        out = appendResultText(out, skillIndex, text)
+        continue
       }
       if (userInterruption.test(text)) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+      if (message.role === "user") {
+        if (imageCompanion.test(trimmed)) {
+          out = appendResultText(out, imageIndex, trimmed)
+          continue
+        }
+        if (toolLoadedCompanion.test(trimmed)) {
+          out = appendResultText(out, toolSearchIndex, trimmed)
+          continue
+        }
+        if (loopNotice.test(trimmed)) {
+          notices.push(trimmed)
+          continue
+        }
+        if (skillIndex >= 0 && !isNoise(trimmed) && !protocolNoticeStart.test(trimmed)) {
+          out = appendResultText(out, skillIndex, text)
+          continue
+        }
       }
       notices.push(...Array.from(text.matchAll(contextNotice), (match) => match[0]))
       const withoutNotices = text.replace(contextNotice, "")
@@ -1769,12 +1857,8 @@ function withContextNotices(results, body) {
       }
     }
   }
-  if (!notices.length) return results
-  const last = results.at(-1)
-  return [...results.slice(0, -1), { ...last, result: {
-    ...last.result,
-    content: [...last.result.content, { type: "text", text: `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>` }],
-  } }]
+  if (!notices.length) return out
+  return appendResultText(out, out.length - 1, `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>`)
 }
 
 function namedWorkDirectory(body, init) {
@@ -1803,9 +1887,16 @@ function namedWorkDirectory(body, init) {
 }
 
 function workDirectory(directory) {
-  if (!directory || !path.isAbsolute(directory)) return null
+  if (!directory) return null
+  let candidate = directory
+  if (process.platform === "win32" && candidate.startsWith("/")) {
+    const wsl = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/.exec(candidate)
+    if (!wsl) return null
+    candidate = `${wsl[1].toUpperCase()}:\\${(wsl[2] || "").replace(/\//g, "\\")}`
+  }
+  if (!path.isAbsolute(candidate)) return null
   try {
-    if (fs.statSync(directory).isDirectory()) return path.resolve(directory)
+    if (fs.statSync(candidate).isDirectory()) return path.resolve(candidate)
   } catch {}
   return null
 }
@@ -2201,16 +2292,20 @@ export const AntigravityBridgePlugin = async () => {
                   }
                   if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
                   if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
-                  const results = withContextNotices(matches.map(({ block, match }) => ({
+                  const rawResults = matches.map(({ block, match }) => ({
                     block,
                     call: match.call,
                     result: toolResult(block),
-                  })), body)
-                  proc.validateResults(results)
-                  if (!proc.matchesHistory(trailingMessages(body).history) || proc.workDir !== workDir ||
-                    proc.instructions !== instructions) {
-                    // A changed context needs a new session. Replay the real
-                    // results without resolving the old process's calls.
+                  }))
+                  proc.validateResults(rawResults)
+                  const interrupted = isInterruptedToolTurn(body)
+                  const results = interrupted ? rawResults : withContextNotices(rawResults, body)
+                  if (!interrupted) proc.validateResults(results)
+                  if (interrupted || !proc.matchesHistory(trailingMessages(body).history) ||
+                    proc.workDir !== workDir || proc.instructions !== instructions) {
+                    // A changed context or user-interrupted tool turn needs a new
+                    // session. Replay the real results without resolving the old
+                    // process's calls.
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()

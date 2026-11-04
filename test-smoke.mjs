@@ -236,6 +236,22 @@ async function prompt(params) {
     chunk("Late result seen: " + (/\[tool result for echo call_id=\S+\]\n([^\n]*)/.exec(text)?.[1] || "none"))
     return finish("late")
   }
+  if (text.includes("SKILLCALL")) {
+    chunk("Before skill.\n")
+    await invoke("Skill", { skill: "hengjian-chat-archive" })
+    chunk("After skill.\n")
+    return finish("Before skill.\nAfter skill.\n")
+  }
+  if (text.includes("TOOLSEARCHCALL")) {
+    await invoke("ToolSearch", { query: "select:WebFetch" })
+    chunk("After tool search.\n")
+    return finish("After tool search.\n")
+  }
+  if (text.includes("ESCCALL") && !text.includes("<conversation_history>")) {
+    await invoke("echo", { text: "probe" })
+    chunk("After esc.\n")
+    return finish("After esc.\n")
+  }
   if (text.includes("TOOL")) {
     chunk("Before tool.\n")
     await invoke("echo", { text: "probe" })
@@ -1316,6 +1332,133 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check("unsupported system content block error names the block type",
     nonTextSystem.status === 400 && nonTextPayload.error?.message?.includes('"tool_addition"'),
     nonTextPayload.error?.message)
+}
+
+{
+  // Claude Code Skill tool appends SKILL.md as a user text block beside tool_result.
+  const skillTool = {
+    name: "Skill",
+    description: "Invoke a skill",
+    input_schema: { type: "object", properties: { skill: { type: "string" } } },
+  }
+  const first = { model, messages: [{ role: "user", content: "SKILLCALL load archive skill" }], tools: [skillTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const skillBody = [
+    "Base directory for this skill: /root/.claude/skills/hengjian-chat-archive",
+    "",
+    "# Archive Skill",
+    "Docs may quote `<system-reminder>` or `The user sent a new message while you were working:` literally.",
+  ].join("\n")
+  const second = continuation(first, events, "Launching skill: hengjian-chat-archive")
+  second.messages.at(-1).content.push({ type: "text", text: skillBody })
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === convId).at(-1)
+  const parts = delivered?.result?.content?.map(part => part.text) || []
+  check("Claude Code Skill companion block continues the live turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before, `got ${response.status}`)
+  check("Skill companion body reaches MCP verbatim alongside Launching skill",
+    parts[0] === "Launching skill: hengjian-chat-archive" && parts[1] === skillBody, JSON.stringify(parts))
+  const third = nextTurn(second, final, "MEMORY after skill")
+  const thirdRes = await callFetch(third)
+  const thirdEvents = (await readSSE(thirdRes)).events
+  check("turn after Skill companion reuses the same live session",
+    thirdRes.status === 200 && stopOf(thirdEvents) === "end_turn" && inits().length === before && lastOf("user").convId === convId)
+}
+
+{
+  // MCP prompt Skill without Base directory header + protocol notice beside tool_result.
+  const skillTool = { name: "Skill", description: "Skill", input_schema: { type: "object" } }
+  const first = { model, messages: [{ role: "user", content: "SKILLCALL mcp prompt skill" }], tools: [skillTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const second = continuation(first, events, "Launching skill: mcp-review")
+  second.messages.at(-1).content.push(
+    { type: "text", text: "# MCP Skill Prompt\nReview every changed file carefully." },
+    { type: "text", text: "<system-reminder>Allowed tools updated</system-reminder>" },
+  )
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === convId).at(-1)
+  const mcpText = delivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("prompt-only Skill companion and system-reminder continue the live turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before &&
+    mcpText.includes("# MCP Skill Prompt") && mcpText.includes("Allowed tools updated"), mcpText)
+}
+
+{
+  // Claude Code image dimension note, ToolSearch tool_reference + Tool loaded., teammate-message, and /loop fold.
+  const first = { model, messages: [{ role: "user", content: "TOOL image dimension companion" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const second = continuation(first, events, [
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+  ])
+  second.messages.at(-1).content.push(
+    { type: "text", text: "[Image: original 3423x1834, displayed at 2000x1072. Multiply coordinates by 1.71 to map to original image.]" },
+    { type: "text", text: "<teammate-message teammate_id=\"worker-1\">check complete</teammate-message>" },
+    { type: "text", text: "[2 prior /loop wakeups found nothing actionable; loop is healthy.]" },
+  )
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === convId).at(-1)
+  const content = delivered?.result?.content || []
+  const texts = content.filter(part => part.type === "text").map(part => part.text).join("\n")
+  check("image dimension companion, teammate-message, and loop notice continue live turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before &&
+    content[0]?.type === "image" &&
+    texts.includes("Multiply coordinates by 1.71") &&
+    texts.includes("worker-1") &&
+    texts.includes("prior /loop wakeups"), JSON.stringify(content))
+
+  const searchTool = { name: "ToolSearch", description: "Search deferred tools", input_schema: { type: "object" } }
+  const searchFirst = { model, messages: [{ role: "user", content: "TOOLSEARCHCALL load WebFetch" }], tools: [searchTool] }
+  const searchEvents = (await readSSE(await callFetch(searchFirst))).events
+  const searchConv = inits().at(-1).convId
+  const beforeSearch = inits().length
+  const searchSecond = continuation(searchFirst, searchEvents, [
+    { type: "tool_reference", tool_name: "WebFetch" },
+  ])
+  searchSecond.messages.at(-1).content.push({ type: "text", text: "Tool loaded." })
+  const searchRes = await callFetch(searchSecond)
+  const searchFinal = (await readSSE(searchRes)).events
+  const searchDelivered = logs().filter(event => event.type === "mcpResult" && event.convId === searchConv).at(-1)
+  const searchText = searchDelivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("ToolSearch tool_reference and Tool loaded. companion continue live turn",
+    searchRes.status === 200 && stopOf(searchFinal) === "end_turn" && inits().length === beforeSearch &&
+    searchText.includes("Loaded tool: WebFetch") && searchText.includes("Tool loaded."), searchText)
+  const afterSearch = nextTurn(searchSecond, searchFinal, "MEMORY after tool search")
+  const afterSearchRes = await callFetch(afterSearch)
+  await readSSE(afterSearchRes)
+  check("turn after ToolSearch tool_reference reuses the live session",
+    afterSearchRes.status === 200 && inits().length === beforeSearch)
+}
+
+{
+  // Pressing Esc during a client tool run appends [Request interrupted by user] + the new user prompt.
+  const first = { model, messages: [{ role: "user", content: "ESCCALL interrupted by user" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const old = inits().at(-1)
+  const second = continuation(first, events, "partial tool output")
+  second.messages.at(-1).content.push(
+    { type: "text", text: "[Request interrupted by user]\n" },
+    { type: "text", text: "New instruction after Esc" },
+  )
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const replay = lastOf("user")
+  check("user-interrupted tool turn abandons old process and starts new turn cleanly",
+    response.status === 200 && stopOf(final) === "end_turn" && replay.convId !== old.convId &&
+    replay.text.includes("New instruction after Esc") && !fs.existsSync(old.cwd), `got ${response.status}`)
+  const third = nextTurn(second, final, "MEMORY after interrupted tool turn")
+  const thirdRes = await callFetch(third)
+  await readSSE(thirdRes)
+  check("turn after user-interrupted replay reuses the new session",
+    thirdRes.status === 200 && lastOf("user").convId === replay.convId)
 }
 
 try { fs.unlinkSync(fakeAgy) } catch {}

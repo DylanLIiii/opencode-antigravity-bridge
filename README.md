@@ -110,13 +110,18 @@ magpie plugin add ./opencode-antigravity-bridge
   context messages (such as Claude Code's per-turn hook, environment, and
   deferred-tool reminders) do not invalidate a turn or force a session restart.
   Client-renamed tool IDs are matched only when history, tool names and
-  arguments identify one pending response. Real history edits (compaction)
-  start a fresh session and replay the current history and real results.
-- **Protocol context notices** beside tool results, including trailing
-  user/system/developer messages, reach MCP inside a separate `system-reminder`.
-  This covers OpenCode `<system-update>` messages, background task notifications,
-  Claude Code environment/file-change/progress reminders, and recognized
-  hook/token-count notices without treating them as user messages.
+  arguments identify one pending response. Real history edits (compaction) and
+  user-interrupted tool turns (`[Request interrupted by user]`) start a fresh
+  session and replay the current history and real results.
+- **Protocol context notices and tool companions** beside tool results:
+  trailing user/system/developer notices reach MCP inside a separate
+  `system-reminder` (OpenCode `<system-update>`, background task and
+  `<teammate-message>` notifications, `/loop` status folds, Claude Code
+  environment/file-change/progress reminders, and recognized hook/token-count
+  notices), while Claude Code's tool-companion blocks (`Skill` prompt bodies,
+  image coordinate dimensions, and `ToolSearch` `tool_reference` / `Tool loaded.`
+  blocks) attach directly to their matching tool result without treating
+  ordinary user instructions as tool output.
 - **Conversation pooling**: at most four agy processes, idle reaping, LRU
   eviction, and HTTP 503 for conflicting concurrent responses.
 - **Isolation without a permission bypass.** The agent is defined with
@@ -311,7 +316,7 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. Its 185 checks pass under both Node and Bun. They cover the minimal
+exercised. Its 194 checks pass under both Node and Bun. They cover the minimal
 agent and allowlisted client identity, session instructions, streaming, thought
 summaries with bridge-issued signatures, per-turn usage, session reuse, conversation isolation, native tool
 round-trips, parallel/consecutive calls, atomic result validation, failures,

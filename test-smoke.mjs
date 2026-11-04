@@ -1107,6 +1107,217 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check("a changed history is not resumed", inits().at(-1).resumed === false)
 }
 
+{
+  // Claude Code appends trailing role:"system" context messages on user and tool turns.
+  const before = inits().length
+  const turn1 = {
+    model,
+    system: "CLAUDE-CODE-SYSTEM",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "MEMORY Claude Code turn one" }] },
+      { role: "system", content: [{ type: "text", text: "SessionStart hook additional context: ok\n\n# Environment\n - Primary working directory: /remote-wsl/project" }] },
+    ],
+  }
+  const r1 = await callFetch(turn1)
+  const e1 = (await readSSE(r1)).events
+  const init1 = inits().at(-1)
+  const u1 = lastOf("user")
+  check("trailing system message on fresh turn returns 200", r1.status === 200 && stopOf(e1) === "end_turn", `got ${r1.status}`)
+  check("fresh turn sends both user text and wrapped system context",
+    u1.text.includes("MEMORY Claude Code turn one") &&
+    u1.text.includes("<system-reminder>\nSessionStart hook additional context: ok") &&
+    !u1.text.includes("<conversation_history>"), u1.text)
+  check("caller working directory is recognized from initial trailing system message",
+    init1.systemAppend?.includes('"/remote-wsl/project"'), init1.systemAppend)
+
+  const turn2 = {
+    ...turn1,
+    messages: [
+      ...turn1.messages,
+      { role: "assistant", content: assistantBlocks(e1) },
+      { role: "user", content: [{ type: "text", text: "MEMORY Claude Code turn two" }] },
+      { role: "system", content: [{ type: "text", text: "UserPromptSubmit hook additional context: route hint\n\nWorking directory: /other-later-dir" }] },
+    ],
+  }
+  const r2 = await callFetch(turn2)
+  const e2 = (await readSSE(r2)).events
+  const u2 = lastOf("user")
+  check("continued turn with trailing system message reuses the live session",
+    r2.status === 200 && stopOf(e2) === "end_turn" && inits().length === before + 1 && u2.convId === init1.convId)
+  check("continued turn preserves user text alongside trailing system message",
+    u2.text.includes("MEMORY Claude Code turn two") &&
+    u2.text.includes("<system-reminder>\nUserPromptSubmit hook additional context: route hint") &&
+    textOf(e2).includes("prompts so far 2"), u2.text)
+
+  const turn3 = {
+    ...turn2,
+    messages: [
+      ...turn2.messages,
+      { role: "assistant", content: assistantBlocks(e2) },
+      { role: "system", content: [{ type: "text", text: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>bg-42</task-id></task-notification>" }] },
+    ],
+  }
+  const r3 = await callFetch(turn3)
+  const e3 = (await readSSE(r3)).events
+  check("post-assistant standalone system notification turn continues the session",
+    r3.status === 200 && stopOf(e3) === "end_turn" && lastOf("user").convId === init1.convId && lastOf("user").text.includes("bg-42"))
+
+  const { default: restartedAtisDefault } = await import("./index.mjs?restart-atis")
+  const restartedAtis = await (await restartedAtisDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: "agy" }))
+  const turn4 = {
+    ...turn3,
+    messages: [
+      ...turn3.messages,
+      { role: "assistant", content: assistantBlocks(e3) },
+      { role: "user", content: "MEMORY Claude Code after restart" },
+      { role: "system", content: "UserPromptSubmit hook additional context: after restart" },
+    ],
+  }
+  const r4 = await restartedAtis.fetch("agy://local/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(turn4),
+  })
+  const e4 = (await readSSE(r4)).events
+  const resumedAtis = inits().at(-1)
+  check("restarted bridge resumes a conversation with trailing system messages",
+    r4.status === 200 && stopOf(e4) === "end_turn" && resumedAtis.resumed === true && resumedAtis.convId === init1.convId &&
+    lastOf("user").text.includes("MEMORY Claude Code after restart") && !lastOf("user").text.includes("<conversation_history>"))
+}
+
+{
+  const opening = {
+    model,
+    messages: [
+      { role: "user", content: "base before trailing-system cancel and error" },
+      { role: "system", content: "SessionStart hook additional context: init" },
+    ],
+  }
+  const openingEvents = (await readSSE(await callFetch(opening))).events
+  const convId = inits().at(-1).convId
+
+  process.env.FAKE_AGY_SET_MODEL_DELAY = "300"
+  const controller = new AbortController()
+  const early = {
+    ...opening,
+    model: legacyModel,
+    messages: [
+      ...opening.messages,
+      { role: "assistant", content: assistantBlocks(openingEvents) },
+      { role: "user", content: "EARLY user with trailing system" },
+      { role: "system", content: "UserPromptSubmit hook additional context: early-system" },
+    ],
+  }
+  const earlyResponse = await callFetch(early, {}, controller.signal)
+  controller.abort()
+  await readSSE(earlyResponse)
+  await new Promise(resolve => setTimeout(resolve, 500))
+  delete process.env.FAKE_AGY_SET_MODEL_DELAY
+
+  const after = {
+    ...early,
+    messages: [
+      ...early.messages,
+      { role: "user", content: "NEXT user after cancel" },
+      { role: "system", content: "UserPromptSubmit hook additional context: next-system" },
+    ],
+  }
+  const afterEvents = (await readSSE(await callFetch(after))).events
+  const deliveredPrompt = lastOf("user")
+  check("early cancel preserves both cancelled and next user/system messages",
+    stopOf(afterEvents) === "end_turn" && deliveredPrompt.convId === convId &&
+    deliveredPrompt.text.includes("EARLY user with trailing system") &&
+    deliveredPrompt.text.includes("early-system") &&
+    deliveredPrompt.text.includes("NEXT user after cancel") &&
+    deliveredPrompt.text.includes("next-system"), deliveredPrompt.text)
+
+  const beforeErrorInits = inits().length
+  const errBody = {
+    ...opening,
+    messages: [
+      ...after.messages,
+      { role: "assistant", content: assistantBlocks(afterEvents) },
+      { role: "user", content: "AGENTERROR with trailing system" },
+      { role: "system", content: "UserPromptSubmit hook additional context: retry-system" },
+    ],
+  }
+  const errEvents = (await readSSE(await callFetch(errBody))).events
+  check("upstream error on trailing-system turn emits error frame", errEvents.some(event => event.event === "error"))
+  await readSSE(await callFetch(errBody))
+  check("retry after upstream error reuses session and preserves trailing-system turn",
+    inits().length === beforeErrorInits && lastOf("user").convId === convId &&
+    lastOf("user").text.includes("AGENTERROR with trailing system") &&
+    lastOf("user").text.includes("retry-system"))
+}
+
+{
+  const first = {
+    model,
+    tools: [echoTool],
+    messages: [
+      { role: "user", content: "TOOL trailing system notices" },
+      { role: "system", content: "# Environment\n - Primary working directory: /remote-wsl/project" },
+    ],
+  }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+
+  const interrupted = continuation(first, events, "real output")
+  interrupted.messages.push({
+    role: "system",
+    content: [{ type: "text", text: "The user sent a new message while you were working:\nstop" }],
+  })
+  check("user interruption inside a system message beside tool_result returns 400",
+    (await callFetch(interrupted)).status === 400)
+
+  const second = continuation(first, events, "real output")
+  second.messages.at(-1).content.push({
+    type: "text",
+    text: "<system-reminder>Note: /remote-wsl/project/file.js changed on disk</system-reminder>",
+  })
+  second.messages.push({
+    role: "system",
+    content: [
+      { type: "text", text: "tool.call hook additional context: lowercase-hook-noise" },
+      { type: "text", text: "PostToolUse:Bash hook additional context: hook-head\n\n# Environment update\n - Primary working directory: /remote-wsl/project/subdir" },
+      { type: "text", text: "The user hasn't heard from you in a while." },
+    ],
+  })
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().find(event => event.type === "mcpResult" && event.convId === convId)
+  const mcpText = delivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("system notices and mid-turn environment update continue the live tool turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before, `got ${response.status}`)
+  check("system notices reach MCP while lowercase hook noise is excluded",
+    mcpText.startsWith("real output") &&
+    mcpText.includes("changed on disk") &&
+    mcpText.includes("# Environment update") &&
+    mcpText.includes("hasn't heard from you") &&
+    !mcpText.includes("lowercase-hook-noise"), mcpText)
+}
+
+{
+  const prefillOnly = await callFetch({ model, messages: [{ role: "assistant", content: "prefill" }] })
+  const prefillTail = await callFetch({ model, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "prefill" }] })
+  const loneSystem = await callFetch({ model, messages: [{ role: "system", content: "system without user or history" }] })
+  const nonTextSystem = await callFetch({
+    model,
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "system", content: [{ type: "tool_addition", name: "extra" }] },
+    ],
+  })
+  const nonTextPayload = await nonTextSystem.json()
+  check("assistant prefill and lone system messages return 400",
+    prefillOnly.status === 400 && prefillTail.status === 400 && loneSystem.status === 400,
+    `${prefillOnly.status},${prefillTail.status},${loneSystem.status}`)
+  check("unsupported system content block error names the block type",
+    nonTextSystem.status === 400 && nonTextPayload.error?.message?.includes('"tool_addition"'),
+    nonTextPayload.error?.message)
+}
+
 try { fs.unlinkSync(fakeAgy) } catch {}
 try { fs.unlinkSync(wrapper) } catch {}
 try { fs.unlinkSync(logPath) } catch {}

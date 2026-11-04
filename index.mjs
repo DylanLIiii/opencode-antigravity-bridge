@@ -87,12 +87,22 @@ function findAgy() {
     if (dir) candidates.push(path.join(dir, process.platform === "win32" ? "agy.exe" : "agy"))
   }
   const home = os.homedir()
-  candidates.push(
-    path.join(home, ".local", "bin", "agy"),
-    path.join(home, ".gemini", "bin", "agy"),
-    "/usr/local/bin/agy",
-    "/opt/homebrew/bin/agy",
-  )
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local")
+    candidates.push(
+      path.join(localAppData, "agy", "bin", "agy.exe"),
+      path.join(localAppData, "Programs", "Antigravity", "bin", "agy.exe"),
+      path.join(home, ".local", "bin", "agy.exe"),
+      path.join(home, ".gemini", "bin", "agy.exe"),
+    )
+  } else {
+    candidates.push(
+      path.join(home, ".local", "bin", "agy"),
+      path.join(home, ".gemini", "bin", "agy"),
+      "/usr/local/bin/agy",
+      "/opt/homebrew/bin/agy",
+    )
+  }
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
@@ -109,6 +119,7 @@ function execOnce(file, args, opts = {}) {
     try {
       child = spawn(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
         ...opts,
       })
     } catch (err) {
@@ -425,7 +436,7 @@ class AcpConnection {
 class Turn {
   constructor(proc, messages) {
     this.proc = proc
-    this.baseHistory = messages.slice(0, -1).map((message) => ({ ...message }))
+    this.baseHistory = trailingMessages({ messages }).history.map((message) => ({ ...message }))
     this.events = []
     this.waiters = []
     this.calls = []
@@ -606,12 +617,18 @@ class Proc {
     ]
     if (this.workDir) args.push("--add-dir", this.workDir)
     try {
+      const childEnv = { ...process.env }
+      const inheritedPath = process.env.PATH || childEnv.Path || ""
+      for (const key of Object.keys(childEnv)) {
+        if (/^path$/i.test(key) && key !== "PATH") delete childEnv[key]
+      }
       this.child = spawn(this.agyPath, args, {
         cwd: this.workspace,
         stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
         env: {
-          ...process.env,
-          PATH: bin + path.delimiter + (process.env.PATH || ""),
+          ...childEnv,
+          PATH: bin + path.delimiter + inheritedPath,
           AGY_BRIDGE_CONTROL_PORT: String(controlServer.address().port),
           AGY_BRIDGE_TOKEN: this.token,
           AGY_CLI_DISABLE_AUTO_UPDATE: "true",
@@ -824,7 +841,9 @@ class Proc {
     try {
       if (model && model !== this.currentModel) await this.#setModel(model)
       // Text a cancelled turn never delivered still belongs to the session.
-      let text = this.unsentPrompt ? this.unsentPrompt + "\n\n" + content : content
+      let text = this.unsentPrompt && content
+        ? this.unsentPrompt + "\n\n" + content
+        : (this.unsentPrompt || content)
       this.unsentPrompt = ""
       let usage = null
       for (;;) {
@@ -1133,8 +1152,12 @@ class Proc {
       const alive = () => child.exitCode === null && child.signalCode === null
       if (alive()) {
         const closed = once(child, "close").catch(() => {})
-        try { child.kill("SIGTERM") } catch {}
-        await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
+        if (process.platform === "win32" && child.pid) {
+          await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3_000 })
+        } else {
+          try { child.kill("SIGTERM") } catch {}
+          await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
+        }
         if (alive()) {
           try { child.kill("SIGKILL") } catch {}
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 1_000))])
@@ -1143,7 +1166,15 @@ class Proc {
     }
     this.child = null
     if (this.workspace) {
-      await fs.promises.rm(this.workspace, { recursive: true, force: true }).catch(() => {})
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          await fs.promises.rm(this.workspace, { recursive: true, force: true })
+          break
+        } catch (error) {
+          if (attempt === 3 || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)) break
+          await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)))
+        }
+      }
     }
     allProcs.delete(this)
   }
@@ -1358,12 +1389,21 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
       if (!existing.dead && existing.turn) {
         throw new BusyError("agy bridge: this conversation still has an unfinished response")
       }
+      let matchedHistory = opts.history
+      if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
+        Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
+        const k = existing.expectedMessages.length
+        if (k > matchedHistory.length && k <= opts.messages.length &&
+          existing.matchesHistory(opts.messages.slice(0, k))) {
+          matchedHistory = opts.messages.slice(0, k)
+        }
+      }
       const compatible = !forceNew && !existing.dead && !existing.retiring &&
         existing.workDir === opts.workDir && existing.instructions === opts.instructions &&
-        existing.matchesHistory(opts.history)
+        existing.matchesHistory(matchedHistory)
       if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
         await existing.updateTools(opts.tools)
-        return existing
+        return { proc: existing, history: matchedHistory }
       }
       existing.retiring = true
       dropFromPool(existing)
@@ -1383,7 +1423,7 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
       throw error
     }
     pool.set(convKey, proc)
-    return proc
+    return { proc, history: opts.history }
   })
 }
 
@@ -1563,11 +1603,21 @@ function sessionInstructions(body, callerWorkDir) {
   return parts.join("\n\n")
 }
 
+function renderTurnMessage(message) {
+  const text = messageText(message)
+  if (message.role === "user") return text
+  const trimmed = text.trim()
+  if (!trimmed) return ""
+  if (/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder>$/.test(trimmed)) return trimmed
+  return `<system-reminder>\n${trimmed}\n</system-reminder>`
+}
+
+function renderTurnMessages(messages) {
+  return messages.map(renderTurnMessage).filter((part) => part !== "").join("\n\n")
+}
+
 function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
-  const messages = body.messages || []
-  const split = extractToolResults(body).length ? messages.length - trailingMessages(body).messages.length : messages.length - 1
-  const history = messages.slice(0, split)
-  const current = messages.slice(split)
+  const { history, messages: current } = trailingMessages(body)
   const out = []
   if (!instructionsInSession) {
     const system = systemText(body)
@@ -1584,23 +1634,26 @@ function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
     out.push("Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
     out.push("</conversation_history>\n\n")
   }
-  const currentText = current.map(message => message.role === "user"
-    ? messageText(message) : `${message.role}: ${messageText(message)}`).join("\n\n")
+  const currentText = renderTurnMessages(current)
   // A fresh conversation needs no wrapper; it would only add tokens.
   if (!out.length) return currentText
   out.push("<current_turn>\n", currentText, "\n</current_turn>")
   return out.join("")
 }
 
-function renderContinuedTurn(body) {
-  return messageText(body.messages[body.messages.length - 1])
+function renderContinuedTurn(messages) {
+  return renderTurnMessages(messages)
 }
 
 function validateBody(body) {
   if (!Array.isArray(body?.messages) || !body.messages.length) {
     throw new UnsupportedContent("a request without messages")
   }
-  if (body.messages.at(-1)?.role !== "user" && !extractToolResults(body).length) {
+  const trailing = trailingMessages(body)
+  const lastRole = body.messages.at(-1)?.role
+  const validTailRole = lastRole === "user" || lastRole === "system" || lastRole === "developer"
+  if (!validTailRole || (!extractToolResults(body).length &&
+    !trailing.messages.some((message) => message.role === "user") && !trailing.history.length)) {
     throw new UnsupportedContent("a request whose last message is not from the user or a tool-result notification")
   }
   if (body.system && typeof body.system !== "string") {
@@ -1615,9 +1668,15 @@ function validateBody(body) {
         throw new UnsupportedContent(`an assistant content block of type ${JSON.stringify(block?.type)}`)
       }
     } else if (message.role === "system" || message.role === "developer") {
-      if (typeof message.content !== "string" && (!Array.isArray(message.content) ||
-        message.content.some(block => block?.type !== "text" || typeof block.text !== "string"))) {
-        throw new UnsupportedContent("a non-text system/developer message")
+      if (typeof message.content !== "string") {
+        if (!Array.isArray(message.content)) throw new UnsupportedContent("a non-text system/developer message")
+        for (const block of message.content) {
+          if (block?.type === "text" && typeof block.text === "string") continue
+          if (block && typeof block.type === "string" && block.type !== "text") {
+            throw new UnsupportedContent(`a non-text system/developer content block of type ${JSON.stringify(block.type)}`)
+          }
+          throw new UnsupportedContent("a non-text system/developer message")
+        }
       }
     } else if (message.role === "user") {
       if (Array.isArray(message.content)) {
@@ -1672,6 +1731,13 @@ function withContextNotices(results, body) {
   const notices = []
   let seenResult = false
   const contextNotice = /<system-update(?:\s[^>]*)?>[\s\S]*?<\/system-update>|(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
+  const systemReminder = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder>/g
+  const unclosedNotice = /<\/?(?:system-update|task-notification|system-reminder)\b/
+  const userInterruption = /The user sent (?:a new message while you were working|the following message):/
+  const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/
+  const hookNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
+  const structuredDelta = /<(?:deferred_tools_delta|mcp_instructions_delta|agent_listing_delta|skill_listing)\b|^# Environment\b/m
+  const isNoise = (value) => !value || tokenNoise.test(value) || (hookNoise.test(value) && !structuredDelta.test(value))
   for (const message of trailingMessages(body).messages) {
     const blocks = Array.isArray(message.content) ? message.content : [message.content]
     for (const block of blocks) {
@@ -1683,11 +1749,22 @@ function withContextNotices(results, body) {
       if (!seenResult && text.trim()) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
-      notices.push(...Array.from(text.matchAll(contextNotice), match => match[0]))
-      const rest = text.replace(contextNotice, "").replace(/<\/?system-reminder(?:\s[^>]*)?>/g, "").trim()
-      if (/The user sent (?:a new message while you were working|the following message):/.test(rest) ||
-        (rest && !/^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/.test(rest) &&
-        !/^[A-Z][A-Za-z]+(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/.test(rest))) {
+      if (userInterruption.test(text)) {
+        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+      notices.push(...Array.from(text.matchAll(contextNotice), (match) => match[0]))
+      const withoutNotices = text.replace(contextNotice, "")
+      for (const match of withoutNotices.matchAll(systemReminder)) {
+        const inner = match[1].trim()
+        if (!isNoise(inner)) notices.push(inner)
+      }
+      const rest = withoutNotices.replace(systemReminder, "").trim()
+      if (unclosedNotice.test(rest)) {
+        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+      if (message.role === "system" || message.role === "developer") {
+        if (!isNoise(rest)) notices.push(rest)
+      } else if (!isNoise(rest)) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
     }
@@ -1705,9 +1782,10 @@ function namedWorkDirectory(body, init) {
   if (raw) {
     try { return decodeURIComponent(raw) } catch { return raw }
   }
+  const firstAssistant = body.messages.findIndex((message) => message.role === "assistant")
+  const opening = firstAssistant < 0 ? body.messages : body.messages.slice(0, firstAssistant)
   const texts = []
-  for (const message of [{ role: "system", content: body.system }, ...body.messages]) {
-    if (message.role === "assistant") continue
+  for (const message of [{ role: "system", content: body.system }, ...opening]) {
     if (typeof message.content === "string") texts.push(message.content)
     else if (Array.isArray(message.content)) {
       for (const block of message.content) if (block?.type === "text") texts.push(block.text || "")
@@ -2100,7 +2178,8 @@ export const AntigravityBridgePlugin = async () => {
             body = { ...body, model: requestedModel }
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const convKey = conversationKey(body)
-            const isFresh = body.messages.length <= 1
+            const trailing = trailingMessages(body)
+            const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
             const callerWorkDir = namedWorkDirectory(body, init)
             const workDir = workDirectory(callerWorkDir)
@@ -2151,15 +2230,15 @@ export const AntigravityBridgePlugin = async () => {
                 }
               }
 
-              const proc = await acquireProc(
+              const { proc, history } = await acquireProc(
                 agy,
                 convKey,
-                { model, tools, workDir, instructions, history: body.messages.slice(0, -1) },
+                { model, tools, workDir, instructions, history: trailing.history, messages: body.messages },
                 isFresh,
                 resultBlocks.length > 0,
               )
               const content = proc.hasSentFirstTurn
-                ? renderContinuedTurn(body)
+                ? renderContinuedTurn(body.messages.slice(history.length))
                 : renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession)
               const turn = proc.startTurn(content, body.messages, model)
               return streamResponse(proc, turn, body, init.signal)

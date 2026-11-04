@@ -106,14 +106,17 @@ magpie plugin add ./opencode-antigravity-bridge
 - **Subscription quota reporting** in Magpie through `auth.usage`, using the
   real CLI's structured `/usage` report.
 - **Client-compatible continuation**: cache markers, string/block text, split
-  assistant messages and outer text whitespace do not invalidate a turn.
+  assistant messages, outer text whitespace, and trailing `system`/`developer`
+  context messages (such as Claude Code's per-turn hook, environment, and
+  deferred-tool reminders) do not invalidate a turn or force a session restart.
   Client-renamed tool IDs are matched only when history, tool names and
   arguments identify one pending response. Real history edits (compaction)
   start a fresh session and replay the current history and real results.
 - **Protocol context notices** beside tool results, including trailing
   user/system/developer messages, reach MCP inside a separate `system-reminder`.
   This covers OpenCode `<system-update>` messages, background task notifications,
-  and recognized hook/token-count notices without treating them as user messages.
+  Claude Code environment/file-change/progress reminders, and recognized
+  hook/token-count notices without treating them as user messages.
 - **Conversation pooling**: at most four agy processes, idle reaping, LRU
   eviction, and HTTP 503 for conflicting concurrent responses.
 - **Isolation without a permission bypass.** The agent is defined with
@@ -270,9 +273,9 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   `authenticate` (it switches agy to a different sign-in path) and relies on the
   CLI's existing login.
 - **The IDE tool connection uses a private `nc`.** agy runs `nc host port` for
-  `--ide-mcp-port`; the bridge puts its own `nc` first in agy's PATH, which runs
-  `mcp-server.mjs` authenticated by a per-process token. Windows (`nc.cmd`) is
-  not verified.
+  `--ide-mcp-port`; the bridge puts its own `nc` (and `nc.cmd` on Windows) first
+  in agy's PATH, which runs `mcp-server.mjs` authenticated by a per-process
+  token.
 - **No automatic agy installation** and no support guarantee for CLI protocol
   changes. The MCP helper answers as a `2025-11-25` server, because agy's
   `2026-07-28` mode expects notifications through `subscriptions/listen`.
@@ -308,7 +311,7 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. Its 170 checks pass under both Node and Bun. They cover the minimal
+exercised. Its 185 checks pass under both Node and Bun. They cover the minimal
 agent and allowlisted client identity, session instructions, streaming, thought
 summaries with bridge-issued signatures, per-turn usage, session reuse, conversation isolation, native tool
 round-trips, parallel/consecutive calls, atomic result validation, failures,

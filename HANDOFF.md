@@ -53,9 +53,10 @@ HMAC-SHA256，客户端才会保留并回传；Anthropic API 不认此签名）�
 会话落盘（之后补）：每轮结束及回收时把会话记入 `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
 （0600，只存 sessionId、workDir、历史与指令的 SHA-256，`AGY_BRIDGE_STATE_FILE` 可改），重启后
 哈希一致即 `session/resume`；真实 agy 下新 Node 进程续聊成功。多个 bridge 进程合并写入。
-缓存（只测 `gemini-3.8-flash-low`，按用户要求不调其他模型）：5.5k 稳定前缀 4 轮，append /
-首条消息 / 默认组件三种都是 `cachedReadTokens: 0`；agy 每次注入精确到秒的 `Local Time`，
-无设置可关，桥接无法控制命中，只保证前缀稳定、不重放。注意 `pgrep -f` 会匹配自身所在
+缓存：5.5k 稳定前缀经 bridge 4 轮。`gemini-4-argon-low` 第 2 轮起命中（input/cacheRead
+2,155/3,513、2,152/3,619、2,151/3,722）；`gemini-3.8-flash-low` 在 append / 首条消息 / 默认
+组件三种放法下都是 0。前缀稳定由桥接保证，命中与否取决于模型后端。agy 每次注入精确到秒
+的 `Local Time`，未见开关。注意 `pgrep -f` 会匹配自身所在
 bash，检查遗留进程时别被它误导。
 未验证：Magpie GUI、OpenCode 端到端、macOS/Windows 上的 ACP 传输。未提交/推送。
 

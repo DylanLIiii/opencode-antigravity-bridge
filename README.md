@@ -159,13 +159,19 @@ call per 150 s of waiting only when a tool runs longer than that.
 **Prompt caching** is decided by Google's backend, not the bridge. The bridge
 keeps the request prefix as stable as it can: the instructions are installed
 once per session and agy keeps the conversation, so each turn appends only the
-new message. On agy 1.4.12 with `gemini-3.8-flash-low`, a 5.5k-token stable
-prefix over four turns reported `cachedReadTokens: 0` every turn, with
-`systemPrompt.append`, with the instructions in the first message, and with
-agy's default components kept. agy injects a per-request `Local Time` (to the
-second) into the model context and exposes no setting to turn it off, which
-can defeat an implicit prefix cache. When the backend does report cached
-tokens, they appear as `cache_read_input_tokens`.
+new message. Measured on agy 1.4.12 with a 5.5k-token stable system prompt
+over four turns of one session:
+
+| model | turn 1 | turns 2–4 (input / cache read) |
+|---|---|---|
+| `gemini-4-argon-low` | 5,567 / 0 | 2,155 / 3,513 · 2,152 / 3,619 · 2,151 / 3,722 |
+| `gemini-3.8-flash-low` | 5,528 / 0 | 0 cache read on every turn |
+
+Argon reuses the whole earlier prefix from the second turn on (about 62–64% of
+the prompt). Flash reported no cached tokens with `systemPrompt.append`, with
+the instructions in the first message, or with agy's default components kept,
+so that is the backend's behaviour for that model, not a prefix the bridge
+changes. Cached tokens appear as `cache_read_input_tokens`.
 
 ## Subscription limits
 

@@ -976,6 +976,18 @@ for (const change of ["tools", "model"]) {
   await new Promise(resolve => setTimeout(resolve, 400))
   const quitFinal = (await readSSE(await callFetch(continuation(quitBody, quitEvents, "late-output")))).events
   check("a result agy stopped waiting for is delivered in a follow-up prompt", stopOf(quitFinal) === "end_turn" && textOf(quitFinal).includes("Late result seen: late-output"), textOf(quitFinal))
+
+  const renamedLongBody = { model, messages: [{ role: "user", content: "LONGTOOL renamed id" }], tools: [echoTool] }
+  const renamedLongEvents = (await readSSE(await callFetch(renamedLongBody))).events
+  await new Promise(resolve => setTimeout(resolve, 350))
+  const renamedLongCont = continuation(renamedLongBody, renamedLongEvents, "renamed-long-result")
+  renamedLongCont.messages[1].content.find(block => block.type === "tool_use").id = "toolu_client_rewritten_long"
+  renamedLongCont.messages[2].content[0].tool_use_id = "toolu_client_rewritten_long"
+  const renamedLongRes = await callFetch(renamedLongCont)
+  const renamedLongFinal = (await readSSE(renamedLongRes)).events
+  check("deferred long tool past deadline still matches client-renamed tool IDs without 409",
+    renamedLongRes.status === 200 && stopOf(renamedLongFinal) === "end_turn" && textOf(renamedLongFinal).includes("Long done: renamed-long-result"),
+    `status=${renamedLongRes.status} text=${textOf(renamedLongFinal)}`)
   delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
 }
 
@@ -1134,6 +1146,13 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const again = await (await againDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: "agy" }))
   await readSSE(await again.fetch("agy://local/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(edited) }))
   check("a changed history is not resumed", inits().at(-1).resumed === false)
+
+  const crashFirst = { model, messages: [{ role: "user", content: "MEMORY before mid-turn crash" }] }
+  const crashFirstEvents = (await readSSE(await callFetch(crashFirst))).events
+  const crashTarget = inits().at(-1)
+  check("completed turn parks session before crash test", fs.readFileSync(bridgeStateFile, "utf8").includes(crashTarget.convId))
+  await readSSE(await callFetch(nextTurn(crashFirst, crashFirstEvents, "DIE mid-turn crash")))
+  check("in-flight prompt crash removes stale pre-turn snapshot from state file", !fs.readFileSync(bridgeStateFile, "utf8").includes(crashTarget.convId))
 }
 
 {

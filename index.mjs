@@ -946,6 +946,7 @@ class Proc {
           return
         }
         turn.arm()
+        unpark(this.convKey)
         this.hasSentFirstTurn = true
         const result = await this.conn.request("session/prompt", {
           sessionId: this.sessionId,
@@ -1191,6 +1192,7 @@ class Proc {
       clearTimeout(call.deadline)
       if (call.id && toolCalls.get(call.id)?.call === call) toolCalls.delete(call.id)
       if (call.mcpSeen && !call.mcpResponded) {
+        this.historyInvalid = true
         this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
       }
     }
@@ -1426,23 +1428,61 @@ function loadParked() {
   }
 }
 
-// Merge with the file so concurrent bridge processes do not erase each other.
-function saveParked() {
-  const merged = new Map()
-  for (const entry of readStateFile().filter(validEntry)) merged.set(entry.key, entry)
-  for (const key of unparked) merged.delete(key)
-  for (const [key, entry] of parked) {
-    if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
-  }
-  const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
-  const file = sessionStateFile()
+// Hold a short-lived lockfile around read-merge-rename so concurrent bridge
+// processes do not overwrite each other's parked session updates.
+function withStateLock(file, fn) {
+  const lock = `${file}.lock`
+  let fd = null
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-    const temp = `${file}.${process.pid}.tmp`
-    fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
-    fs.renameSync(temp, file)
-    unparked.clear()
+    const waitBuf = new Int32Array(new SharedArrayBuffer(4))
+    for (let attempt = 0; attempt < 40; attempt++) {
+      try {
+        fd = fs.openSync(lock, "wx", 0o600)
+        break
+      } catch (error) {
+        if (error?.code !== "EEXIST") break
+        try {
+          if (Date.now() - fs.statSync(lock).mtimeMs > 5_000) fs.unlinkSync(lock)
+        } catch {}
+        Atomics.wait(waitBuf, 0, 0, 5)
+      }
+    }
+    return fn()
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch {}
+      try { fs.unlinkSync(lock) } catch {}
+    }
+  }
+}
+
+// Merge with the file so concurrent bridge processes do not erase each other.
+function saveParked() {
+  const file = sessionStateFile()
+  try {
+    withStateLock(file, () => {
+      const merged = new Map()
+      for (const entry of readStateFile().filter(validEntry)) merged.set(entry.key, entry)
+      for (const key of unparked) merged.delete(key)
+      for (const [key, entry] of parked) {
+        if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
+      }
+      const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
+      const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+      fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
+      fs.renameSync(temp, file)
+      unparked.clear()
+    })
   } catch {}
+}
+
+function unpark(convKey) {
+  loadParked()
+  if (!parked.has(convKey) && !readStateFile().some((entry) => entry?.key === convKey)) return
+  parked.delete(convKey)
+  unparked.add(convKey)
+  saveParked()
 }
 
 // Remember a session so a later request, or a restarted bridge, resumes it
@@ -1744,7 +1784,7 @@ function matchToolResults(body, blocks) {
     if (shown.length !== calls.length || shown.some((call, index) =>
       call.name !== calls[index].name || stableJSON(call.input ?? {}) !== stableJSON(calls[index].input ?? {}))) continue
     const mapped = blocks.map(block => ({ block, match: toolCalls.get(shown[byID.get(block.tool_use_id)].id) }))
-    if (mapped.some(item => !item.match) || !mapped.some(item => !item.match.call.mcpResponded)) continue
+    if (mapped.some(item => !item.match) || !mapped.some(item => !item.match.call.mcpResponded || (item.match.call.deferred && !item.match.call.result))) continue
     if (found) throw new BusyError("agy bridge: renamed tool IDs match more than one pending conversation")
     found = mapped
   }

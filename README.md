@@ -335,7 +335,7 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. Its 206 checks pass under both Node and Bun. They cover the minimal
+exercised. Its 209 checks pass under both Node and Bun. They cover the minimal
 agent and allowlisted client identity, session instructions, streaming, thought
 summaries with bridge-issued signatures, per-turn usage, session reuse, conversation isolation, native tool
 round-trips, parallel/consecutive calls, atomic result validation, failures,

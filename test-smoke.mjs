@@ -146,9 +146,13 @@ async function reply(text) {
 
 async function prompt(params) {
   const text = params.prompt.map(block => block.text || "").join("")
+  const images = params.prompt.filter(block => block.type === "image").length
   session.prompts++
   saveState()
-  log({ type: "user", convId: session.id, prompt: session.prompts, text, model })
+  log({ type: "user", convId: session.id, prompt: session.prompts, text, images, model })
+  if (text.includes("REFUSAL_CLEAN")) {
+    return { stopReason: "refusal" }
+  }
   if (text.includes("DIE")) {
     chunk("before death")
     process.exit(2)
@@ -282,7 +286,12 @@ async function handle(message) {
       clientInfo = params.clientInfo
       return {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {} }, _meta: { antigravity: { systemPrompt: { append: true } } } },
+        agentCapabilities: {
+          loadSession: true,
+          ...(process.env.FAKE_AGY_PROMPT_IMAGE === "1" ? { promptCapabilities: { image: true } } : {}),
+          sessionCapabilities: { resume: {}, close: {} },
+          _meta: { antigravity: { systemPrompt: { append: true } } },
+        },
         agentInfo: { name: "Antigravity ACP Server", version: "1.4.12" },
         authMethods: [],
       }
@@ -1279,14 +1288,6 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const convId = inits().at(-1).convId
   const before = inits().length
 
-  const interrupted = continuation(first, events, "real output")
-  interrupted.messages.push({
-    role: "system",
-    content: [{ type: "text", text: "The user sent a new message while you were working:\nstop" }],
-  })
-  check("user interruption inside a system message beside tool_result returns 400",
-    (await callFetch(interrupted)).status === 400)
-
   const second = continuation(first, events, "real output")
   second.messages.at(-1).content.push({
     type: "text",
@@ -1322,7 +1323,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     model,
     messages: [
       { role: "user", content: "hi" },
-      { role: "system", content: [{ type: "tool_addition", name: "extra" }] },
+      { role: "system", content: [{ type: "audio_chunk", data: "AAAA" }] },
     ],
   })
   const nonTextPayload = await nonTextSystem.json()
@@ -1330,7 +1331,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     prefillOnly.status === 400 && prefillTail.status === 400 && loneSystem.status === 400,
     `${prefillOnly.status},${prefillTail.status},${loneSystem.status}`)
   check("unsupported system content block error names the block type",
-    nonTextSystem.status === 400 && nonTextPayload.error?.message?.includes('"tool_addition"'),
+    nonTextSystem.status === 400 && nonTextPayload.error?.message?.includes('"audio_chunk"'),
     nonTextPayload.error?.message)
 }
 
@@ -1459,6 +1460,178 @@ for (const location of ["inline", "system", "developer", "user"]) {
   await readSSE(thirdRes)
   check("turn after user-interrupted replay reuses the new session",
     thirdRes.status === 200 && lastOf("user").convId === replay.convId)
+}
+
+{
+  // /v1/messages/count_tokens returns fast token estimate without spawning agy.
+  const before = logs().length
+  const countRes = await loader.fetch("agy://local/v1/messages/count_tokens?beta=true", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      system: "Be concise.",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Hello token counter 中文" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(4000) } },
+        ],
+      }],
+    }),
+  })
+  const countData = await countRes.json()
+  check("count_tokens returns JSON input_tokens without spawning agy",
+    countRes.status === 200 && countData.input_tokens >= 1600 && logs().length === before,
+    JSON.stringify(countData))
+}
+
+{
+  // Tool schema sanitization, stream: false JSON response, promptCapabilities.image, text/PDF documents, and clean refusal.
+  process.env.FAKE_AGY_PROMPT_IMAGE = "1"
+  const trickyTool = {
+    name: "tricky_schema",
+    description: "Schema sanitizer check",
+    input_schema: {
+      type: "object",
+      properties: {
+        union_arr: { type: ["object", "array"], items: { type: "string" } },
+        stale_items: { type: ["string", "number"], items: { type: "string" }, properties: { bad: { type: "string" } } },
+        num_enum: { type: "integer", enum: [0, 1, 2] },
+      },
+      required: ["union_arr", "missing_field"],
+    },
+  }
+  const syncRes = await callFetch({
+    model,
+    stream: false,
+    tools: [trickyTool],
+    messages: [{
+      role: "user",
+      content: [
+        { type: "document", title: "spec.txt", source: { type: "text", media_type: "text/plain", data: "DOC_MARKER_42" } },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } },
+        { type: "text", text: "inspect multimodal turn" },
+      ],
+    }],
+  })
+  const syncMsg = await syncRes.json()
+  const initTool = inits().at(-1)?.tools?.[0]
+  const lastUser = lastOf("user")
+  check("stream: false returns aggregated JSON message with image and text document",
+    syncRes.status === 200 && syncMsg.type === "message" && lastUser.images === 1 && lastUser.text.includes("DOC_MARKER_42"),
+    JSON.stringify(syncMsg))
+  check("sanitizeInputSchema normalizes union types, stale array/object fields, non-string enums, and dangling required",
+    initTool?.inputSchema?.properties?.union_arr?.type === "array" &&
+    initTool?.inputSchema?.properties?.stale_items?.items === undefined &&
+    initTool?.inputSchema?.properties?.stale_items?.properties === undefined &&
+    initTool?.inputSchema?.properties?.num_enum?.enum === undefined &&
+    /Allowed values: 0, 1, 2/.test(initTool?.inputSchema?.properties?.num_enum?.description || "") &&
+    JSON.stringify(initTool?.inputSchema?.required) === JSON.stringify(["union_arr"]),
+    JSON.stringify(initTool?.inputSchema))
+
+  const pdfRes = await callFetch({
+    model,
+    messages: [{
+      role: "user",
+      content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } }],
+    }],
+  })
+  check("binary PDF document block returns HTTP 400", pdfRes.status === 400)
+
+  const refusalRes = await callFetch({ model, stream: false, messages: [{ role: "user", content: "REFUSAL_CLEAN" }] })
+  const refusalMsg = await refusalRes.json()
+  check("clean ACP refusal stopReason maps to Anthropic refusal without killing session",
+    refusalRes.status === 200 && refusalMsg.stop_reason === "refusal", JSON.stringify(refusalMsg))
+  delete process.env.FAKE_AGY_PROMPT_IMAGE
+}
+
+{
+  // Magpie privacy-masking placeholder notice beside live tool_result + session history continuity.
+  const magpieNotice = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
+  const first = {
+    model,
+    tools: [echoTool],
+    messages: [{ role: "user", content: `TOOL masked {{TERM_vgth3dgg}}\n\n${magpieNotice}` }],
+  }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const second = {
+    ...first,
+    // Magpie moves its placeholder notice to the latest user message on Turn 2.
+    messages: [
+      { role: "user", content: "TOOL masked {{TERM_vgth3dgg}}" },
+      { role: "assistant", content: assistantBlocks(events) },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: toolCall(events).id, content: "SECRET={{SECRET_yv2yqxeq}}" },
+          { type: "text", text: magpieNotice },
+        ],
+      },
+    ],
+  }
+  const secondRes = await callFetch(second)
+  const secondFinal = (await readSSE(secondRes)).events
+  check("Magpie privacy-masking placeholder notice beside tool_result continues the live session",
+    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && inits().length === before,
+    `status=${secondRes.status}, inits=${inits().length - before}`)
+  const third = {
+    ...second,
+    messages: [
+      { role: "user", content: "TOOL masked {{TERM_vgth3dgg}}" },
+      { role: "assistant", content: assistantBlocks(events) },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: toolCall(events).id, content: "SECRET={{SECRET_yv2yqxeq}}" }] },
+      { role: "assistant", content: assistantBlocks(secondFinal) },
+      { role: "user", content: `MEMORY after masked turn\n\n${magpieNotice}` },
+    ],
+  }
+  const thirdRes = await callFetch(third)
+  const thirdEvents = (await readSSE(thirdRes)).events
+  check("moving Magpie placeholder notice to later user turns preserves convKey and live session",
+    thirdRes.status === 200 && stopOf(thirdEvents) === "end_turn" && inits().length === before && lastOf("user").convId === convId)
+}
+
+{
+  // Claude Code mid-turn queued_command + tool_addition + bounded <system-reminder id="..."> + post-failure unwedge.
+  const first = { model, messages: [{ role: "user", content: "ESCCALL queued command mid-turn" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const old = inits().at(-1)
+  const second = continuation(first, events, "file-output")
+  second.messages.at(-1).content.push(
+    { type: "text", text: "<ide_opened_file>/project/a.ts</ide_opened_file>" },
+    { type: "text", text: '<system-reminder id="rem123">\nBounded reminder\n</system-reminder id="rem123">' },
+    {
+      type: "text",
+      text: "The user sent a new message while you were working:\nRemove invalid freejev accounts now\n\nThis is how Claude Code surfaces messages the user sends mid-turn — within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.",
+    },
+  )
+  second.messages.push({
+    role: "system",
+    content: [{ type: "tool_addition", tool: { type: "tool_definition", definition: { name: "Extra" } } }],
+  })
+  const secondRes = await callFetch(second)
+  const secondFinal = (await readSSE(secondRes)).events
+  const steeredUser = lastOf("user")
+  check("Claude Code mid-turn queued_command and tool_addition replay as clean user prompt",
+    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && steeredUser.convId !== old.convId &&
+    steeredUser.text.includes("Remove invalid freejev accounts now") &&
+    !steeredUser.text.includes("This is how Claude Code surfaces"),
+    JSON.stringify(steeredUser))
+
+  // Standalone follow-up user message after a failed/aborted tool turn unwedges the conversation.
+  const wFirst = { model, messages: [{ role: "user", content: "ESCCALL wedged follow-up" }], tools: [echoTool] }
+  const wEvents = (await readSSE(await callFetch(wFirst))).events
+  const wOld = inits().at(-1)
+  const wedged = continuation(wFirst, wEvents, "tool-output-before-abort")
+  wedged.messages.push({ role: "user", content: "Standalone follow-up user instruction" })
+  const wRes = await callFetch(wedged)
+  const wFinal = (await readSSE(wRes)).events
+  check("standalone follow-up user message after aborted tool turn replays instead of wedging with 400",
+    wRes.status === 200 && stopOf(wFinal) === "end_turn" && lastOf("user").convId !== wOld.convId &&
+    lastOf("user").text.includes("Standalone follow-up user instruction"),
+    `status=${wRes.status}`)
 }
 
 try { fs.unlinkSync(fakeAgy) } catch {}

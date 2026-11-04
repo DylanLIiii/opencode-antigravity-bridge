@@ -222,12 +222,25 @@ async function loadModelCatalog(agyPath, refresh = false) {
   return catalog
 }
 
+function normalizeEffort(value) {
+  const direct = String(value || "").trim().toLowerCase()
+  if (direct === "ultra") return "max"
+  return EFFORT_ORDER.includes(direct) ? direct : ""
+}
+
 function requestedEffort(body) {
+  const forced = normalizeEffort(process.env.AGY_BRIDGE_EFFORT)
+  if (forced) return forced
   const thinking = body.thinking?.type
   if (thinking !== "enabled" && thinking !== "adaptive") return ""
-  const direct = String(body.output_config?.effort || "").toLowerCase()
-  if (direct === "ultra") return "max"
-  if (EFFORT_ORDER.includes(direct)) return direct
+  const direct = normalizeEffort(
+    body.output_config?.effort ||
+    body.reasoning_effort ||
+    body.reasoningEffort ||
+    body.reasoning?.effort ||
+    body.generationConfig?.thinkingConfig?.thinkingLevel,
+  )
+  if (direct) return direct
   const budget = Number(body.thinking?.budget_tokens)
   if (!Number.isFinite(budget) || budget <= 0) return ""
   if (budget <= 4096) return "low"
@@ -574,6 +587,7 @@ class Proc {
     this.currentModel = null
     this.agentVersion = null
     this.instructionsInSession = false
+    this.promptImage = false
     this.resumed = false
     this.child = null
     this.conn = null
@@ -588,7 +602,7 @@ class Proc {
     this.stderrTail = ""
     this.hasSentFirstTurn = false
     this.historyInvalid = false
-    this.unsentPrompt = ""
+    this.unsentPrompt = null
     this.turn = null
     this.expectedMessages = null
     this.toolsVersion = 1
@@ -686,6 +700,8 @@ class Proc {
     const capabilities = init?.agentCapabilities ?? {}
     const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
+    this.promptImage = capabilities.promptCapabilities?.image === true ||
+      capabilities.prompt_capabilities?.image === true
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
       ? { _meta: { antigravity: { systemPrompt: { append: this.instructions } } } }
@@ -700,6 +716,7 @@ class Proc {
           mcpServers: [],
           ...meta,
         })
+        if (!session || typeof session !== "object") throw new Error("empty session/resume result")
         this.sessionId = this.resumeFrom.sessionId
         this.resumed = true
         this.hasSentFirstTurn = true
@@ -708,7 +725,7 @@ class Proc {
         session = null
       }
     }
-    if (!session) {
+    if (!this.resumed) {
       session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
@@ -721,7 +738,7 @@ class Proc {
 
   async #setModel(model) {
     try {
-      await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model })
+      await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model }, 30_000)
     } catch (error) {
       const wrapped = new Error(`agy bridge: model ${model} is unavailable to this agy account: ${error.message}`)
       wrapped.statusCode = 400
@@ -839,18 +856,17 @@ class Proc {
 
   async #runTurn(turn, content, model) {
     try {
+      turn.arm()
       if (model && model !== this.currentModel) await this.#setModel(model)
-      // Text a cancelled turn never delivered still belongs to the session.
-      let text = this.unsentPrompt && content
-        ? this.unsentPrompt + "\n\n" + content
-        : (this.unsentPrompt || content)
-      this.unsentPrompt = ""
+      // Content a cancelled turn never delivered still belongs to the session.
+      let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
+      this.unsentPrompt = null
       let usage = null
       for (;;) {
         turn.logOffset = await fileSize(this.logPath)
         // A cancel that arrived before the prompt would be ignored by agy.
         if (turn.cancelRequested) {
-          if (this.hasSentFirstTurn) this.unsentPrompt = text
+          if (this.hasSentFirstTurn) this.unsentPrompt = promptParts
           turn.complete({ stopReason: "cancelled" })
           return
         }
@@ -858,15 +874,19 @@ class Proc {
         this.hasSentFirstTurn = true
         const result = await this.conn.request("session/prompt", {
           sessionId: this.sessionId,
-          prompt: [{ type: "text", text }],
+          prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
         })
         usage = addUsage(usage, result?.usage)
         if (turn.cancelRequested) {
           turn.complete({ stopReason: "cancelled" })
           return
         }
-        if (turn.agentError || result?.stopReason === "refusal") {
-          throw await this.#agentError(turn, result)
+        if (turn.agentError) {
+          throw await this.#agentError(turn)
+        }
+        if (result?.stopReason === "refusal") {
+          const detail = await lastAgentError(this.logPath, turn.logOffset)
+          if (detail) throw this.#formatAgentError(detail)
         }
         turn.flushText()
         // agy ended the turn without waiting for a long-running client tool:
@@ -879,7 +899,7 @@ class Proc {
         turn.arm()
         await turn.waitLate()
         for (const call of late) call.lateDelivered = true
-        text = renderLateResults(late)
+        promptParts = renderLateResultParts(late, this.promptImage)
       }
     } catch (error) {
       if (turn.cancelRequested && !this.dead) {
@@ -903,9 +923,13 @@ class Proc {
     }
   }
 
-  async #agentError(turn, result) {
+  async #agentError(turn) {
     const detail = await lastAgentError(this.logPath, turn.logOffset)
-    if (result?.stopReason === "refusal" || /QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|code 429\b/.test(detail)) {
+    return this.#formatAgentError(detail)
+  }
+
+  #formatAgentError(detail) {
+    if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
       return new AgentTurnError(
         `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}`,
         "rate_limit_error",
@@ -1019,12 +1043,14 @@ class Proc {
   }
 
   #deliverLate(turn, call) {
-    const waiter = turn.awaitCalls.find((item) => item.target === call)
-    if (waiter) {
-      clearTimeout(waiter.timer)
-      turn.awaitCalls = turn.awaitCalls.filter((item) => item !== waiter)
+    const waiters = turn.awaitCalls.filter((item) => item.target === call)
+    if (waiters.length) {
+      turn.awaitCalls = turn.awaitCalls.filter((item) => item.target !== call)
       call.lateDelivered = true
-      waiter.reply(call.result)
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer)
+        waiter.reply(call.result)
+      }
     }
     turn.notifyLate()
   }
@@ -1195,6 +1221,50 @@ function renderLateResults(calls) {
     parts.push(`[tool result for ${call.name} call_id=${call.id}${call.result?.isError ? " (error)" : ""}]\n${resultText(call.result)}\n[end of tool result]`)
   }
   return parts.join("\n\n")
+}
+
+function renderLateResultParts(calls, includeImages = false) {
+  const out = [{ type: "text", text: renderLateResults(calls) }]
+  if (includeImages) {
+    for (const call of calls) {
+      for (const part of call.result?.content || []) {
+        if (part?.type === "image" && part.data) {
+          out.push({ type: "image", data: part.data, mimeType: part.mimeType || "image/png" })
+        }
+      }
+    }
+  }
+  return out
+}
+
+function toPromptParts(content) {
+  if (!content) return []
+  if (typeof content === "string") return content ? [{ type: "text", text: content }] : []
+  if (!Array.isArray(content)) return [{ type: "text", text: String(content) }]
+  const out = []
+  for (const part of content) {
+    if (!part) continue
+    if (part.type === "text") {
+      if (!part.text) continue
+      if (out.at(-1)?.type === "text") out.at(-1).text += part.text
+      else out.push({ type: "text", text: part.text })
+    } else if (part.type === "image" && part.data) {
+      out.push({ type: "image", data: part.data, mimeType: part.mimeType || "image/png" })
+    }
+  }
+  return out
+}
+
+function mergePromptParts(first, second) {
+  const a = toPromptParts(first)
+  const b = toPromptParts(second)
+  if (!a.length) return b
+  if (!b.length) return a
+  return toPromptParts([...a, { type: "text", text: "\n\n" }, ...b])
+}
+
+function promptHasImage(parts) {
+  return Array.isArray(parts) && parts.some((part) => part?.type === "image")
 }
 
 function addUsage(total, usage) {
@@ -1433,6 +1503,50 @@ function stableJSON(value) {
     : item)
 }
 
+const SUPPORTED_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"])
+
+function parseUserImage(block) {
+  if (block?.type !== "image") return null
+  const mediaType = String(block.source?.media_type || "").toLowerCase()
+  if (block.source?.type !== "base64" || !SUPPORTED_IMAGE_MIMES.has(mediaType) ||
+    typeof block.source.data !== "string" || !block.source.data) {
+    throw new UnsupportedContent("an image block in a user message that is not base64 png/jpeg/gif/webp")
+  }
+  return {
+    type: "image",
+    data: block.source.data,
+    mimeType: mediaType === "image/jpg" ? "image/jpeg" : mediaType,
+  }
+}
+
+function parseUserDocumentText(block) {
+  if (block?.type !== "document") return ""
+  const title = typeof block.title === "string" && block.title.trim() ? block.title.trim() : ""
+  const src = block.source
+  let text = null
+  if (src?.type === "text" && typeof src.data === "string") {
+    text = src.data
+  } else if (src?.type === "content") {
+    if (typeof src.content === "string") {
+      text = src.content
+    } else if (Array.isArray(src.content) && src.content.every((part) => part?.type === "text" && typeof part.text === "string")) {
+      text = src.content.map((part) => part.text).join("\n")
+    }
+  }
+  if (text === null) {
+    throw new UnsupportedContent("a binary or URL document block in a user message (agy's ACP prompt accepts text and images only)")
+  }
+  return title ? `[document: ${title}]\n${text}\n[end of document]` : text
+}
+
+const MAGPIE_PLACEHOLDER_NOTICE = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
+const MAGPIE_PLACEHOLDER_NOTICE_RE = /(?:^|\n\n)Values written like \{\{NAME_ab12cd34\}\} are placeholders for real values\. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs\. Don't ask to verify them, and don't replace them with examples\.(?=\s|$)/g
+
+function stripMagpiePlaceholderNotice(text) {
+  if (typeof text !== "string" || !text.includes("{{NAME_ab12cd34}}")) return text
+  return text.replace(MAGPIE_PLACEHOLDER_NOTICE_RE, "")
+}
+
 // Compare conversation content, not transport metadata or client-assigned IDs.
 // Keep argument values, result contents and internal whitespace significant.
 function historyKey(messages) {
@@ -1441,10 +1555,17 @@ function historyKey(messages) {
   for (const message of messages) {
     const blocks = Array.isArray(message.content) ? message.content : [{ type: "text", text: message.content ?? "" }]
     for (const block of blocks) {
-      if (block.type === "thinking" || block.type === "redacted_thinking") continue
+      if (!block) continue
+      if (block.type === "thinking" || block.type === "redacted_thinking" ||
+        block.type === "tool_addition" || block.type === "tool_removal") continue
       let value
       if (typeof block === "string" || block.type === "text") {
-        value = { type: "text", text: typeof block === "string" ? block : block.text || "" }
+        value = { type: "text", text: stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "") }
+      } else if (block.type === "document") {
+        value = { type: "text", text: parseUserDocumentText(block) }
+      } else if (block.type === "image") {
+        const image = parseUserImage(block)
+        value = { type: "image", mimeType: image.mimeType, sha256: digest(image.data) }
       } else if (block.type === "tool_use") {
         const ordinal = ids.size + 1
         ids.set(block.id, ordinal)
@@ -1520,6 +1641,121 @@ function conversationKey(body) {
   return createHash("sha256").update(source).digest("hex")
 }
 
+function appendSchemaHint(node, hint) {
+  if (!hint) return
+  if (typeof node.description === "string" && node.description.trim()) {
+    if (!node.description.includes(hint)) node.description = `${node.description} (${hint})`
+  } else {
+    node.description = hint
+  }
+}
+
+// Sanitize JSON Schema constructs that agy's ACP -> Google Code Assist translator
+// converts into invalid Schema protos (e.g. union types leaving stale array/object
+// keywords, or non-string/empty enum entries producing `enum[0]: cannot be empty`).
+function sanitizeInputSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema
+  const out = { ...schema }
+
+  if (Array.isArray(out.type)) {
+    const types = out.type.filter((item) => typeof item === "string")
+    const nullable = types.includes("null")
+    const nonNull = types.filter((item) => item !== "null")
+    if (nonNull.length > 1) {
+      let chosen = nonNull[0]
+      if (nonNull.includes("array") && out.items !== undefined) chosen = "array"
+      else if (nonNull.includes("object") && (out.properties !== undefined || out.additionalProperties !== undefined)) {
+        chosen = "object"
+      }
+      out.type = nullable ? [chosen, "null"] : chosen
+      appendSchemaHint(out, `Accepts types: ${types.join(" | ")}`)
+    } else if (nonNull.length === 1) {
+      out.type = nullable ? [nonNull[0], "null"] : nonNull[0]
+    }
+  }
+
+  const resolvedType = typeof out.type === "string"
+    ? out.type
+    : Array.isArray(out.type)
+      ? out.type.find((item) => item !== "null") || null
+      : null
+
+  if (resolvedType && resolvedType !== "array") {
+    delete out.items
+    delete out.prefixItems
+    delete out.minItems
+    delete out.maxItems
+    delete out.uniqueItems
+    delete out.contains
+  }
+  if (resolvedType && resolvedType !== "object") {
+    delete out.properties
+    delete out.patternProperties
+    delete out.required
+    delete out.minProperties
+    delete out.maxProperties
+    delete out.dependentRequired
+  }
+
+  if (Array.isArray(out.enum)) {
+    const invalidEnum = out.enum.length === 0 ||
+      (resolvedType && resolvedType !== "string") ||
+      out.enum.some((item) => typeof item !== "string" || item.length === 0)
+    if (invalidEnum) {
+      if (out.enum.length) {
+        appendSchemaHint(out, `Allowed values: ${out.enum.map((item) => JSON.stringify(item)).join(", ")}`)
+      }
+      delete out.enum
+    }
+  }
+
+  if (out.const !== undefined && (typeof out.const !== "string" || out.const.length === 0 || (resolvedType && resolvedType !== "string"))) {
+    appendSchemaHint(out, `Must equal: ${JSON.stringify(out.const)}`)
+    delete out.const
+  }
+
+  if (out.properties && typeof out.properties === "object" && !Array.isArray(out.properties)) {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+    )
+    if (Array.isArray(out.required)) {
+      const filtered = out.required.filter((key) => typeof key === "string" && Object.hasOwn(out.properties, key))
+      if (filtered.length) out.required = filtered
+      else delete out.required
+    }
+  }
+  if (out.patternProperties && typeof out.patternProperties === "object" && !Array.isArray(out.patternProperties)) {
+    out.patternProperties = Object.fromEntries(
+      Object.entries(out.patternProperties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+    )
+  }
+  if (out.additionalProperties && typeof out.additionalProperties === "object" && !Array.isArray(out.additionalProperties)) {
+    out.additionalProperties = sanitizeInputSchema(out.additionalProperties)
+  }
+  if (Array.isArray(out.items)) {
+    out.items = out.items.map((item) => sanitizeInputSchema(item))
+  } else if (out.items && typeof out.items === "object") {
+    out.items = sanitizeInputSchema(out.items)
+  }
+  if (Array.isArray(out.prefixItems)) {
+    out.prefixItems = out.prefixItems.map((item) => sanitizeInputSchema(item))
+  }
+  for (const key of ["anyOf", "oneOf", "allOf"]) {
+    if (Array.isArray(out[key])) out[key] = out[key].map((item) => sanitizeInputSchema(item))
+  }
+  if (out.not && typeof out.not === "object" && !Array.isArray(out.not)) {
+    out.not = sanitizeInputSchema(out.not)
+  }
+  for (const defsKey of ["$defs", "definitions"]) {
+    if (out[defsKey] && typeof out[defsKey] === "object" && !Array.isArray(out[defsKey])) {
+      out[defsKey] = Object.fromEntries(
+        Object.entries(out[defsKey]).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+      )
+    }
+  }
+  return out
+}
+
 function normalizeTools(body) {
   if (!Array.isArray(body.tools) || !body.tools.length) return []
   const choice = body.tool_choice
@@ -1534,10 +1770,11 @@ function normalizeTools(body) {
     if (seen.has(tool.name)) throw new UnsupportedContent(`duplicate tool ${tool.name}`)
     seen.add(tool.name)
     if (selected && tool.name !== selected) continue
-    const inputSchema = tool.input_schema ?? { type: "object", properties: {} }
-    if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
+    const rawSchema = tool.input_schema ?? { type: "object", properties: {} }
+    if (!rawSchema || typeof rawSchema !== "object" || Array.isArray(rawSchema)) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
+    const inputSchema = sanitizeInputSchema(rawSchema)
     tools.push({
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
@@ -1554,8 +1791,14 @@ function blockText(block) {
     throw new UnsupportedContent("a non-object content block")
   }
   if (block.type === "text") return typeof block.text === "string" ? block.text : ""
+  if (block.type === "tool_addition" || block.type === "tool_removal") return ""
   if (block.type === "tool_reference" && typeof block.tool_name === "string") {
     return `Loaded tool: ${block.tool_name}`
+  }
+  if (block.type === "document") return parseUserDocumentText(block)
+  if (block.type === "image") {
+    parseUserImage(block)
+    return "[image]"
   }
   if (block.type === "tool_result") {
     const inner = Array.isArray(block.content)
@@ -1565,9 +1808,6 @@ function blockText(block) {
       }).join("")
       : String(block.content ?? "")
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
-  }
-  if (block.type === "image" || block.type === "document") {
-    throw new UnsupportedContent("an image/document block in a user message (agy's ACP prompt accepts text only)")
   }
   if (block.type === "tool_use") throw new UnsupportedContent("a tool_use block in a user message")
   throw new UnsupportedContent(`a content block of type ${JSON.stringify(block.type)}`)
@@ -1606,22 +1846,121 @@ function sessionInstructions(body, callerWorkDir) {
   return parts.join("\n\n")
 }
 
+const QUEUED_PROMPT_PREFIX_RE = /^(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):\n([\s\S]*)$/
+const QUEUED_PROMPT_SUFFIX_RE = /\n\n(?:This is how Claude Code surfaces (?:messages the user sends|prompts [^\r\n]+ submits) mid-turn[\s\S]*|IMPORTANT: After completing your current task, you MUST address the user's message above\. Do not ignore it\.|Please address this message and continue with your tasks\.)\s*$/
+
+function extractQueuedPrompt(raw) {
+  if (typeof raw !== "string") return null
+  const cleanedRaw = stripMagpiePlaceholderNotice(raw)
+  const hadPlaceholder = cleanedRaw !== raw
+  let trimmed = cleanedRaw.trim()
+  const reminder = /^<system-reminder(?:\s[^>]*)?>([\s\S]*)<\/system-reminder(?:\s[^>]*)?>$/.exec(trimmed)
+  if (reminder) trimmed = reminder[1].trim()
+  const match = QUEUED_PROMPT_PREFIX_RE.exec(trimmed)
+  if (!match) return null
+  const unwrapped = match[1].replace(QUEUED_PROMPT_SUFFIX_RE, "").trim()
+  if (!hadPlaceholder) return unwrapped
+  const placeholderTag = `<system-reminder>\n${MAGPIE_PLACEHOLDER_NOTICE}\n</system-reminder>`
+  return unwrapped ? `${unwrapped}\n\n${placeholderTag}` : placeholderTag
+}
+
 function renderTurnMessage(message) {
-  const text = messageText(message)
-  if (message.role === "user") return text
-  const trimmed = text.trim()
-  if (!trimmed) return ""
-  if (/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder>$/.test(trimmed)) return trimmed
-  return `<system-reminder>\n${trimmed}\n</system-reminder>`
+  if (message.role === "user") {
+    if (typeof message.content === "string") {
+      const queued = extractQueuedPrompt(message.content)
+      return queued !== null ? queued : message.content
+    }
+    if (Array.isArray(message.content)) {
+      const out = []
+      let afterToolResult = false
+      for (const block of message.content) {
+        if (block?.type === "tool_result") {
+          out.push(blockText(block))
+          afterToolResult = true
+          continue
+        }
+        const raw = blockText(block)
+        const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
+        const rendered = queued !== null ? queued : raw
+        if (rendered && afterToolResult && !rendered.startsWith("\n")) {
+          out.push("\n\n" + rendered)
+        } else {
+          out.push(rendered)
+        }
+        if (rendered) afterToolResult = false
+      }
+      return out.join("")
+    }
+    return messageText(message)
+  }
+  const blocks = Array.isArray(message.content) ? message.content : [message.content]
+  const reminders = []
+  const queuedParts = []
+  for (const block of blocks) {
+    const raw = blockText(block)
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    const queued = extractQueuedPrompt(trimmed)
+    if (queued !== null) {
+      if (queued) queuedParts.push(queued)
+    } else {
+      reminders.push(raw)
+    }
+  }
+  const out = []
+  const joinedReminders = reminders.join("").trim()
+  if (joinedReminders) {
+    out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(joinedReminders)
+      ? joinedReminders
+      : `<system-reminder>\n${joinedReminders}\n</system-reminder>`)
+  }
+  out.push(...queuedParts)
+  return out.join("\n\n")
 }
 
-function renderTurnMessages(messages) {
-  return messages.map(renderTurnMessage).filter((part) => part !== "").join("\n\n")
+function renderTurnMessageParts(message) {
+  if (message.role === "user" && Array.isArray(message.content) &&
+    message.content.some((block) => block?.type === "image")) {
+    const parts = []
+    let afterToolResult = false
+    for (const block of message.content) {
+      if (block?.type === "image") {
+        parts.push(parseUserImage(block))
+        afterToolResult = false
+      } else if (block?.type === "tool_result") {
+        parts.push({ type: "text", text: blockText(block) })
+        afterToolResult = true
+      } else {
+        const raw = blockText(block)
+        const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
+        const rendered = queued !== null ? queued : raw
+        parts.push({
+          type: "text",
+          text: rendered && afterToolResult && !rendered.startsWith("\n") ? "\n\n" + rendered : rendered,
+        })
+        if (rendered) afterToolResult = false
+      }
+    }
+    return toPromptParts(parts)
+  }
+  const text = renderTurnMessage(message)
+  return text === "" ? [] : [{ type: "text", text }]
 }
 
-function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
+function renderTurnMessagesParts(messages) {
+  const groups = messages.map(renderTurnMessageParts).filter((group) => group.length > 0)
+  const out = []
+  for (let i = 0; i < groups.length; i++) {
+    if (i > 0) out.push({ type: "text", text: "\n\n" })
+    out.push(...groups[i])
+  }
+  return toPromptParts(out)
+}
+
+function renderInitialPromptParts(body, callerWorkDir, instructionsInSession) {
   const { history, messages: current } = trailingMessages(body)
   const out = []
+  const historyImages = []
   if (!instructionsInSession) {
     const system = systemText(body)
     if (system.trim()) out.push(`<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
@@ -1630,22 +1969,40 @@ function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
   if (history.length) {
     out.push("<conversation_history>\n")
     for (const message of history) {
-      if (message.role === "user") out.push(`Human: ${messageText(message)}\n`)
-      else if (message.role === "assistant") out.push(`Assistant: ${renderAssistantTurn(message)}\n`)
-      else out.push(`${message.role}: ${messageText(message)}\n`)
+      if (message.role === "user") {
+        if (Array.isArray(message.content)) {
+          for (const block of message.content) {
+            if (block?.type === "image") historyImages.push(parseUserImage(block))
+          }
+        }
+        out.push(`Human: ${renderTurnMessage(message)}\n`)
+      } else if (message.role === "assistant") {
+        out.push(`Assistant: ${renderAssistantTurn(message)}\n`)
+      } else {
+        const raw = messageText(message)
+        if (extractQueuedPrompt(raw.trim()) !== null) {
+          out.push(`Human: ${renderTurnMessage(message)}\n`)
+        } else {
+          out.push(`${message.role}: ${raw}\n`)
+        }
+      }
     }
     out.push("Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
     out.push("</conversation_history>\n\n")
   }
-  const currentText = renderTurnMessages(current)
+  const currentParts = renderTurnMessagesParts(current)
   // A fresh conversation needs no wrapper; it would only add tokens.
-  if (!out.length) return currentText
-  out.push("<current_turn>\n", currentText, "\n</current_turn>")
-  return out.join("")
+  if (!out.length) return currentParts
+  return toPromptParts([
+    ...historyImages,
+    { type: "text", text: out.join("") + "<current_turn>\n" },
+    ...currentParts,
+    { type: "text", text: "\n</current_turn>" },
+  ])
 }
 
-function renderContinuedTurn(messages) {
-  return renderTurnMessages(messages)
+function renderContinuedTurnParts(messages) {
+  return renderTurnMessagesParts(messages)
 }
 
 function validateBody(body) {
@@ -1675,6 +2032,7 @@ function validateBody(body) {
         if (!Array.isArray(message.content)) throw new UnsupportedContent("a non-text system/developer message")
         for (const block of message.content) {
           if (block?.type === "text" && typeof block.text === "string") continue
+          if (block?.type === "tool_addition" || block?.type === "tool_removal") continue
           if (block && typeof block.type === "string" && block.type !== "text") {
             throw new UnsupportedContent(`a non-text system/developer content block of type ${JSON.stringify(block.type)}`)
           }
@@ -1686,6 +2044,8 @@ function validateBody(body) {
         for (const block of message.content) {
           if (block?.type === "tool_result") toolResult(block)
           else if (block?.type === "text" || typeof block === "string") continue
+          else if (block?.type === "image") parseUserImage(block)
+          else if (block?.type === "document") parseUserDocumentText(block)
           else blockText(block)
         }
       } else if (typeof message.content !== "string") {
@@ -1744,16 +2104,20 @@ function isSkillResult(item) {
     /^(?:Launching skill|Loaded skill instructions \(read-only\)): /.test(first.text || "")
 }
 
-function appendResultText(results, index, text) {
+function appendResultPart(results, index, part) {
   const target = index >= 0 ? index : results.length - 1
   const targetCall = results[target]?.call
   return results.map((item, i) => (targetCall ? item.call !== targetCall : i !== target) ? item : {
     ...item,
     result: {
       ...item.result,
-      content: [...item.result.content, { type: "text", text }],
+      content: [...item.result.content, part],
     },
   })
+}
+
+function appendResultText(results, index, text) {
+  return appendResultPart(results, index, { type: "text", text })
 }
 
 function isInterruptedToolTurn(body) {
@@ -1765,7 +2129,11 @@ function isInterruptedToolTurn(body) {
         seenResult = true
         continue
       }
-      const text = blockText(block)
+      if (block?.type === "image") {
+        if (!seenResult) return false
+        continue
+      }
+      const text = stripMagpiePlaceholderNotice(blockText(block))
       if (!seenResult && text.trim()) return false
       if (seenResult && message.role === "user" &&
         /^\[Request interrupted by user(?:\s+for tool use)?\]\s*$/.test(text)) {
@@ -1776,24 +2144,30 @@ function isInterruptedToolTurn(body) {
   return false
 }
 
+const CONTEXT_NOTICE_RE = /<(?:system-update|teammate-message|ide_opened_file|ide_selection|mcp-resource)(?:\s[^>]*)?>[\s\S]*?<\/(?:system-update|teammate-message|ide_opened_file|ide_selection|mcp-resource)>|(?:\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
+const SYSTEM_REMINDER_RE = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder(?:\s[^>]*)?>/g
+const PROTOCOL_NOTICE_START_RE = /^(?:<(?:system-update|task-notification|teammate-message|system-reminder|ide_opened_file|ide_selection|mcp-resource)\b|\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\])/
+const UNCLOSED_NOTICE_RE = /<\/?(?:system-update|task-notification|teammate-message|system-reminder|ide_opened_file|ide_selection|mcp-resource)\b/
+
 // Forward complete protocol-generated context notices and tool-companion blocks
 // without turning ordinary user instructions into tool output. OpenCode can
 // append a <system-update> after a tool result when its dynamic tool catalog
 // changes; Claude Code appends turn-companion blocks for Skill bodies, image
-// coordinate dimensions, and ToolSearch confirmations.
-function withContextNotices(results, body) {
+// coordinate dimensions, ToolSearch confirmations, and mid-turn queued_command
+// prompts (which set userSteered so the bridge replays them via session/prompt
+// rather than inside MCP function_response).
+function inspectToolTurn(results, body) {
   let out = results
+  let userSteered = false
   const notices = []
   let seenResult = false
   const skillIndex = findLastResultIndex(out, isSkillResult)
   const imageIndex = findLastResultIndex(out, (item) =>
     item.result?.content?.some((part) => part?.type === "image"))
   const toolSearchIndex = findLastResultIndex(out, (item) => item.call?.name === "ToolSearch")
-  const contextNotice = /<system-update(?:\s[^>]*)?>[\s\S]*?<\/system-update>|(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>|<teammate-message(?:\s[^>]*)?>[\s\S]*?<\/teammate-message>/g
-  const systemReminder = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder>/g
-  const protocolNoticeStart = /^(?:<(?:system-update|task-notification|teammate-message|system-reminder)\b|\[SYSTEM NOTIFICATION - NOT USER INPUT\])/
-  const unclosedNotice = /<\/?(?:system-update|task-notification|teammate-message|system-reminder)\b/
-  const userInterruption = /The user sent (?:a new message while you were working|the following message):/
+  const userInterruption = /(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):/
+  const queuedCommandEnvelope = /^(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):\n[\s\S]*\n\nThis is how Claude Code surfaces (?:messages the user sends|prompts [^\r\n]+ submits) mid-turn\b/
+  const nonUserSourceNotice = /^\[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT\]\s*\n/
   const skillCompanion = /^\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) /
   const imageCompanion = /^\[Image(?: source)?: [^\r\n]+\]$/
   const toolLoadedCompanion = /^Tools? loaded\.(?:\n\[id:[^\]\n]+\])*$/
@@ -1801,7 +2175,8 @@ function withContextNotices(results, body) {
   const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/
   const hookNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
   const structuredDelta = /<(?:deferred_tools_delta|mcp_instructions_delta|agent_listing_delta|skill_listing)\b|^# Environment\b/m
-  const isNoise = (value) => !value || tokenNoise.test(value) || (hookNoise.test(value) && !structuredDelta.test(value))
+  const isNoise = (value) => !value || tokenNoise.test(value) ||
+    (hookNoise.test(value) && !structuredDelta.test(value) && !userInterruption.test(value))
   for (const message of trailingMessages(body).messages) {
     const blocks = Array.isArray(message.content) ? message.content : [message.content]
     for (const block of blocks) {
@@ -1809,20 +2184,40 @@ function withContextNotices(results, body) {
         seenResult = true
         continue
       }
-      const text = blockText(block)
-      const trimmed = text.trim()
-      if (!seenResult && trimmed) {
+      if (block?.type === "image") {
+        if (!seenResult) {
+          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        }
+        out = appendResultPart(out, out.length - 1, parseUserImage(block))
+        continue
+      }
+      const rawText = blockText(block)
+      if (!seenResult && rawText.trim()) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
+      const text = stripMagpiePlaceholderNotice(rawText)
+      if (text !== rawText && !notices.includes(MAGPIE_PLACEHOLDER_NOTICE)) {
+        notices.push(MAGPIE_PLACEHOLDER_NOTICE)
+      }
+      const trimmed = text.trim()
       if (!trimmed) continue
       if (message.role === "user" && skillCompanion.test(text)) {
         out = appendResultText(out, skillIndex, text)
         continue
       }
-      if (userInterruption.test(text)) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
-      }
       if (message.role === "user") {
+        if (queuedCommandEnvelope.test(trimmed)) {
+          userSteered = true
+          continue
+        }
+        if (nonUserSourceNotice.test(trimmed) && !/<task-notification\b/.test(trimmed)) {
+          const check = trimmed.replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+          if (UNCLOSED_NOTICE_RE.test(check)) {
+            throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+          }
+          notices.push(trimmed)
+          continue
+        }
         if (imageCompanion.test(trimmed)) {
           out = appendResultText(out, imageIndex, trimmed)
           continue
@@ -1835,30 +2230,73 @@ function withContextNotices(results, body) {
           notices.push(trimmed)
           continue
         }
-        if (skillIndex >= 0 && !isNoise(trimmed) && !protocolNoticeStart.test(trimmed)) {
+        if (skillIndex >= 0 && !isNoise(trimmed) && !PROTOCOL_NOTICE_START_RE.test(trimmed) && !userInterruption.test(trimmed)) {
           out = appendResultText(out, skillIndex, text)
           continue
         }
       }
-      notices.push(...Array.from(text.matchAll(contextNotice), (match) => match[0]))
-      const withoutNotices = text.replace(contextNotice, "")
-      for (const match of withoutNotices.matchAll(systemReminder)) {
+      notices.push(...Array.from(text.matchAll(CONTEXT_NOTICE_RE), (match) => match[0]))
+      const withoutNotices = text.replace(CONTEXT_NOTICE_RE, "")
+      for (const match of withoutNotices.matchAll(SYSTEM_REMINDER_RE)) {
         const inner = match[1].trim()
+        if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) {
+          userSteered = true
+          continue
+        }
         if (!isNoise(inner)) notices.push(inner)
       }
-      const rest = withoutNotices.replace(systemReminder, "").trim()
-      if (unclosedNotice.test(rest)) {
+      const rest = withoutNotices.replace(SYSTEM_REMINDER_RE, "").trim()
+      if (UNCLOSED_NOTICE_RE.test(rest)) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
       if (message.role === "system" || message.role === "developer") {
-        if (!isNoise(rest)) notices.push(rest)
+        if (extractQueuedPrompt(rest) !== null || userInterruption.test(rest)) {
+          userSteered = true
+        } else if (!isNoise(rest)) {
+          notices.push(rest)
+        }
       } else if (!isNoise(rest)) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
     }
   }
-  if (!notices.length) return out
-  return appendResultText(out, out.length - 1, `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>`)
+  const finalResults = notices.length
+    ? appendResultText(out, out.length - 1, `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>`)
+    : out
+  return { results: finalResults, userSteered }
+}
+
+function withContextNotices(results, body) {
+  return inspectToolTurn(results, body).results
+}
+
+// When a previous tool-result HTTP request failed or was aborted before producing
+// an assistant message, and the user subsequently enters a new standalone user
+// message after the tool_result message, replay in a fresh session instead of
+// wedging the conversation with HTTP 400.
+function canReplayFollowUpAfterResults(body, rawResults) {
+  const { history, messages } = trailingMessages(body)
+  let lastResultIndex = -1
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    if (message.role === "user" && Array.isArray(message.content) &&
+      message.content.some((block) => block?.type === "tool_result")) {
+      lastResultIndex = i
+    }
+  }
+  if (lastResultIndex < 0 || lastResultIndex >= messages.length - 1) return false
+  const tail = messages.slice(lastResultIndex + 1)
+  if (!tail.some((message) => message.role === "user")) return false
+  try {
+    withContextNotices(rawResults, { ...body, messages: [...history, ...messages.slice(0, lastResultIndex + 1)] })
+  } catch {
+    return false
+  }
+  for (const message of tail) {
+    const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+    if (UNCLOSED_NOTICE_RE.test(rest)) return false
+  }
+  return true
 }
 
 function namedWorkDirectory(body, init) {
@@ -2199,10 +2637,140 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
   })
 }
 
+function estimateTextTokens(text) {
+  if (!text) return 0
+  let ascii = 0
+  let nonAsciiBytes = 0
+  const buf = Buffer.from(String(text), "utf8")
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] < 0x80) ascii++
+    else nonAsciiBytes++
+  }
+  return Math.ceil(ascii / 4 + nonAsciiBytes / 3)
+}
+
+function estimateInputTokens(body) {
+  let total = 0
+  let images = 0
+  const walk = (value) => {
+    if (value == null) return
+    if (typeof value === "string") {
+      total += estimateTextTokens(value)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item)
+      return
+    }
+    if (typeof value === "object") {
+      if (value.type === "image" && value.source?.type === "base64") {
+        images++
+        return
+      }
+      for (const [key, item] of Object.entries(value)) {
+        if (key === "cache_control" || key === "signature") continue
+        walk(item)
+      }
+    }
+  }
+  walk(body.system)
+  walk(body.messages)
+  if (Array.isArray(body.tools) && body.tools.length) {
+    total += estimateTextTokens(JSON.stringify(body.tools))
+  }
+  return Math.max(1, total + images * 1600)
+}
+
+async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let message = {
+    id: fallbackId,
+    type: "message",
+    role: "assistant",
+    model: fallbackModel,
+    content: [],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 0, output_tokens: 0 },
+  }
+  const blocks = new Map()
+  let streamError = null
+
+  const processBlock = (raw) => {
+    let eventName = ""
+    let dataLine = ""
+    for (const line of raw.split("\n")) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim()
+      else if (line.startsWith("data:")) dataLine += line.slice(5).trim()
+    }
+    if (!dataLine) return
+    let payload
+    try { payload = JSON.parse(dataLine) } catch { return }
+    if (eventName === "message_start" && payload.message) {
+      message = { ...message, ...payload.message, content: [] }
+    } else if (eventName === "content_block_start" && payload.content_block) {
+      blocks.set(payload.index, { ...payload.content_block, _json: "" })
+    } else if (eventName === "content_block_delta" && payload.delta) {
+      const current = blocks.get(payload.index)
+      if (!current) return
+      if (payload.delta.type === "text_delta") current.text = (current.text || "") + (payload.delta.text || "")
+      else if (payload.delta.type === "thinking_delta") current.thinking = (current.thinking || "") + (payload.delta.thinking || "")
+      else if (payload.delta.type === "signature_delta") current.signature = payload.delta.signature
+      else if (payload.delta.type === "input_json_delta") current._json += payload.delta.partial_json || ""
+    } else if (eventName === "content_block_stop") {
+      const current = blocks.get(payload.index)
+      if (!current) return
+      blocks.delete(payload.index)
+      if (current.type === "tool_use" && current._json) {
+        try { current.input = JSON.parse(current._json) } catch {}
+      }
+      delete current._json
+      message.content.push(current)
+    } else if (eventName === "message_delta") {
+      if (payload.delta?.stop_reason !== undefined) message.stop_reason = payload.delta.stop_reason
+      if (payload.delta?.stop_sequence !== undefined) message.stop_sequence = payload.delta.stop_sequence
+      if (payload.usage) message.usage = { ...message.usage, ...payload.usage }
+    } else if (eventName === "error") {
+      streamError = payload.error || { type: "api_error", message: "stream error" }
+    }
+  }
+
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let boundary
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      processBlock(frame)
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) processBlock(buffer)
+
+  if (streamError) {
+    const status = streamError.type === "rate_limit_error" ? 429 : 502
+    return new Response(JSON.stringify({ type: "error", error: streamError }), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    })
+  }
+  return new Response(JSON.stringify(message), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  })
+}
+
 function streamResponse(proc, turn, body, signal) {
   turn.attach()
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
   const stream = makeAnthropicStream(proc, turn, body, msgId, signal)
+  if (body.stream === false) {
+    return jsonResponseFromStream(stream, body.model, msgId)
+  }
   return new Response(stream, {
     status: 200,
     headers: {
@@ -2252,7 +2820,30 @@ export const AntigravityBridgePlugin = async () => {
         return {
           baseURL: "agy://local",
           apiKey: "agy",
-          fetch: async (fetchInput, init) => {
+          fetch: async (fetchInput, init = {}) => {
+            const requestUrl = typeof fetchInput === "string"
+              ? fetchInput
+              : fetchInput instanceof URL
+                ? fetchInput.href
+                : fetchInput?.url || ""
+            if (/\/count[_-]tokens(?:$|[/?#])/i.test(requestUrl)) {
+              try {
+                const raw = init.body != null
+                  ? (typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body))
+                  : (typeof fetchInput?.text === "function" ? await fetchInput.text() : "")
+                const parsed = JSON.parse(raw)
+                if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.messages)) {
+                  return jsonError(400, "invalid count_tokens request")
+                }
+                return new Response(JSON.stringify({ input_tokens: estimateInputTokens(parsed) }), {
+                  status: 200,
+                  headers: { "Content-Type": "application/json" },
+                })
+              } catch (error) {
+                return jsonError(400, error.message)
+              }
+            }
+
             const agy = findAgy()
             if (!agy) return jsonError(503, "agy CLI not found on this machine")
             let body
@@ -2265,7 +2856,7 @@ export const AntigravityBridgePlugin = async () => {
             }
 
             const rawModel = body.model || ""
-            const requestedModel = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel
+            const requestedModel = (rawModel.includes("/") ? rawModel.split("/").pop() : rawModel).replace(/\[1m\]$/i, "")
             body = { ...body, model: requestedModel }
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const convKey = conversationKey(body)
@@ -2298,8 +2889,21 @@ export const AntigravityBridgePlugin = async () => {
                     result: toolResult(block),
                   }))
                   proc.validateResults(rawResults)
-                  const interrupted = isInterruptedToolTurn(body)
-                  const results = interrupted ? rawResults : withContextNotices(rawResults, body)
+                  let interrupted = isInterruptedToolTurn(body)
+                  let results = rawResults
+                  if (!interrupted) {
+                    try {
+                      const inspected = inspectToolTurn(rawResults, body)
+                      results = inspected.results
+                      if (inspected.userSteered) interrupted = true
+                    } catch (error) {
+                      if (error instanceof UnsupportedContent && canReplayFollowUpAfterResults(body, rawResults)) {
+                        interrupted = true
+                      } else {
+                        throw error
+                      }
+                    }
+                  }
                   if (!interrupted) proc.validateResults(results)
                   if (interrupted || !proc.matchesHistory(trailingMessages(body).history) ||
                     proc.workDir !== workDir || proc.instructions !== instructions) {
@@ -2332,10 +2936,17 @@ export const AntigravityBridgePlugin = async () => {
                 isFresh,
                 resultBlocks.length > 0,
               )
-              const content = proc.hasSentFirstTurn
-                ? renderContinuedTurn(body.messages.slice(history.length))
-                : renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession)
-              const turn = proc.startTurn(content, body.messages, model)
+              const contentParts = proc.hasSentFirstTurn
+                ? renderContinuedTurnParts(body.messages.slice(history.length))
+                : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession)
+              if (promptHasImage(contentParts) && !proc.promptImage) {
+                if (!proc.hasSentFirstTurn) {
+                  dropFromPool(proc)
+                  await proc.stop().catch(() => {})
+                }
+                throw new UnsupportedContent("an image block in a user message (agy's ACP prompt accepts text only)")
+              }
+              const turn = proc.startTurn(contentParts, body.messages, model)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
               return jsonError(error.statusCode ?? 502, error.message)

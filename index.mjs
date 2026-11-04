@@ -212,7 +212,7 @@ function buildModelCatalog(list) {
     })
     routes.set(id, { byEffort, efforts, defaultEffort })
   }
-  return { models, routes }
+  return { models, routes, rawIds }
 }
 
 async function loadModelCatalog(agyPath, refresh = false) {
@@ -262,10 +262,52 @@ function closestEffort(effort, efforts) {
   return best
 }
 
+function resolveCatalogAlias(catalog, model) {
+  if (!model || catalog.routes.has(model) || catalog.rawIds?.has(model)) {
+    return { id: model, inlineEffort: "" }
+  }
+  const undated = model.replace(/-\d{8}$/, "")
+  if (catalog.routes.has(undated) || catalog.rawIds?.has(undated)) {
+    return { id: undated, inlineEffort: "" }
+  }
+  const effortMatch = /^(.*)-(minimal|low|medium|high|xhigh|max)$/i.exec(undated)
+  const base = effortMatch ? effortMatch[1] : undated
+  const inlineEffort = effortMatch ? effortMatch[2].toLowerCase() : ""
+  if (catalog.routes.has(base) || catalog.rawIds?.has(base)) {
+    return { id: base, inlineEffort }
+  }
+  const routeKeys = [...catalog.routes.keys()]
+  if (/^(?:gemini-[0-9.]+-flash(?:-lite)?|claude-(?:[0-9.-]+-)?haiku(?:-[0-9.-]+)?)$/i.test(base)) {
+    const flashFamily = routeKeys.find((id) => /flash/i.test(id)) ||
+      catalog.models.find((item) => /flash/i.test(item.id))?.id
+    if (flashFamily) return { id: flashFamily, inlineEffort }
+    const fallbackGemini = routeKeys.find((id) => /^gemini-/i.test(id))
+    if (fallbackGemini) return { id: fallbackGemini, inlineEffort: inlineEffort || "low" }
+  }
+  if (/^gemini-[0-9.]+-(?:pro|ultra)(?:-[a-z0-9.]+)?$/i.test(base)) {
+    const proFamily = (catalog.routes.has("gemini-4-argon") ? "gemini-4-argon" : null) ||
+      routeKeys.find((id) => /^gemini-/i.test(id) && !/flash/i.test(id)) ||
+      catalog.models.find((item) => /^gemini-/i.test(item.id) && !/flash/i.test(item.id))?.id
+    if (proFamily) return { id: proFamily, inlineEffort }
+  }
+  if (/^claude-(?:[0-9.-]+-)?sonnet(?:-[0-9.-]+)?$/i.test(base)) {
+    const sonnet = routeKeys.find((id) => /^claude-.*sonnet/i.test(id)) ||
+      catalog.models.find((item) => /^claude-.*sonnet/i.test(item.id))?.id
+    if (sonnet) return { id: sonnet, inlineEffort }
+  }
+  if (/^claude-(?:[0-9.-]+-)?opus(?:-[0-9.-]+)?(?:-thinking)?$/i.test(base)) {
+    const opus = routeKeys.find((id) => /^claude-.*opus/i.test(id)) ||
+      catalog.models.find((item) => /^claude-.*opus/i.test(item.id))?.id
+    if (opus) return { id: opus, inlineEffort }
+  }
+  return { id: model, inlineEffort: "" }
+}
+
 function resolveAgyModel(catalog, model, body) {
-  const family = catalog.routes.get(model)
-  if (!family) return model
-  const requested = requestedEffort(body)
+  const { id: resolvedId, inlineEffort } = resolveCatalogAlias(catalog, model)
+  const family = catalog.routes.get(resolvedId)
+  if (!family) return resolvedId
+  const requested = requestedEffort(body) || inlineEffort
   const effort = requested ? closestEffort(requested, family.efforts) : family.defaultEffort
   return family.byEffort.get(effort)
 }
@@ -842,6 +884,39 @@ class Proc {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
     return historyKey(this.expectedMessages) === historyKey(messages)
+  }
+
+  // Clients such as Claude Code normalize tool_use inputs when recording an
+  // assistant message (e.g. filling default replace_all: false on Edit or
+  // stripping a redundant cd prefix on Bash). When the pending turn's exact
+  // CSPRNG toolu_ IDs and tool names match, allow canonicalized tool_use.input
+  // without tearing down the live ACP session.
+  matchesPendingTurnHistory(turn, history) {
+    if (this.matchesHistory(history)) return true
+    if (this.historyInvalid || !turn || this.turn !== turn || !Array.isArray(this.expectedMessages)) return false
+    let split = history.length
+    while (split > 0 && history[split - 1].role === "assistant") split--
+    let expectedSplit = this.expectedMessages.length
+    while (expectedSplit > 0 && this.expectedMessages[expectedSplit - 1].role === "assistant") expectedSplit--
+    if (historyKey(this.expectedMessages.slice(0, expectedSplit)) !== historyKey(history.slice(0, split))) return false
+    const actualAssistant = history.slice(split)
+    const expectedAssistant = this.expectedMessages.slice(expectedSplit)
+    const actualCalls = lastAssistantCalls(actualAssistant)
+    const expectedCalls = lastAssistantCalls(expectedAssistant)
+    if (!actualCalls.length || actualCalls.length !== expectedCalls.length) return false
+    if (actualCalls.some((call, index) =>
+      !call.id || call.id !== expectedCalls[index].id || call.name !== expectedCalls[index].name)) {
+      return false
+    }
+    const stripToolInputs = (messages) => messages.map((message) => ({
+      ...message,
+      content: Array.isArray(message.content)
+        ? message.content.map((block) => block?.type === "tool_use"
+          ? { type: "tool_use", id: block.id, name: block.name, input: {} }
+          : block)
+        : message.content,
+    }))
+    return historyKey(stripToolInputs(expectedAssistant)) === historyKey(stripToolInputs(actualAssistant))
   }
 
   recordToolResults(turn, messages) {
@@ -1539,6 +1614,51 @@ function parseUserDocumentText(block) {
   return title ? `[document: ${title}]\n${text}\n[end of document]` : text
 }
 
+function parseSearchResultText(block) {
+  if (block?.type !== "search_result") return ""
+  const header = [block.title, block.source].filter((item) => typeof item === "string" && item.trim()).join(" — ")
+  const body = Array.isArray(block.content)
+    ? block.content.map((part) => typeof part?.text === "string" ? part.text : "").join("\n")
+    : typeof block.content === "string" ? block.content : ""
+  return header ? `[search result: ${header}]\n${body}\n[end of search result]` : body
+}
+
+const SERVER_TOOL_RESULT_BLOCK_TYPES = new Set([
+  "web_search_tool_result",
+  "web_fetch_tool_result",
+  "code_execution_tool_result",
+  "bash_code_execution_tool_result",
+  "text_editor_code_execution_tool_result",
+  "tool_search_tool_result",
+  "mcp_tool_result",
+  "advisor_tool_result",
+])
+
+const ASSISTANT_ALLOWED_BLOCK_TYPES = new Set([
+  "text",
+  "tool_use",
+  "thinking",
+  "redacted_thinking",
+  "server_tool_use",
+  "mcp_tool_use",
+  "container_upload",
+  ...SERVER_TOOL_RESULT_BLOCK_TYPES,
+])
+
+function renderServerAssistantBlock(block) {
+  if (!block || typeof block !== "object") return ""
+  if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
+    return `[server tool call ${block.name || block.type} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`
+  }
+  if (block.type === "container_upload") {
+    return block.file_id ? `[container upload ${block.file_id}]` : ""
+  }
+  if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+    return `[${block.type}${block.tool_use_id ? " id=" + block.tool_use_id : ""}] ${JSON.stringify(block.content ?? "")}`
+  }
+  return ""
+}
+
 const MAGPIE_PLACEHOLDER_NOTICE = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
 const MAGPIE_PLACEHOLDER_NOTICE_RE = /(?:^|\n\n)Values written like \{\{NAME_ab12cd34\}\} are placeholders for real values\. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs\. Don't ask to verify them, and don't replace them with examples\.(?=\s|$)/g
 
@@ -1563,6 +1683,8 @@ function historyKey(messages) {
         value = { type: "text", text: stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "") }
       } else if (block.type === "document") {
         value = { type: "text", text: parseUserDocumentText(block) }
+      } else if (block.type === "search_result") {
+        value = { type: "text", text: parseSearchResultText(block) }
       } else if (block.type === "image") {
         const image = parseUserImage(block)
         value = { type: "image", mimeType: image.mimeType, sha256: digest(image.data) }
@@ -1572,6 +1694,9 @@ function historyKey(messages) {
         value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
       } else if (block.type === "tool_result") {
         value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
+      } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
+        block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+        value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }
       } else {
         value = block
       }
@@ -1796,6 +1921,7 @@ function blockText(block) {
     return `Loaded tool: ${block.tool_name}`
   }
   if (block.type === "document") return parseUserDocumentText(block)
+  if (block.type === "search_result") return parseSearchResultText(block)
   if (block.type === "image") {
     parseUserImage(block)
     return "[image]"
@@ -1828,9 +1954,33 @@ function renderAssistantTurn(message) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
       parts.push(`[tool call ${block.name} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`)
+    } else {
+      const rendered = renderServerAssistantBlock(block)
+      if (rendered) parts.push(rendered)
     }
   }
   return parts.join("\n")
+}
+
+function outputFormatReminder(body) {
+  const format = body?.output_config?.format || body?.response_format
+  if (!format || typeof format !== "object") return []
+  if (format.type === "json_schema") {
+    const schema = format.schema ?? format.json_schema?.schema
+    if (schema && typeof schema === "object") {
+      return [{
+        type: "text",
+        text: `<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON value (no Markdown code fences, no backticks, and no explanatory prose before or after) conforming strictly to this JSON Schema:\n${JSON.stringify(schema)}\n</system-reminder>`,
+      }]
+    }
+  }
+  if (format.type === "json_object") {
+    return [{
+      type: "text",
+      text: "<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON object (no Markdown code fences, no backticks, and no explanatory prose before or after).\n</system-reminder>",
+    }]
+  }
+  return []
 }
 
 function workDirNote(callerWorkDir) {
@@ -2024,7 +2174,7 @@ function validateBody(body) {
   for (const message of body.messages) {
     if (message.role === "assistant" && Array.isArray(message.content)) {
       for (const block of message.content) {
-        if (["text", "tool_use", "thinking", "redacted_thinking"].includes(block?.type)) continue
+        if (ASSISTANT_ALLOWED_BLOCK_TYPES.has(block?.type)) continue
         throw new UnsupportedContent(`an assistant content block of type ${JSON.stringify(block?.type)}`)
       }
     } else if (message.role === "system" || message.role === "developer") {
@@ -2046,6 +2196,7 @@ function validateBody(body) {
           else if (block?.type === "text" || typeof block === "string") continue
           else if (block?.type === "image") parseUserImage(block)
           else if (block?.type === "document") parseUserDocumentText(block)
+          else if (block?.type === "search_result") parseSearchResultText(block)
           else blockText(block)
         }
       } else if (typeof message.content !== "string") {
@@ -2068,6 +2219,8 @@ function toolResult(block) {
       if (part?.type === "tool_reference" && typeof part.tool_name === "string") {
         return { type: "text", text: `Loaded tool: ${part.tool_name}` }
       }
+      if (part?.type === "document") return { type: "text", text: parseUserDocumentText(part) }
+      if (part?.type === "search_result") return { type: "text", text: parseSearchResultText(part) }
       if (part?.type === "image" && part.source?.type === "base64" && part.source.data) {
         return {
           type: "image",
@@ -2134,7 +2287,7 @@ function isInterruptedToolTurn(body) {
         continue
       }
       const text = stripMagpiePlaceholderNotice(blockText(block))
-      if (!seenResult && text.trim()) return false
+      if (!seenResult && message.role === "user" && text.trim()) return false
       if (seenResult && message.role === "user" &&
         /^\[Request interrupted by user(?:\s+for tool use)?\]\s*$/.test(text)) {
         return true
@@ -2144,18 +2297,24 @@ function isInterruptedToolTurn(body) {
   return false
 }
 
-const CONTEXT_NOTICE_RE = /<(?:system-update|teammate-message|ide_opened_file|ide_selection|mcp-resource)(?:\s[^>]*)?>[\s\S]*?<\/(?:system-update|teammate-message|ide_opened_file|ide_selection|mcp-resource)>|(?:\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
+const NOTICE_TAG_NAMES = "system-update|teammate-message|agent-message|cross-session-message|coordinator-relay|channel|ide_opened_file|ide_selection|mcp-resource|mcp-resource-update|mcp-polling-update|post-tool-use-hook|user-prompt-submit-hook"
+const CONTEXT_NOTICE_RE = new RegExp(
+  `<(${NOTICE_TAG_NAMES})(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1>|(?:\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\][^<]*)?<task-notification>[\\s\\S]*?<\\/task-notification>`,
+  "g",
+)
 const SYSTEM_REMINDER_RE = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder(?:\s[^>]*)?>/g
-const PROTOCOL_NOTICE_START_RE = /^(?:<(?:system-update|task-notification|teammate-message|system-reminder|ide_opened_file|ide_selection|mcp-resource)\b|\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\])/
-const UNCLOSED_NOTICE_RE = /<\/?(?:system-update|task-notification|teammate-message|system-reminder|ide_opened_file|ide_selection|mcp-resource)\b/
+const PROTOCOL_NOTICE_START_RE = new RegExp(
+  `^(?:<(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b|\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\])`,
+)
+const UNCLOSED_NOTICE_RE = new RegExp(
+  `<\\/?(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b`,
+)
 
-// Forward complete protocol-generated context notices and tool-companion blocks
-// without turning ordinary user instructions into tool output. OpenCode can
-// append a <system-update> after a tool result when its dynamic tool catalog
-// changes; Claude Code appends turn-companion blocks for Skill bodies, image
-// coordinate dimensions, ToolSearch confirmations, and mid-turn queued_command
-// prompts (which set userSteered so the bridge replays them via session/prompt
-// rather than inside MCP function_response).
+// Forward complete protocol-generated context notices, Claude Code hook outputs,
+// and tool-companion blocks without turning arbitrary inline user instructions
+// into MCP function_response text. Mid-turn queued_command prompts and follow-up
+// user instructions after a rejected/stopped tool call set userSteered so the
+// bridge replays them via session/prompt.
 function inspectToolTurn(results, body) {
   let out = results
   let userSteered = false
@@ -2165,6 +2324,8 @@ function inspectToolTurn(results, body) {
   const imageIndex = findLastResultIndex(out, (item) =>
     item.result?.content?.some((part) => part?.type === "image"))
   const toolSearchIndex = findLastResultIndex(out, (item) => item.call?.name === "ToolSearch")
+  const stoppedByHookOrUser = out.some((item) => item.result?.isError &&
+    /^(?:The user doesn't want to proceed with this tool use\.|User rejected tool use\b|Operation stopped by hook\b|Execution stopped by hook\b|Blocked by PreToolUse hook\b|Hook PreToolUse:\S+ denied\b|API Error: Request was aborted\.|\[Request interrupted by user\b)/.test(resultText(item.result).trim()))
   const userInterruption = /(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):/
   const queuedCommandEnvelope = /^(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):\n[\s\S]*\n\nThis is how Claude Code surfaces (?:messages the user sends|prompts [^\r\n]+ submits) mid-turn\b/
   const nonUserSourceNotice = /^\[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT\]\s*\n/
@@ -2172,11 +2333,12 @@ function inspectToolTurn(results, body) {
   const imageCompanion = /^\[Image(?: source)?: [^\r\n]+\]$/
   const toolLoadedCompanion = /^Tools? loaded\.(?:\n\[id:[^\]\n]+\])*$/
   const loopNotice = /^\[\d+ prior \/loop wakeups? found nothing actionable; loop is healthy\.\]$/
-  const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/
-  const hookNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
-  const structuredDelta = /<(?:deferred_tools_delta|mcp_instructions_delta|agent_listing_delta|skill_listing)\b|^# Environment\b/m
-  const isNoise = (value) => !value || tokenNoise.test(value) ||
-    (hookNoise.test(value) && !structuredDelta.test(value) && !userInterruption.test(value))
+  const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining|USD budget: \$\S+; \$\S+ remaining|Output tokens \u2014 turn: [^\r\n]+)$/
+  const hookBoilerplateNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook success:\s*(?:Success)?\s*$/
+  const hookOutput = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
+  const hookStoppedContinuation = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook stopped continuation:/
+  const claudeMetaFeedback = /^(?:(?:Stop|SubagentStop|TeammateIdle|TaskCreated|TaskCompleted|PermissionRequest|PermissionDenied|PreCompact|PostCompact|Elicitation|ElicitationResult|ConfigChange|CwdChanged|FileChanged|WorktreeCreate|WorktreeRemove|InstructionsLoaded) hook feedback:\n[\s\S]+|UserPromptSubmit operation blocked by hook:\n[\s\S]+|The PermissionDenied hook indicated you may retry this tool call\.|The turn did not end: a tool call in your last message asked to end it, but another call in that message failed\.[\s\S]*|Your response above was stopped by a safety classifier \u2014 this is not a tool or API error\.[\s\S]*|The previous response failed to produce a valid tool call\. Please retry the tool call now\.|Your tool call was malformed and could not be parsed\. Please retry\.|Output token limit hit[\s\S]*|Your response (?:was cut off|above was cut off)[\s\S]*|\[Your previous response (?:had no visible output|reached the output limit)[\s\S]*\]|\[structured-output-enforce\][\s\S]*|\[projects-reply-gate\][\s\S]*|Linked in your reply but not sent:[\s\S]*|Goal check-in: \u00ab[\s\S]*)$/
+  const isNoise = (value) => !value || tokenNoise.test(value) || hookBoilerplateNoise.test(value)
   for (const message of trailingMessages(body).messages) {
     const blocks = Array.isArray(message.content) ? message.content : [message.content]
     for (const block of blocks) {
@@ -2192,7 +2354,7 @@ function inspectToolTurn(results, body) {
         continue
       }
       const rawText = blockText(block)
-      if (!seenResult && rawText.trim()) {
+      if (!seenResult && message.role === "user" && rawText.trim()) {
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
       const text = stripMagpiePlaceholderNotice(rawText)
@@ -2230,7 +2392,8 @@ function inspectToolTurn(results, body) {
           notices.push(trimmed)
           continue
         }
-        if (skillIndex >= 0 && !isNoise(trimmed) && !PROTOCOL_NOTICE_START_RE.test(trimmed) && !userInterruption.test(trimmed)) {
+        if (skillIndex >= 0 && !isNoise(trimmed) && !PROTOCOL_NOTICE_START_RE.test(trimmed) &&
+          !userInterruption.test(trimmed) && !hookOutput.test(trimmed) && !claudeMetaFeedback.test(trimmed)) {
           out = appendResultText(out, skillIndex, text)
           continue
         }
@@ -2256,7 +2419,13 @@ function inspectToolTurn(results, body) {
           notices.push(rest)
         }
       } else if (!isNoise(rest)) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
+          notices.push(rest)
+        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item))) {
+          userSteered = true
+        } else {
+          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        }
       }
     }
   }
@@ -2905,7 +3074,11 @@ export const AntigravityBridgePlugin = async () => {
                     }
                   }
                   if (!interrupted) proc.validateResults(results)
-                  if (interrupted || !proc.matchesHistory(trailingMessages(body).history) ||
+                  const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
+                  const historyMatches = directIdsMatch
+                    ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
+                    : proc.matchesHistory(trailingMessages(body).history)
+                  if (interrupted || !historyMatches ||
                     proc.workDir !== workDir || proc.instructions !== instructions) {
                     // A changed context or user-interrupted tool turn needs a new
                     // session. Replay the real results without resolving the old
@@ -2936,9 +3109,10 @@ export const AntigravityBridgePlugin = async () => {
                 isFresh,
                 resultBlocks.length > 0,
               )
-              const contentParts = proc.hasSentFirstTurn
+              const baseParts = proc.hasSentFirstTurn
                 ? renderContinuedTurnParts(body.messages.slice(history.length))
                 : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession)
+              const contentParts = mergePromptParts(baseParts, outputFormatReminder(body))
               if (promptHasImage(contentParts) && !proc.promptImage) {
                 if (!proc.hasSentFirstTurn) {
                   dropFromPool(proc)

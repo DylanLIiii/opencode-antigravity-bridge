@@ -1007,7 +1007,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const convId = inits().at(-1).convId
   const second = continuation(first, events, "real tool output")
   const notice = { type: "text", text: "<system-reminder>[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>job-7</task-id><summary>subagent finished</summary></task-notification>\n<task-notification><task-id>job-8</task-id><summary>another subagent finished</summary></task-notification></system-reminder>" }
-  second.messages.at(-1).content.push({ type: "text", text: "<total_tokens>12345</total_tokens>" }, { type: "text", text: "PreToolUse:Read hook additional context: hook-only-output" })
+  second.messages.at(-1).content.push(
+    { type: "text", text: "<total_tokens>12345</total_tokens>" },
+    { type: "text", text: "PreToolUse:Read hook success: Success" },
+    { type: "text", text: "PreToolUse:Read hook additional context: hook-only-output" },
+  )
   if (location === "inline") second.messages.at(-1).content.push(notice)
   else second.messages.push({ role: location, content: [notice] })
   const response = await callFetch(second)
@@ -1015,7 +1019,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check(`${location} task notification continues the live turn`, response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
   const delivered = logs().find(event => event.type === "mcpResult" && event.convId === convId)
   const content = delivered?.result?.content?.map(part => part.text).join("\n") || ""
-  check(`${location} task notifications reach MCP without hook/token noise`, content.startsWith("real tool output") && content.includes("<system-reminder>") && content.includes("job-7") && content.includes("job-8") && !content.includes("12345") && !content.includes("hook-only-output"), content)
+  check(`${location} task notifications and hook context reach MCP without token/boilerplate noise`, content.startsWith("real tool output") && content.includes("<system-reminder>") && content.includes("job-7") && content.includes("job-8") && content.includes("hook-only-output") && !content.includes("12345") && !content.includes("hook success: Success"), content)
   check(`${location} task notification does not add an agy prompt`, logs().filter(event => event.type === "user" && event.convId === convId).length === 1)
   if (response.status !== 200) await drive(first, events, "cleanup")
 }
@@ -1296,7 +1300,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
   second.messages.push({
     role: "system",
     content: [
-      { type: "text", text: "tool.call hook additional context: lowercase-hook-noise" },
+      { type: "text", text: "SessionStart:startup hook success: Success" },
+      { type: "text", text: "tool.call hook additional context: lowercase-hook-context" },
       { type: "text", text: "PostToolUse:Bash hook additional context: hook-head\n\n# Environment update\n - Primary working directory: /remote-wsl/project/subdir" },
       { type: "text", text: "The user hasn't heard from you in a while." },
     ],
@@ -1307,12 +1312,14 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const mcpText = delivered?.result?.content?.map(part => part.text).join("\n") || ""
   check("system notices and mid-turn environment update continue the live tool turn",
     response.status === 200 && stopOf(final) === "end_turn" && inits().length === before, `got ${response.status}`)
-  check("system notices reach MCP while lowercase hook noise is excluded",
+  check("system notices and hook contexts reach MCP while empty hook success is excluded",
     mcpText.startsWith("real output") &&
     mcpText.includes("changed on disk") &&
+    mcpText.includes("lowercase-hook-context") &&
+    mcpText.includes("PostToolUse:Bash hook additional context: hook-head") &&
     mcpText.includes("# Environment update") &&
     mcpText.includes("hasn't heard from you") &&
-    !mcpText.includes("lowercase-hook-noise"), mcpText)
+    !mcpText.includes("hook success: Success"), mcpText)
 }
 
 {
@@ -1632,6 +1639,106 @@ for (const location of ["inline", "system", "developer", "user"]) {
     wRes.status === 200 && stopOf(wFinal) === "end_turn" && lastOf("user").convId !== wOld.convId &&
     lastOf("user").text.includes("Standalone follow-up user instruction"),
     `status=${wRes.status}`)
+}
+
+{
+  // Full Claude Code hook lifecycle: PreToolUse normalized input + additionalContext,
+  // PostToolUse blocking error, TaskCreated/Stop/PermissionDenied meta-feedback,
+  // rejected tool + merged user follow-up, prompt-hook json_schema, model aliases, and server_tool_use history.
+  const hFirst = { model, messages: [{ role: "user", content: "TOOL hook suite" }], tools: [echoTool] }
+  const hEvents = (await readSSE(await callFetch(hFirst))).events
+  const hConv = inits().at(-1).convId
+  const beforeHookInits = inits().length
+  const hSecond = continuation(hFirst, hEvents, "rtk-rewritten-output")
+  // Simulate Claude Code normalizing assistant tool_use.input (e.g. adding default flags) while keeping toolu_ ID.
+  hSecond.messages[1].content.find(block => block.type === "tool_use").input = { text: "probe", normalized_default: false }
+  // Pre-result system message + PostToolUse blocking error + TaskCreated hook feedback + PermissionDenied retry hint + channel tag.
+  hSecond.messages.splice(2, 0, {
+    role: "system",
+    content: [{ type: "text", text: "PreToolUse:echo hook additional context: PRE_HOOK_MARKER" }],
+  })
+  hSecond.messages.at(-1).content.push(
+    { type: "text", text: '<system-reminder>\nPostToolUse:echo hook blocking error from command: "lint.sh": POST_BLOCK_MARKER\n</system-reminder>' },
+    { type: "text", text: "TaskCreated hook feedback:\nTASK_FEEDBACK_MARKER" },
+    { type: "text", text: "The PermissionDenied hook indicated you may retry this tool call." },
+    { type: "text", text: '<channel source="mcp-webhook">CHANNEL_EVENT_MARKER</channel>' },
+  )
+  const hRes = await callFetch(hSecond)
+  const hFinal = (await readSSE(hRes)).events
+  const hDelivered = logs().filter(event => event.type === "mcpResult" && event.convId === hConv).at(-1)
+  const hMcpText = hDelivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("Claude Code PreToolUse/PostToolUse/TaskCreated/PermissionDenied hooks and normalized tool_use.input keep live session",
+    hRes.status === 200 && stopOf(hFinal) === "end_turn" && inits().length === beforeHookInits &&
+    hMcpText.includes("PRE_HOOK_MARKER") &&
+    hMcpText.includes("POST_BLOCK_MARKER") &&
+    hMcpText.includes("TASK_FEEDBACK_MARKER") &&
+    hMcpText.includes("PermissionDenied hook indicated you may retry") &&
+    hMcpText.includes("CHANNEL_EVENT_MARKER"),
+    hMcpText)
+  const hThird = nextTurn(hSecond, hFinal, "MEMORY after normalized tool_use input")
+  const hThirdRes = await callFetch(hThird)
+  await readSSE(hThirdRes)
+  check("turn after client-normalized tool_use.input reuses the same live session",
+    hThirdRes.status === 200 && inits().length === beforeHookInits && lastOf("user").convId === hConv)
+
+  // User rejects tool call in TUI and enters a new prompt merged into the same user message by Claude Code aLe().
+  const rFirst = { model, messages: [{ role: "user", content: "ESCCALL user rejected tool" }], tools: [echoTool] }
+  const rEvents = (await readSSE(await callFetch(rFirst))).events
+  const rOld = inits().at(-1)
+  const rSecond = continuation(
+    rFirst,
+    rEvents,
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. STOP what you are doing and wait for the user to tell you how to proceed.",
+    { isError: true },
+  )
+  rSecond.messages.at(-1).content.push({ type: "text", text: "Write to /tmp/safe instead" })
+  const rRes = await callFetch(rSecond)
+  const rFinal = (await readSSE(rRes)).events
+  check("rejected tool_result merged with follow-up user prompt replays cleanly without 400",
+    rRes.status === 200 && stopOf(rFinal) === "end_turn" && lastOf("user").convId !== rOld.convId &&
+    lastOf("user").text.includes("Write to /tmp/safe instead"),
+    `status=${rRes.status}`)
+
+  // type:"prompt" hook request with claude-haiku small-fast model alias + output_config.format json_schema,
+  // plus historical server_tool_use/web_search_tool_result and search_result blocks.
+  const promptHookRes = await callFetch({
+    model: "antigravity-bridge/claude-haiku-4-5-20251001",
+    stream: false,
+    output_config: {
+      format: {
+        type: "json_schema",
+        schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+      },
+    },
+    messages: [
+      { role: "user", content: "Prior turn before /model switch" },
+      {
+        role: "assistant",
+        content: [
+          { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "agy" } },
+          { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [{ type: "web_search_result", url: "https://example.com" }] },
+          { type: "text", text: "Prior answer" },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "search_result", title: "Policy Doc", source: "kb://policy", content: [{ type: "text", text: "RAG_POLICY_MARKER" }] },
+          { type: "text", text: "Evaluate hook safety" },
+        ],
+      },
+    ],
+  })
+  const promptHookMsg = await promptHookRes.json()
+  const promptHookUser = lastOf("user")
+  check("prompt-hook json_schema, small-fast model alias, server_tool_use history, and search_result succeed without 400",
+    promptHookRes.status === 200 && promptHookMsg.type === "message" &&
+    promptHookUser.model === "gemini-test-low" &&
+    promptHookUser.text.includes("Structured output requirement") &&
+    promptHookUser.text.includes('"required":["ok"]') &&
+    promptHookUser.text.includes("RAG_POLICY_MARKER") &&
+    promptHookUser.text.includes("[server tool call web_search"),
+    JSON.stringify({ status: promptHookRes.status, user: promptHookUser }))
 }
 
 try { fs.unlinkSync(fakeAgy) } catch {}

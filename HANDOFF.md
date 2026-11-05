@@ -4,6 +4,7 @@
 schema 校验），用户图片通过协商后的 ACP image capability 发送；旧版一律 400
 和 schema 不删字段的记录仅描述当时行为。
 
+- 同步随后合入 main 的中文 README，英文技术说明更新到 README.en.md。
 - 原作者 gitxm 的六个提交完整保留；合并当前 main，保留模型/thought_level
   的 `session/set_config_option`、旧协议回退、图片能力声明和既有 1.5.0 测试。
 - 工具 companion 绑定到实际前序结果；无匹配 Skill/ToolSearch/图片的文本拒绝。

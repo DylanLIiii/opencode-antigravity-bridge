@@ -61,7 +61,7 @@ function trace(direction, message) {
     const summary = message?.method === "tools/list" || message?.result?.tools
       ? { ...message, result: message.result?.tools ? { tools: message.result.tools.map(tool => tool.name) } : message.result }
       : message
-    fs.appendFileSync(TRACE_PATH, JSON.stringify({ at: Date.now(), pid: process.pid, direction, message: summary }) + "\n")
+    fs.appendFileSync(TRACE_PATH, JSON.stringify({ at: Date.now(), pid: process.pid, direction, message: summary }) + "\n", { mode: 0o600 })
   } catch {}
 }
 

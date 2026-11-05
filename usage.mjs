@@ -125,7 +125,7 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
     if (signal?.aborted) return abort()
     if (Date.now() >= deadline) return finish(new UsageError("agy usage query timed out."))
     try {
-      child = spawn(file, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] })
+      child = spawn(file, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     } catch {
       finish(new UsageError("agy usage could not start the CLI."))
       return

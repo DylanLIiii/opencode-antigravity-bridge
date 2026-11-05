@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
-import { spawnSync } from "node:child_process"
+import childProcess, { spawnSync } from "node:child_process"
+import { syncBuiltinESMExports } from "node:module"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -133,10 +134,35 @@ else if (version) {
 
 test("queries only the structured command in a private, restricted workspace and cleans up", async t => {
   const f = await fixture(t, { AGY_CLI_DISABLE_AUTO_UPDATE: "false" })
-  const result = await fetchUsage(f.executable, f.options)
+  const originalSpawn = childProcess.spawn
+  const spawns = []
+  let result
+  try {
+    childProcess.spawn = (file, args, options) => {
+      spawns.push({ file, args, options })
+      return originalSpawn(file, args, options)
+    }
+    syncBuiltinESMExports()
+    result = await fetchUsage(f.executable, f.options)
+  } finally {
+    childProcess.spawn = originalSpawn
+    syncBuiltinESMExports()
+  }
   assert.equal(result.windows[0].used, 25)
   const logs = await f.logs()
   assert.equal(logs.length, 2)
+  assert.equal(spawns.length, 2)
+  for (const [index, actual] of spawns.entries()) {
+    assert.equal(actual.file, f.executable)
+    assert.deepEqual(actual.args, logs[index].args)
+    assert.equal(actual.options.windowsHide, true, "usage must hide both version and report child windows")
+    assert.equal(actual.options.detached, true)
+    assert.deepEqual(actual.options.stdio, ["ignore", "pipe", "pipe"])
+    assert.equal(path.basename(actual.options.cwd), path.basename(logs[index].cwd))
+    assert.equal(actual.options.env.AGY_CLI_DISABLE_AUTO_UPDATE, "true")
+    assert.equal(actual.options.env.TEST_LOG, f.env.TEST_LOG)
+    assert.notEqual(actual.options.env, f.env)
+  }
   assert.deepEqual(logs[0].args, ["--version"])
   assert.deepEqual(logs[1].args.slice(0, 6), ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage"])
   assert.equal(logs[1].args[6], "--print-timeout")
@@ -154,6 +180,23 @@ test("queries only the structured command in a private, restricted workspace and
   }
   assert.equal(f.env.AGY_CLI_DISABLE_AUTO_UPDATE, "false")
   await f.assertClean()
+})
+
+test("native Windows usage stays unsupported and never starts a CLI", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform")
+  const originalSpawn = childProcess.spawn
+  let calls = 0
+  try {
+    Object.defineProperty(process, "platform", { ...descriptor, value: "win32" })
+    childProcess.spawn = () => { calls++; throw new Error("unexpected CLI launch") }
+    syncBuiltinESMExports()
+    await assert.rejects(fetchUsage("C:\\Program Files\\Antigravity\\agy.exe"), /currently require macOS or Linux/)
+    assert.equal(calls, 0)
+  } finally {
+    Object.defineProperty(process, "platform", descriptor)
+    childProcess.spawn = originalSpawn
+    syncBuiltinESMExports()
+  }
 })
 
 test("rejects old/unverified versions before any possible model prompt", async t => {

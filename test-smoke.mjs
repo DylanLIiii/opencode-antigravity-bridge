@@ -8,6 +8,8 @@ const fakeAgy = path.join(here, `.tmp-fake-agy${suffix}.mjs`)
 const wrapper = path.join(here, `.tmp-agy${suffix}`)
 const logPath = path.join(here, `.tmp-fake-agy-log${suffix}`)
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-agy-state-"))
+const originalAutoUpdate = process.env.AGY_CLI_DISABLE_AUTO_UPDATE
+process.env.AGY_CLI_DISABLE_AUTO_UPDATE = "false"
 process.env.FAKE_AGY_LOG = logPath
 process.env.FAKE_AGY_STATE = stateDir
 const bridgeStateFile = path.join(stateDir, "bridge-sessions.json")
@@ -39,6 +41,7 @@ if (argv.includes("/usage")) {
   process.exit(0)
 }
 if (argv.includes("models")) {
+  log({ type: "models", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE })
   process.stdout.write("gemini-test-medium\tGemini Test (Medium)\ngemini-test-high\tGemini Test (High)\ngemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
   process.exit(0)
 }
@@ -335,7 +338,7 @@ async function handle(message) {
       model = "gemini-test-medium"
       await connectIde()
       log({
-        type: "init", pid: process.pid, convId: session.id, resumed: message.method === "session/resume",
+        type: "init", pid: process.pid, convId: session.id, resumed: message.method === "session/resume", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
         cwd: process.cwd(), addDir, agentConfig, clientInfo, systemAppend: params._meta?.antigravity?.systemPrompt?.append ?? null,
         tools, idePort,
       })
@@ -553,7 +556,10 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
 }
 
 {
+  const probesBefore = logs().filter(event => event.type === "models").length
   const models = await plugin.provider.models()
+  const probes = logs().filter(event => event.type === "models").slice(probesBefore)
+  check("directory refresh disables auto update even when the parent enables it", probes.length > 0 && probes.every(event => event.update === "true"))
   check("dynamic models accept tab-separated agy output", !!models["gemini-test"])
   check("dynamic models do not fall back to stale list", !models["gemini-3.7-flash-high"])
   check("models declare Anthropic through OpenCode api.npm", models["gemini-test"]?.api?.npm === "@ai-sdk/anthropic")
@@ -563,6 +569,14 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
   check("grouped model declares Magpie and OpenCode reasoning", models["gemini-test"]?.capabilities?.reasoning === true && models["gemini-test"]?.reasoning === true)
   check("Gemini and Claude models expose image input to the host", models["gemini-test"]?.capabilities?.input?.image === true && models["claude-test-medium"]?.capabilities?.input?.image === true)
   check("single-effort models stay ungrouped", models["claude-test-medium"]?.name === "Claude Test (Medium)" && !models["claude-test-medium"]?.variants)
+}
+
+{
+  const before = logs().filter(event => event.type === "models").length
+  const result = await plugin.auth.methods[0].authorize()
+  const probes = logs().filter(event => event.type === "models").slice(before)
+  check("authorize login probe still succeeds", result.type === "success" && result.key === "agy")
+  check("authorize login probe disables auto update", probes.length === 1 && probes[0].update === "true")
 }
 
 async function launchedModel(body) {
@@ -2179,6 +2193,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
     delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
   }
 }
+
+check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))
+check("child launches never mutate the parent's update setting", process.env.AGY_CLI_DISABLE_AUTO_UPDATE === "false")
+if (originalAutoUpdate === undefined) delete process.env.AGY_CLI_DISABLE_AUTO_UPDATE
+else process.env.AGY_CLI_DISABLE_AUTO_UPDATE = originalAutoUpdate
 
 try { fs.unlinkSync(fakeAgy) } catch {}
 try { fs.unlinkSync(wrapper) } catch {}

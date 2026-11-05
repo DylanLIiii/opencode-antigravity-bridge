@@ -1889,6 +1889,96 @@ for (const location of ["inline", "system", "developer", "user"]) {
     JSON.stringify({ status: promptHookRes.status, user: promptHookUser }))
 }
 
+// Integration regressions for review findings: exercise the real fetch/MCP path.
+{
+  for (const [field, effortBody] of [
+    ['reasoning_effort', { reasoning_effort: 'low' }],
+    ['reasoningEffort', { reasoningEffort: 'low' }],
+    ['reasoning.effort', { reasoning: { effort: 'low' } }],
+    ['thinkingLevel', { generationConfig: { thinkingConfig: { thinkingLevel: 'low' } } }],
+  ]) {
+    check(`${field} selects effort without an Anthropic thinking block`,
+      await launchedModel({ model, ...effortBody, messages: [{ role: 'user', content: `MODEL generic effort ${field}` }] }) === 'gemini-test-low')
+  }
+}
+
+{
+  for (const companion of ['ARGUMENTS: please run the tests', 'Tool loaded.', '[Image: unrelated screenshot]']) {
+    const first = { model, messages: [{ role: 'user', content: `TOOL mismatched companion ${companion}` }], tools: [echoTool] }
+    const events = (await readSSE(await callFetch(first))).events
+    const second = continuation(first, events, 'ordinary echo output')
+    second.messages.at(-1).content.push({ type: 'text', text: companion })
+    const response = await callFetch(second)
+    check(`unmatched companion is not injected into another tool: ${companion}`, response.status === 400, `got ${response.status}`)
+    if (response.status === 400) {
+      await response.text()
+      await drive(first, events, 'cleanup unmatched companion')
+    } else await readSSE(response)
+  }
+}
+
+{
+  const skillTool = { name: 'Skill', description: 'Skill', input_schema: { type: 'object' } }
+  const first = { model, messages: [{ role: 'user', content: 'SKILLCALL ordinary user steering regression' }], tools: [skillTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const second = continuation(first, events, 'Launching skill: archive')
+  second.messages.at(-1).content.push({ type: 'text', text: 'Stop this task and explain something else' })
+  const response = await callFetch(second)
+  check('plain user instructions are not treated as a Skill prompt body', response.status === 400, `got ${response.status}`)
+  if (response.status === 400) {
+    await response.text()
+    await drive(first, events, 'cleanup ordinary Skill text')
+  } else await readSSE(response)
+}
+
+{
+  for (const suffix of ['', '\n\nPlease address this message and continue with your tasks.', '\n\nIMPORTANT: After completing your current task, you MUST address the user\'s message above. Do not ignore it.']) {
+    const first = { model, messages: [{ role: 'user', content: `ESCCALL queued envelope ${suffix.length}` }], tools: [echoTool] }
+    const events = (await readSSE(await callFetch(first))).events
+    const oldId = inits().at(-1).convId
+    const second = continuation(first, events, 'queued tool output')
+    second.messages.at(-1).content.push({ type: 'text', text: 'The user sent a new message while you were working:\nQUEUED_STEERING_MARKER' + suffix })
+    const response = await callFetch(second)
+    check(`queued prompt suffix ${suffix.length} is accepted beside a tool result`, response.status === 200, `got ${response.status}`)
+    if (response.status === 200) {
+      await readSSE(response)
+      check(`queued prompt suffix ${suffix.length} replays as user context in a new session`, lastOf('user').convId !== oldId && lastOf('user').text.includes('QUEUED_STEERING_MARKER'))
+    } else {
+      await response.text()
+      await drive(first, events, 'cleanup queued envelope')
+    }
+  }
+}
+
+{
+  const first = { model, messages: [{ role: 'user', content: 'ESCCALL replay tool image regression' }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const second = continuation(first, events, [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'cmVwbGF5aW1hZ2U=' } }])
+  second.messages.at(-1).content.push({ type: 'text', text: 'The user sent a new message while you were working:\nInspect that returned image' })
+  const response = await callFetch(second)
+  if (response.status === 200) await readSSE(response)
+  else await response.text()
+  check('fresh replay retains image bytes inside a tool_result', response.status === 200 && lastOf('user').content.some(part => part.type === 'image' && part.data === 'cmVwbGF5aW1hZ2U='))
+  if (response.status !== 200) await drive(first, events, 'cleanup replay image')
+}
+
+{
+  // A live owner must keep exclusive access, even if its lock is over five seconds old.
+  for (const age of [0, 10_000]) {
+    const snapshot = fs.readFileSync(bridgeStateFile, 'utf8')
+    fs.writeFileSync(bridgeStateFile + '.lock', JSON.stringify({ pid: process.pid }))
+    const when = new Date(Date.now() - age)
+    fs.utimesSync(bridgeStateFile + '.lock', when, when)
+    try {
+      await readSSE(await callFetch({ model, messages: [{ role: 'user', content: `MEMORY state lock regression ${age}` }] }))
+      check(`state writer leaves another live owner's lock intact at age ${age}`, fs.existsSync(bridgeStateFile + '.lock'))
+      check(`state writer never saves without acquiring the lock at age ${age}`, fs.readFileSync(bridgeStateFile, 'utf8') === snapshot)
+    } finally {
+      fs.rmSync(bridgeStateFile + '.lock', { force: true })
+    }
+  }
+}
+
 try { fs.unlinkSync(fakeAgy) } catch {}
 try { fs.unlinkSync(wrapper) } catch {}
 try { fs.unlinkSync(logPath) } catch {}

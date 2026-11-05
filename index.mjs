@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process"
+import { agyCandidates, spawnAgy, windowsMcpShim } from "./platform.mjs"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
 import fs from "node:fs"
@@ -81,28 +81,7 @@ function configuredTimeout(name, fallback) {
 
 function findAgy() {
   if (cachedAgyPath) return cachedAgyPath
-  const candidates = []
-  if (process.env.AGY_PATH) candidates.push(process.env.AGY_PATH)
-  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, process.platform === "win32" ? "agy.exe" : "agy"))
-  }
-  const home = os.homedir()
-  if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local")
-    candidates.push(
-      path.join(localAppData, "agy", "bin", "agy.exe"),
-      path.join(localAppData, "Programs", "Antigravity", "bin", "agy.exe"),
-      path.join(home, ".local", "bin", "agy.exe"),
-      path.join(home, ".gemini", "bin", "agy.exe"),
-    )
-  } else {
-    candidates.push(
-      path.join(home, ".local", "bin", "agy"),
-      path.join(home, ".gemini", "bin", "agy"),
-      "/usr/local/bin/agy",
-      "/opt/homebrew/bin/agy",
-    )
-  }
+  const candidates = agyCandidates(process.env, os.homedir())
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
@@ -117,7 +96,7 @@ function execOnce(file, args, opts = {}) {
   return new Promise((resolve) => {
     let child
     try {
-      child = spawn(file, args, {
+      child = spawnAgy(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
         ...opts,
@@ -232,14 +211,12 @@ function requestedEffort(body) {
   const forced = normalizeEffort(process.env.AGY_BRIDGE_EFFORT)
   if (forced) return forced
   const thinking = body.thinking?.type
+  if (thinking === "disabled") return ""
+  const generic = [body.reasoning_effort, body.reasoningEffort, body.reasoning?.effort,
+    body.generationConfig?.thinkingConfig?.thinkingLevel].map(normalizeEffort).find(Boolean)
+  if (generic) return generic
   if (thinking !== "enabled" && thinking !== "adaptive") return ""
-  const direct = normalizeEffort(
-    body.output_config?.effort ||
-    body.reasoning_effort ||
-    body.reasoningEffort ||
-    body.reasoning?.effort ||
-    body.generationConfig?.thinkingConfig?.thinkingLevel,
-  )
+  const direct = normalizeEffort(body.output_config?.effort)
   if (direct) return direct
   const budget = Number(body.thinking?.budget_tokens)
   if (!Number.isFinite(budget) || budget <= 0) return ""
@@ -380,7 +357,7 @@ function ensureShimDir() {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-bin-"))
     if (process.platform === "win32") {
       await fs.promises.writeFile(path.join(dir, "nc.cmd"),
-        `@"${process.execPath}" "${MCP_SERVER_PATH}"\r\n`)
+        windowsMcpShim(process.execPath, MCP_SERVER_PATH))
     } else {
       await fs.promises.writeFile(path.join(dir, "nc"),
         `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(MCP_SERVER_PATH)}\n`, { mode: 0o700 })
@@ -713,7 +690,7 @@ class Proc {
       for (const key of Object.keys(childEnv)) {
         if (/^path$/i.test(key) && key !== "PATH") delete childEnv[key]
       }
-      this.child = spawn(this.agyPath, args, {
+      this.child = spawnAgy(this.agyPath, args, {
         cwd: this.workspace,
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
@@ -1520,15 +1497,24 @@ function withStateLock(file, fn) {
     for (let attempt = 0; attempt < 40; attempt++) {
       try {
         fd = fs.openSync(lock, "wx", 0o600)
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid }))
         break
       } catch (error) {
         if (error?.code !== "EEXIST") break
         try {
-          if (Date.now() - fs.statSync(lock).mtimeMs > 5_000) fs.unlinkSync(lock)
+          if (Date.now() - fs.statSync(lock).mtimeMs > 5_000) {
+            const owner = JSON.parse(fs.readFileSync(lock, "utf8"))
+            if (Number.isSafeInteger(owner.pid) && owner.pid > 0) {
+              try { process.kill(owner.pid, 0) } catch (error) {
+                if (error.code === "ESRCH") fs.unlinkSync(lock)
+              }
+            }
+          }
         } catch {}
         Atomics.wait(waitBuf, 0, 0, 5)
       }
     }
+    if (fd === null) return
     return fn()
   } finally {
     if (fd !== null) {
@@ -1842,7 +1828,7 @@ function lastAssistantCalls(messages) {
 
 function matchToolResults(body, blocks) {
   const direct = blocks.map(block => ({ block, match: toolCalls.get(block.tool_use_id) }))
-  if (direct.some(item => item.match)) return direct
+  if (direct.every(item => item.match)) return direct
   const { history } = trailingMessages(body)
   const calls = lastAssistantCalls(history)
   const byID = new Map(calls.map((call, index) => [call.id, index]))
@@ -1855,6 +1841,7 @@ function matchToolResults(body, blocks) {
     if (shown.length !== calls.length || shown.some((call, index) =>
       call.name !== calls[index].name || stableJSON(call.input ?? {}) !== stableJSON(calls[index].input ?? {}))) continue
     const mapped = blocks.map(block => ({ block, match: toolCalls.get(shown[byID.get(block.tool_use_id)].id) }))
+    if (mapped.some((item, index) => direct[index].match && item.match !== direct[index].match)) continue
     if (mapped.some(item => !item.match) || !mapped.some(item => !item.match.call.mcpResponded || (item.match.call.deferred && !item.match.call.result))) continue
     if (found) throw new BusyError("agy bridge: renamed tool IDs match more than one pending conversation")
     found = mapped
@@ -2082,15 +2069,6 @@ function appendPrompt(out, content) {
   }
 }
 
-function messagePrompt(message) {
-  const blocks = Array.isArray(message.content) ? message.content : [message.content]
-  const out = []
-  for (const block of blocks) {
-    appendPrompt(out, block?.type === "image" ? [imageContent(block)] : blockText(block))
-  }
-  return out.length ? out : [{ type: "text", text: "" }]
-}
-
 function renderAssistantTurn(message) {
   const parts = []
   const blocks = Array.isArray(message.content)
@@ -2215,32 +2193,31 @@ function renderTurnMessage(message) {
 }
 
 function renderTurnMessageParts(message) {
-  if (message.role === "user" && Array.isArray(message.content) &&
-    message.content.some((block) => block?.type === "image")) {
-    const parts = []
-    let afterToolResult = false
-    for (const block of message.content) {
-      if (block?.type === "image") {
-        parts.push(parseUserImage(block))
-        afterToolResult = false
-      } else if (block?.type === "tool_result") {
-        parts.push({ type: "text", text: blockText(block) })
-        afterToolResult = true
-      } else {
-        const raw = blockText(block)
-        const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
-        const rendered = queued !== null ? queued : raw
-        parts.push({
-          type: "text",
-          text: rendered && afterToolResult && !rendered.startsWith("\n") ? "\n\n" + rendered : rendered,
-        })
-        if (rendered) afterToolResult = false
-      }
-    }
-    return toPromptParts(parts)
+  if (message.role !== "user" || !Array.isArray(message.content)) {
+    const text = renderTurnMessage(message)
+    return text === "" ? [] : [{ type: "text", text }]
   }
-  const text = renderTurnMessage(message)
-  return text === "" ? [] : [{ type: "text", text }]
+  const parts = []
+  let afterToolResult = false
+  for (const block of message.content) {
+    if (block?.type === "image") {
+      parts.push(parseUserImage(block))
+      afterToolResult = false
+    } else if (block?.type === "tool_result") {
+      appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
+      const result = toolResult(block)
+      for (const part of result.content) appendPrompt(parts, [part])
+      appendPrompt(parts, "\n[end of tool result]")
+      afterToolResult = true
+    } else {
+      const raw = blockText(block)
+      const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
+      const rendered = queued !== null ? queued : raw
+      appendPrompt(parts, rendered && afterToolResult && !rendered.startsWith("\n") ? "\n\n" + rendered : rendered)
+      if (rendered) afterToolResult = false
+    }
+  }
+  return toPromptParts(parts)
 }
 
 function renderTurnMessagesParts(messages) {
@@ -2326,7 +2303,7 @@ function validateBody(body) {
       if (Array.isArray(message.content)) {
         for (const block of message.content) {
           if (block?.type === "tool_result") toolResult(block)
-          else if (block?.type === "image") imageContent(block)
+          else if (block?.type === "image") parseUserImage(block)
           else if (block?.type === "text" || typeof block === "string") continue
           else if (block?.type === "image") parseUserImage(block)
           else if (block?.type === "document") parseUserDocumentText(block)
@@ -2377,13 +2354,6 @@ function extractToolResults(body) {
     ? message.content.filter(block => block?.type === "tool_result") : [])
 }
 
-function findLastResultIndex(results, predicate) {
-  for (let i = results.length - 1; i >= 0; i--) {
-    if (predicate(results[i])) return i
-  }
-  return -1
-}
-
 function isSkillResult(item) {
   if (item.call?.name === "Skill") return true
   const first = item.result?.content?.[0]
@@ -2392,7 +2362,10 @@ function isSkillResult(item) {
 }
 
 function appendResultPart(results, index, part) {
-  const target = index >= 0 ? index : results.length - 1
+  if (index < 0 || index >= results.length) {
+    throw new UnsupportedContent("text beside a live tool_result; no matching tool companion")
+  }
+  const target = index
   const targetCall = results[target]?.call
   return results.map((item, i) => (targetCall ? item.call !== targetCall : i !== target) ? item : {
     ...item,
@@ -2454,14 +2427,10 @@ function inspectToolTurn(results, body) {
   let userSteered = false
   const notices = []
   let seenResult = false
-  const skillIndex = findLastResultIndex(out, isSkillResult)
-  const imageIndex = findLastResultIndex(out, (item) =>
-    item.result?.content?.some((part) => part?.type === "image"))
-  const toolSearchIndex = findLastResultIndex(out, (item) => item.call?.name === "ToolSearch")
+  let resultIndex = -1
   const stoppedByHookOrUser = out.some((item) => item.result?.isError &&
     /^(?:The user doesn't want to proceed with this tool use\.|User rejected tool use\b|Operation stopped by hook\b|Execution stopped by hook\b|Blocked by PreToolUse hook\b|Hook PreToolUse:\S+ denied\b|API Error: Request was aborted\.|\[Request interrupted by user\b)/.test(resultText(item.result).trim()))
   const userInterruption = /(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):/
-  const queuedCommandEnvelope = /^(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):\n[\s\S]*\n\nThis is how Claude Code surfaces (?:messages the user sends|prompts [^\r\n]+ submits) mid-turn\b/
   const nonUserSourceNotice = /^\[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT\]\s*\n/
   const skillCompanion = /^\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) /
   const imageCompanion = /^\[Image(?: source)?: [^\r\n]+\]$/
@@ -2478,13 +2447,14 @@ function inspectToolTurn(results, body) {
     for (const block of blocks) {
       if (block?.type === "tool_result") {
         seenResult = true
+        resultIndex = out.findIndex(item => item.block?.tool_use_id === block.tool_use_id)
         continue
       }
       if (block?.type === "image") {
         if (!seenResult) {
           throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
         }
-        out = appendResultPart(out, out.length - 1, parseUserImage(block))
+        out = appendResultPart(out, resultIndex, parseUserImage(block))
         continue
       }
       const rawText = blockText(block)
@@ -2497,12 +2467,16 @@ function inspectToolTurn(results, body) {
       }
       const trimmed = text.trim()
       if (!trimmed) continue
+      const preceding = out[resultIndex]
+      const skillIndex = preceding && isSkillResult(preceding) ? resultIndex : -1
+      const imageIndex = preceding?.result?.content?.some(part => part?.type === "image") ? resultIndex : -1
+      const toolSearchIndex = preceding?.call?.name === "ToolSearch" ? resultIndex : -1
       if (message.role === "user" && skillCompanion.test(text)) {
         out = appendResultText(out, skillIndex, text)
         continue
       }
       if (message.role === "user") {
-        if (queuedCommandEnvelope.test(trimmed)) {
+        if (extractQueuedPrompt(trimmed) !== null) {
           userSteered = true
           continue
         }
@@ -2526,7 +2500,8 @@ function inspectToolTurn(results, body) {
           notices.push(trimmed)
           continue
         }
-        if (skillIndex >= 0 && !isNoise(trimmed) && !PROTOCOL_NOTICE_START_RE.test(trimmed) &&
+        if (skillIndex >= 0 && /^#{1,6}\s+[^\r\n]*\b(?:skill|instructions)\b/i.test(trimmed) &&
+          !isNoise(trimmed) && !PROTOCOL_NOTICE_START_RE.test(trimmed) &&
           !userInterruption.test(trimmed) && !hookOutput.test(trimmed) && !claudeMetaFeedback.test(trimmed)) {
           out = appendResultText(out, skillIndex, text)
           continue

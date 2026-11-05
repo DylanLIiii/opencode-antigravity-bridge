@@ -136,9 +136,11 @@ magpie plugin add ./opencode-antigravity-bridge
   `<total_tokens>` boilerplate is stripped), and Claude Code's tool-companion
   blocks (`Skill` prompt bodies, image coordinate dimensions and base64 images,
   and `ToolSearch` `tool_reference` / `Tool loaded.` blocks) attach directly to
-  their matching tool result without treating ordinary user instructions as tool
-  output.
-- **Broad Anthropic Messages compatibility**: `/v1/messages/count_tokens`,
+  their preceding matching tool result. Skill companions must carry a `Base
+  directory for this skill:`, `ARGUMENTS:` / `Skill arguments:` prefix, or a
+  Markdown heading containing "skill" or "instructions"; unmarked user text
+  is rejected rather than treated as tool output.
+- **Broad Anthropic Messages compatibility**: `/v1/messages/count_tokens` (a local estimate, not a model tokenizer),
   non-streaming `stream: false` responses, `output_config.format` /
   `response_format` JSON schema reminders (used by Claude Code `type: "prompt"`
   hooks), plain-text `document` and `search_result` blocks, historical
@@ -162,10 +164,21 @@ magpie plugin add ./opencode-antigravity-bridge
 - **Actual HTTP 400 errors** for unsupported request content detected before
   streaming starts.
 
-The MCP transport forwards each declared `input_schema`, but that does not
-automatically execute full JSON Schema validation. The bridge validates tool
+The MCP transport sanitizes `input_schema` keywords for agy's Gemini/Vertex
+translator. Mixed unions are narrowed to a representable type, incompatible
+keywords are removed, and unsupported enum/const values become description
+hints. This does not execute full JSON Schema validation. The bridge validates tool
 names and argument shapes; the client that executes a tool must still validate
 its arguments and authorize the operation.
+
+`output_config.effort` and `thinking.budget_tokens` select a level when
+Anthropic `thinking.type` is `enabled` or `adaptive`. Generic
+`reasoning_effort`, `reasoningEffort`, `reasoning.effort` and
+`generationConfig.thinkingConfig.thinkingLevel` do not require that envelope;
+`thinking.type: "disabled"` suppresses these request-level overrides.
+`count_tokens` estimates text at roughly four ASCII bytes or three non-ASCII
+UTF-8 bytes per token and uses a fixed 1,600 tokens per image. It should not be
+used as an exact quota or context-limit measurement.
 
 ## Token cost
 
@@ -324,6 +337,7 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 |---|---|---|
 | `AGY_PATH` | PATH lookup | agy executable |
 | `AGY_BRIDGE_THINKING` | on | `0` stops forwarding thought summaries |
+| `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
@@ -345,7 +359,9 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. Its 208 checks pass under Node. They cover the minimal
+exercised. Its 266 checks pass under Node and Bun. The 25 focused tests cover
+usage, compatibility edge cases and Windows command construction. These tests
+do not substitute for Windows end-to-end validation. Together they cover the minimal
 agent and allowlisted client identity, session instructions, streaming, thought
 summaries with bridge-issued signatures, per-turn usage, session reuse, conversation isolation, native tool
 round-trips, parallel/consecutive calls, atomic result validation, failures,

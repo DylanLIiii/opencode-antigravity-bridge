@@ -514,9 +514,100 @@ class Turn {
     this.timer = null
     this.cleanupTimer = null
     this.logOffset = 0
+    // One session/prompt can cover several HTTP responses (tool round-trips,
+    // late tool results) while ACP reports a single accumulated usage for all
+    // of them. These fields let each HTTP response settle its own share.
+    this.stepInputEstimates = []
+    this.responseSteps = []
+    this.currentResponse = null
+    this.pendingPromptStep = null
+    this.promptCount = 0
+    this.hasLatePrompt = false
+    this.toolResponseCount = 0
+    this.emittedOutputTokens = 0
+    this.rawUsage = null
+    this.accountedPrompts = new Set()
     let settle
     this.settled = new Promise((resolve) => { settle = resolve })
     this.settle = settle
+  }
+
+  registerResponse(body) {
+    const estimate = estimateInputTokens(body)
+    const pending = this.pendingPromptStep
+    const step = {
+      body,
+      inputEstimate: estimate,
+      estimateIndex: pending?.estimateIndex ?? this.stepInputEstimates.length,
+      promptNumbers: pending?.promptNumbers || [],
+      settled: false,
+    }
+    if (pending) {
+      // A late prompt may start before the client attaches its next response.
+      // That HTTP request describes the same model step, not another one.
+      this.stepInputEstimates[step.estimateIndex] = Math.max(estimate, this.stepInputEstimates[step.estimateIndex])
+      this.pendingPromptStep = null
+    } else {
+      this.stepInputEstimates.push(estimate)
+    }
+    this.responseSteps.push(step)
+    this.currentResponse = step
+    return step
+  }
+
+  beginPrompt(parts, lateCalls) {
+    const number = ++this.promptCount
+    const step = this.currentResponse
+    if (number > 1) {
+      this.hasLatePrompt = true
+      const body = step?.body || { messages: this.baseHistory }
+      const history = this.proc.expectedMessages || body.messages || this.baseHistory
+      const content = step?.contentSnapshot?.() || []
+      const results = extractToolResults(body)
+      const alreadyInHistory = lateCalls?.length && lateCalls.every((call) =>
+        results.some((block) => block.tool_use_id === call.id))
+      const estimate = estimateInputTokens({
+        ...body,
+        messages: [
+          ...history,
+          ...(content.length ? [{ role: "assistant", content }] : []),
+          ...(alreadyInHistory ? [] : [{ role: "user", content: parts }]),
+        ],
+      })
+      if (step && !step.settled && !step.promptNumbers.length) {
+        // This late prompt continues the newly registered HTTP step. Replace
+        // its denominator entry rather than counting that model step twice.
+        this.stepInputEstimates[step.estimateIndex] = estimate
+      } else {
+        const index = this.stepInputEstimates.push(estimate) - 1
+        if (step && !step.settled) step.estimateIndex = index
+        else this.pendingPromptStep = { estimateIndex: index, promptNumbers: [number] }
+      }
+    }
+    if (step && !step.settled) step.promptNumbers.push(number)
+    return number
+  }
+
+  recordPromptUsage(number, usage) {
+    if (!this.accountedPrompts.has(number)) {
+      this.accountedPrompts.add(number)
+      this.rawUsage = addUsage(this.rawUsage, usage)
+    }
+    return this.rawUsage
+  }
+
+  recordResponseUsage(step, usage, final, calibrate = final) {
+    if (step.settled) return
+    step.settled = true
+    step.usage = usage
+    this.emittedOutputTokens = tokenCount(this.emittedOutputTokens + usage.output_tokens)
+    if (!final) this.toolResponseCount++
+    const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
+    if (calibrate && total > 0) {
+      this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
+      this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
+    }
   }
 
   attach() {
@@ -638,6 +729,10 @@ class Proc {
     this.currentModel = null
     this.agentVersion = null
     this.supportsImages = false
+    // Learned from settled single-model-call responses; scales the local input
+    // estimate used for tool-step responses that carry no exact usage.
+    this.inputTokenScale = 1
+    this.lastCacheRatio = 0
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -995,6 +1090,7 @@ class Proc {
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
       this.unsentPrompt = null
       let usage = null
+      let lateCalls = null
       for (;;) {
         turn.logOffset = await fileSize(this.logPath)
         // A cancel that arrived before the prompt would be ignored by agy.
@@ -1006,11 +1102,12 @@ class Proc {
         turn.arm()
         unpark(this.convKey)
         this.hasSentFirstTurn = true
+        const promptNumber = turn.beginPrompt(promptParts, lateCalls)
         const result = await this.conn.request("session/prompt", {
           sessionId: this.sessionId,
           prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
         })
-        usage = addUsage(usage, result?.usage)
+        usage = turn.recordPromptUsage(promptNumber, result?.usage)
         if (turn.cancelRequested) {
           turn.complete({ stopReason: "cancelled" })
           return
@@ -1034,6 +1131,7 @@ class Proc {
         await turn.waitLate()
         for (const call of late) call.lateDelivered = true
         promptParts = renderLateResultParts(late, this.supportsImages)
+        lateCalls = late
       }
     } catch (error) {
       if (turn.cancelRequested && !this.dead) {
@@ -2689,18 +2787,96 @@ function sseEvent(event, data) {
 
 const STOP_REASONS = { end_turn: "end_turn", max_tokens: "max_tokens", max_turn_requests: "end_turn", refusal: "refusal" }
 
-// ACP usage is per prompt. Gemini counts cached prompt tokens inside
-// inputTokens and thought tokens outside outputTokens; Anthropic does the reverse.
+function tokenCount(value) {
+  const number = Number(value)
+  return Number.isFinite(number) ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(number))) : 0
+}
+
+// ACP usage accumulates the internal model calls of one session/prompt.
+// Gemini includes read-cache input and excludes thought output in its totals.
 function translateUsage(usage) {
   if (!usage || typeof usage !== "object") return null
-  const number = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0
-  const cacheRead = number(usage.cachedReadTokens)
-  const thinking = number(usage.thoughtTokens)
+  const input = tokenCount(usage.inputTokens)
+  const cacheRead = Math.min(input, tokenCount(usage.cachedReadTokens))
+  const thinking = tokenCount(usage.thoughtTokens)
   return {
-    input_tokens: Math.max(0, number(usage.inputTokens) - cacheRead),
-    output_tokens: number(usage.outputTokens) + thinking,
+    input_tokens: input - cacheRead,
+    output_tokens: tokenCount(tokenCount(usage.outputTokens) + thinking),
     cache_read_input_tokens: cacheRead,
-    cache_creation_input_tokens: number(usage.cachedWriteTokens),
+    cache_creation_input_tokens: tokenCount(usage.cachedWriteTokens),
+    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+  }
+}
+
+function responseOutputEstimate(content) {
+  let output = 0
+  let thinking = 0
+  for (const block of content) {
+    if (block.type === "thinking") {
+      const tokens = estimateTextTokens(block.thinking)
+      thinking += tokens
+      output += tokens
+    } else if (block.type === "text") {
+      output += estimateTextTokens(block.text)
+    } else if (block.type === "tool_use") {
+      output += estimateTextTokens(JSON.stringify(block))
+    }
+  }
+  return { output: tokenCount(output), thinking: tokenCount(thinking) }
+}
+
+// Usage for one HTTP response. ACP reports one accumulated total for a whole
+// session/prompt, which may span several HTTP responses (tool round-trips and
+// late tool results). Reporting that total on the last response makes clients
+// bill the earlier steps again, so each response settles on its own:
+//   - a lone model call keeps the exact ACP numbers;
+//   - tool-step responses get a non-zero estimate scaled by what earlier
+//     responses taught us about this model's tokenizer and cache hit rate;
+//   - the final response gets the ACP input total split by this step's share
+//     of the estimated input, never above 1.5x its own estimate.
+function responseUsage(proc, turn, step, content, result) {
+  if (step.settled) return step.usage
+  const final = result !== undefined
+  const translated = final ? translateUsage(result?.usage) : null
+  const single = final && result?.stopReason !== "cancelled" && !turn.calls.length &&
+    !turn.toolResponseCount && !turn.hasLatePrompt && turn.promptCount <= 1 && turn.responseSteps.length === 1
+  step.usageKind = single && translated ? "exact" : "bounded_step_estimate"
+  if (single && translated) return translated
+
+  const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
+  const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
+  let cacheRatio = Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
+  let input = Math.max(1, tokenCount(estimate * scale))
+  let write = 0
+  if (final) {
+    const sum = turn.stepInputEstimates.reduce((total, value) => total + value, 0)
+    const weight = estimate / Math.max(estimate, sum)
+    const totalInput = tokenCount(result?.usage?.inputTokens)
+    const totalWrite = tokenCount(result?.usage?.cachedWriteTokens)
+    const read = Math.min(totalInput, tokenCount(result?.usage?.cachedReadTokens))
+    if (totalInput + totalWrite > 0) {
+      input = tokenCount(totalInput * weight)
+      write = tokenCount(totalWrite * weight)
+      cacheRatio = totalInput > 0 ? read / totalInput : 0
+    }
+    // The bound applies to the full window, including cache creation. Scale
+    // both portions together before rounding, then split the exact integer.
+    const combined = input + write
+    const bounded = Math.min(tokenCount(estimate * 1.5), combined)
+    write = combined > 0 ? Math.min(bounded, tokenCount(bounded * (write / combined))) : 0
+    input = bounded - write
+  }
+  const read = Math.min(input, tokenCount(input * cacheRatio))
+  const emitted = responseOutputEstimate(content)
+  const output = final
+    ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
+    : Math.max(1, emitted.output)
+  const thinking = Math.min(output, emitted.thinking)
+  return {
+    input_tokens: input - read,
+    cache_read_input_tokens: read,
+    cache_creation_input_tokens: write,
+    output_tokens: output,
     ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
   }
 }
@@ -2717,7 +2893,7 @@ function thinkingSignature(sessionId, thinking) {
     createHmac("sha256", THINKING_KEY).update(String(sessionId) + "\n" + thinking).digest("base64url")
 }
 
-function makeAnthropicStream(proc, turn, body, msgId, signal) {
+function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body)) {
   const encoder = new TextEncoder()
   const responseContent = []
   const forwardThinking = FORWARD_THINKING && body.thinking?.type !== "disabled"
@@ -2726,6 +2902,13 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
   let pingTimer = null
   let finished = false
   let abortHandler = null
+  // What this response has produced so far, for sizing a late prompt's input.
+  step.contentSnapshot = () => [
+    ...responseContent,
+    ...(open ? [open.type === "text"
+      ? { type: "text", text: open.text }
+      : { type: "thinking", thinking: open.text }] : []),
+  ]
 
   return new ReadableStream({
     async start(controller) {
@@ -2789,12 +2972,13 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
         if (signal && abortHandler) signal.removeEventListener("abort", abortHandler)
         abortHandler = null
       }
-      const stopMessage = (stopReason, usage) => {
+      const stopMessage = (stopReason, usage, final = false, calibrate = final) => {
         send("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
           usage,
         })
+        turn.recordResponseUsage(step, usage, final, calibrate)
         send("message_stop", { type: "message_stop" })
       }
       const partial = () => {
@@ -2819,7 +3003,6 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
         return
       }
 
-      const emptyUsage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }
       try {
         send("message_start", {
           type: "message_start",
@@ -2853,16 +3036,17 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
             emitToolUse(event.call)
             // Calls agy issued together leave in the same response.
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
-            stopMessage("tool_use", emptyUsage)
+            stopMessage("tool_use", responseUsage(proc, turn, step, responseContent))
             proc.recordAssistantResponse(turn, responseContent)
             detach()
             controller.close()
             return
           }
           if (event.type === "result") {
-            const usage = translateUsage(event.result.usage) || emptyUsage
             closeBlock()
-            stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage)
+            turn.rawUsage = event.result.usage ?? turn.rawUsage
+            const usage = responseUsage(proc, turn, step, responseContent, event.result)
+            stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage, true, event.result.stopReason !== "cancelled")
             proc.recordAssistantResponse(turn, responseContent)
             proc.finalizeTurn(turn)
             detach()
@@ -3044,8 +3228,9 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
 
 function streamResponse(proc, turn, body, signal) {
   turn.attach()
+  const step = turn.registerResponse(body)
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
-  const stream = makeAnthropicStream(proc, turn, body, msgId, signal)
+  const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step)
   if (body.stream === false) {
     return jsonResponseFromStream(stream, body.model, msgId)
   }

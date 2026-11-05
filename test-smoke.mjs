@@ -146,9 +146,13 @@ async function reply(text) {
 
 async function prompt(params) {
   const text = params.prompt.map(block => block.text || "").join("")
+  const images = params.prompt.filter(block => block.type === "image").length
   session.prompts++
   saveState()
-  log({ type: "user", convId: session.id, prompt: session.prompts, text, content: params.prompt, model })
+  log({ type: "user", convId: session.id, prompt: session.prompts, text, images, content: params.prompt, model })
+  if (text.includes("REFUSAL_CLEAN")) {
+    return { stopReason: "refusal" }
+  }
   if (text.includes("DIE")) {
     chunk("before death")
     process.exit(2)
@@ -235,6 +239,22 @@ async function prompt(params) {
   if (text.includes("Their real results")) {
     chunk("Late result seen: " + (/\[tool result for echo call_id=\S+\]\n([^\n]*)/.exec(text)?.[1] || "none"))
     return finish("late")
+  }
+  if (text.includes("SKILLCALL")) {
+    chunk("Before skill.\n")
+    await invoke("Skill", { skill: "hengjian-chat-archive" })
+    chunk("After skill.\n")
+    return finish("Before skill.\nAfter skill.\n")
+  }
+  if (text.includes("TOOLSEARCHCALL")) {
+    await invoke("ToolSearch", { query: "select:WebFetch" })
+    chunk("After tool search.\n")
+    return finish("After tool search.\n")
+  }
+  if (text.includes("ESCCALL") && !text.includes("<conversation_history>")) {
+    await invoke("echo", { text: "probe" })
+    chunk("After esc.\n")
+    return finish("After esc.\n")
   }
   if (text.includes("TOOL")) {
     chunk("Before tool.\n")
@@ -1085,6 +1105,18 @@ for (const change of ["tools", "model"]) {
   await new Promise(resolve => setTimeout(resolve, 400))
   const quitFinal = (await readSSE(await callFetch(continuation(quitBody, quitEvents, "late-output")))).events
   check("a result agy stopped waiting for is delivered in a follow-up prompt", stopOf(quitFinal) === "end_turn" && textOf(quitFinal).includes("Late result seen: late-output"), textOf(quitFinal))
+
+  const renamedLongBody = { model, messages: [{ role: "user", content: "LONGTOOL renamed id" }], tools: [echoTool] }
+  const renamedLongEvents = (await readSSE(await callFetch(renamedLongBody))).events
+  await new Promise(resolve => setTimeout(resolve, 350))
+  const renamedLongCont = continuation(renamedLongBody, renamedLongEvents, "renamed-long-result")
+  renamedLongCont.messages[1].content.find(block => block.type === "tool_use").id = "toolu_client_rewritten_long"
+  renamedLongCont.messages[2].content[0].tool_use_id = "toolu_client_rewritten_long"
+  const renamedLongRes = await callFetch(renamedLongCont)
+  const renamedLongFinal = (await readSSE(renamedLongRes)).events
+  check("deferred long tool past deadline still matches client-renamed tool IDs without 409",
+    renamedLongRes.status === 200 && stopOf(renamedLongFinal) === "end_turn" && textOf(renamedLongFinal).includes("Long done: renamed-long-result"),
+    `status=${renamedLongRes.status} text=${textOf(renamedLongFinal)}`)
   delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
 }
 
@@ -1116,7 +1148,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const convId = inits().at(-1).convId
   const second = continuation(first, events, "real tool output")
   const notice = { type: "text", text: "<system-reminder>[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>job-7</task-id><summary>subagent finished</summary></task-notification>\n<task-notification><task-id>job-8</task-id><summary>another subagent finished</summary></task-notification></system-reminder>" }
-  second.messages.at(-1).content.push({ type: "text", text: "<total_tokens>12345</total_tokens>" }, { type: "text", text: "PreToolUse:Read hook additional context: hook-only-output" })
+  second.messages.at(-1).content.push(
+    { type: "text", text: "<total_tokens>12345</total_tokens>" },
+    { type: "text", text: "PreToolUse:Read hook success: Success" },
+    { type: "text", text: "PreToolUse:Read hook additional context: hook-only-output" },
+  )
   if (location === "inline") second.messages.at(-1).content.push(notice)
   else second.messages.push({ role: location, content: [notice] })
   const response = await callFetch(second)
@@ -1124,7 +1160,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check(`${location} task notification continues the live turn`, response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
   const delivered = logs().find(event => event.type === "mcpResult" && event.convId === convId)
   const content = delivered?.result?.content?.map(part => part.text).join("\n") || ""
-  check(`${location} task notifications reach MCP without hook/token noise`, content.startsWith("real tool output") && content.includes("<system-reminder>") && content.includes("job-7") && content.includes("job-8") && !content.includes("12345") && !content.includes("hook-only-output"), content)
+  check(`${location} task notifications and hook context reach MCP without token/boilerplate noise`, content.startsWith("real tool output") && content.includes("<system-reminder>") && content.includes("job-7") && content.includes("job-8") && content.includes("hook-only-output") && !content.includes("12345") && !content.includes("hook success: Success"), content)
   check(`${location} task notification does not add an agy prompt`, logs().filter(event => event.type === "user" && event.convId === convId).length === 1)
   if (response.status !== 200) await drive(first, events, "cleanup")
 }
@@ -1239,6 +1275,708 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const again = await (await againDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: "agy" }))
   await readSSE(await again.fetch("agy://local/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(edited) }))
   check("a changed history is not resumed", inits().at(-1).resumed === false)
+
+  const crashFirst = { model, messages: [{ role: "user", content: "MEMORY before mid-turn crash" }] }
+  const crashFirstEvents = (await readSSE(await callFetch(crashFirst))).events
+  const crashTarget = inits().at(-1)
+  check("completed turn parks session before crash test", fs.readFileSync(bridgeStateFile, "utf8").includes(crashTarget.convId))
+  await readSSE(await callFetch(nextTurn(crashFirst, crashFirstEvents, "DIE mid-turn crash")))
+  check("in-flight prompt crash removes stale pre-turn snapshot from state file", !fs.readFileSync(bridgeStateFile, "utf8").includes(crashTarget.convId))
+}
+
+{
+  // Claude Code appends trailing role:"system" context messages on user and tool turns.
+  const before = inits().length
+  const turn1 = {
+    model,
+    system: "CLAUDE-CODE-SYSTEM",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "MEMORY Claude Code turn one" }] },
+      { role: "system", content: [{ type: "text", text: "SessionStart hook additional context: ok\n\n# Environment\n - Primary working directory: /remote-wsl/project" }] },
+    ],
+  }
+  const r1 = await callFetch(turn1)
+  const e1 = (await readSSE(r1)).events
+  const init1 = inits().at(-1)
+  const u1 = lastOf("user")
+  check("trailing system message on fresh turn returns 200", r1.status === 200 && stopOf(e1) === "end_turn", `got ${r1.status}`)
+  check("fresh turn sends both user text and wrapped system context",
+    u1.text.includes("MEMORY Claude Code turn one") &&
+    u1.text.includes("<system-reminder>\nSessionStart hook additional context: ok") &&
+    !u1.text.includes("<conversation_history>"), u1.text)
+  check("caller working directory is recognized from initial trailing system message",
+    init1.systemAppend?.includes('"/remote-wsl/project"'), init1.systemAppend)
+
+  const turn2 = {
+    ...turn1,
+    messages: [
+      ...turn1.messages,
+      { role: "assistant", content: assistantBlocks(e1) },
+      { role: "user", content: [{ type: "text", text: "MEMORY Claude Code turn two" }] },
+      { role: "system", content: [{ type: "text", text: "UserPromptSubmit hook additional context: route hint\n\nWorking directory: /other-later-dir" }] },
+    ],
+  }
+  const r2 = await callFetch(turn2)
+  const e2 = (await readSSE(r2)).events
+  const u2 = lastOf("user")
+  check("continued turn with trailing system message reuses the live session",
+    r2.status === 200 && stopOf(e2) === "end_turn" && inits().length === before + 1 && u2.convId === init1.convId)
+  check("continued turn preserves user text alongside trailing system message",
+    u2.text.includes("MEMORY Claude Code turn two") &&
+    u2.text.includes("<system-reminder>\nUserPromptSubmit hook additional context: route hint") &&
+    textOf(e2).includes("prompts so far 2"), u2.text)
+
+  const turn3 = {
+    ...turn2,
+    messages: [
+      ...turn2.messages,
+      { role: "assistant", content: assistantBlocks(e2) },
+      { role: "system", content: [{ type: "text", text: "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>bg-42</task-id></task-notification>" }] },
+    ],
+  }
+  const r3 = await callFetch(turn3)
+  const e3 = (await readSSE(r3)).events
+  check("post-assistant standalone system notification turn continues the session",
+    r3.status === 200 && stopOf(e3) === "end_turn" && lastOf("user").convId === init1.convId && lastOf("user").text.includes("bg-42"))
+
+  const { default: restartedAtisDefault } = await import("./index.mjs?restart-atis")
+  const restartedAtis = await (await restartedAtisDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: "agy" }))
+  const turn4 = {
+    ...turn3,
+    messages: [
+      ...turn3.messages,
+      { role: "assistant", content: assistantBlocks(e3) },
+      { role: "user", content: "MEMORY Claude Code after restart" },
+      { role: "system", content: "UserPromptSubmit hook additional context: after restart" },
+    ],
+  }
+  const r4 = await restartedAtis.fetch("agy://local/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(turn4),
+  })
+  const e4 = (await readSSE(r4)).events
+  const resumedAtis = inits().at(-1)
+  check("restarted bridge resumes a conversation with trailing system messages",
+    r4.status === 200 && stopOf(e4) === "end_turn" && resumedAtis.resumed === true && resumedAtis.convId === init1.convId &&
+    lastOf("user").text.includes("MEMORY Claude Code after restart") && !lastOf("user").text.includes("<conversation_history>"))
+}
+
+{
+  const opening = {
+    model,
+    messages: [
+      { role: "user", content: "base before trailing-system cancel and error" },
+      { role: "system", content: "SessionStart hook additional context: init" },
+    ],
+  }
+  const openingEvents = (await readSSE(await callFetch(opening))).events
+  const convId = inits().at(-1).convId
+
+  process.env.FAKE_AGY_SET_MODEL_DELAY = "300"
+  const controller = new AbortController()
+  const early = {
+    ...opening,
+    model: legacyModel,
+    messages: [
+      ...opening.messages,
+      { role: "assistant", content: assistantBlocks(openingEvents) },
+      { role: "user", content: "EARLY user with trailing system" },
+      { role: "system", content: "UserPromptSubmit hook additional context: early-system" },
+    ],
+  }
+  const earlyResponse = await callFetch(early, {}, controller.signal)
+  controller.abort()
+  await readSSE(earlyResponse)
+  await new Promise(resolve => setTimeout(resolve, 500))
+  delete process.env.FAKE_AGY_SET_MODEL_DELAY
+
+  const after = {
+    ...early,
+    messages: [
+      ...early.messages,
+      { role: "user", content: "NEXT user after cancel" },
+      { role: "system", content: "UserPromptSubmit hook additional context: next-system" },
+    ],
+  }
+  const afterEvents = (await readSSE(await callFetch(after))).events
+  const deliveredPrompt = lastOf("user")
+  check("early cancel preserves both cancelled and next user/system messages",
+    stopOf(afterEvents) === "end_turn" && deliveredPrompt.convId === convId &&
+    deliveredPrompt.text.includes("EARLY user with trailing system") &&
+    deliveredPrompt.text.includes("early-system") &&
+    deliveredPrompt.text.includes("NEXT user after cancel") &&
+    deliveredPrompt.text.includes("next-system"), deliveredPrompt.text)
+
+  const beforeErrorInits = inits().length
+  const errBody = {
+    ...opening,
+    messages: [
+      ...after.messages,
+      { role: "assistant", content: assistantBlocks(afterEvents) },
+      { role: "user", content: "AGENTERROR with trailing system" },
+      { role: "system", content: "UserPromptSubmit hook additional context: retry-system" },
+    ],
+  }
+  const errEvents = (await readSSE(await callFetch(errBody))).events
+  check("upstream error on trailing-system turn emits error frame", errEvents.some(event => event.event === "error"))
+  await readSSE(await callFetch(errBody))
+  check("retry after upstream error reuses session and preserves trailing-system turn",
+    inits().length === beforeErrorInits && lastOf("user").convId === convId &&
+    lastOf("user").text.includes("AGENTERROR with trailing system") &&
+    lastOf("user").text.includes("retry-system"))
+}
+
+{
+  const first = {
+    model,
+    tools: [echoTool],
+    messages: [
+      { role: "user", content: "TOOL trailing system notices" },
+      { role: "system", content: "# Environment\n - Primary working directory: /remote-wsl/project" },
+    ],
+  }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+
+  const second = continuation(first, events, "real output")
+  second.messages.at(-1).content.push({
+    type: "text",
+    text: "<system-reminder>Note: /remote-wsl/project/file.js changed on disk</system-reminder>",
+  })
+  second.messages.push({
+    role: "system",
+    content: [
+      { type: "text", text: "SessionStart:startup hook success: Success" },
+      { type: "text", text: "tool.call hook additional context: lowercase-hook-context" },
+      { type: "text", text: "PostToolUse:Bash hook additional context: hook-head\n\n# Environment update\n - Primary working directory: /remote-wsl/project/subdir" },
+      { type: "text", text: "The user hasn't heard from you in a while." },
+    ],
+  })
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().find(event => event.type === "mcpResult" && event.convId === convId)
+  const mcpText = delivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("system notices and mid-turn environment update continue the live tool turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before, `got ${response.status}`)
+  check("system notices and hook contexts reach MCP while empty hook success is excluded",
+    mcpText.startsWith("real output") &&
+    mcpText.includes("changed on disk") &&
+    mcpText.includes("lowercase-hook-context") &&
+    mcpText.includes("PostToolUse:Bash hook additional context: hook-head") &&
+    mcpText.includes("# Environment update") &&
+    mcpText.includes("hasn't heard from you") &&
+    !mcpText.includes("hook success: Success"), mcpText)
+}
+
+{
+  const prefillOnly = await callFetch({ model, messages: [{ role: "assistant", content: "prefill" }] })
+  const prefillTail = await callFetch({ model, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "prefill" }] })
+  const loneSystem = await callFetch({ model, messages: [{ role: "system", content: "system without user or history" }] })
+  const nonTextSystem = await callFetch({
+    model,
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "system", content: [{ type: "audio_chunk", data: "AAAA" }] },
+    ],
+  })
+  const nonTextPayload = await nonTextSystem.json()
+  check("assistant prefill and lone system messages return 400",
+    prefillOnly.status === 400 && prefillTail.status === 400 && loneSystem.status === 400,
+    `${prefillOnly.status},${prefillTail.status},${loneSystem.status}`)
+  check("unsupported system content block error names the block type",
+    nonTextSystem.status === 400 && nonTextPayload.error?.message?.includes('"audio_chunk"'),
+    nonTextPayload.error?.message)
+}
+
+{
+  // Claude Code Skill tool appends SKILL.md as a user text block beside tool_result.
+  const skillTool = {
+    name: "Skill",
+    description: "Invoke a skill",
+    input_schema: { type: "object", properties: { skill: { type: "string" } } },
+  }
+  const first = { model, messages: [{ role: "user", content: "SKILLCALL load archive skill" }], tools: [skillTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const skillBody = [
+    "Base directory for this skill: /root/.claude/skills/hengjian-chat-archive",
+    "",
+    "# Archive Skill",
+    "Docs may quote `<system-reminder>` or `The user sent a new message while you were working:` literally.",
+  ].join("\n")
+  const second = continuation(first, events, "Launching skill: hengjian-chat-archive")
+  second.messages.at(-1).content.push({ type: "text", text: skillBody })
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === convId).at(-1)
+  const parts = delivered?.result?.content?.map(part => part.text) || []
+  check("Claude Code Skill companion block continues the live turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before, `got ${response.status}`)
+  check("Skill companion body reaches MCP verbatim alongside Launching skill",
+    parts[0] === "Launching skill: hengjian-chat-archive" && parts[1] === skillBody, JSON.stringify(parts))
+  const third = nextTurn(second, final, "MEMORY after skill")
+  const thirdRes = await callFetch(third)
+  const thirdEvents = (await readSSE(thirdRes)).events
+  check("turn after Skill companion reuses the same live session",
+    thirdRes.status === 200 && stopOf(thirdEvents) === "end_turn" && inits().length === before && lastOf("user").convId === convId)
+}
+
+{
+  // MCP prompt Skill without Base directory header + protocol notice beside tool_result.
+  const skillTool = { name: "Skill", description: "Skill", input_schema: { type: "object" } }
+  const first = { model, messages: [{ role: "user", content: "SKILLCALL mcp prompt skill" }], tools: [skillTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const second = continuation(first, events, "Launching skill: mcp-review")
+  second.messages.at(-1).content.push(
+    { type: "text", text: "# MCP Skill Prompt\nReview every changed file carefully." },
+    { type: "text", text: "<system-reminder>Allowed tools updated</system-reminder>" },
+  )
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === convId).at(-1)
+  const mcpText = delivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("prompt-only Skill companion and system-reminder continue the live turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before &&
+    mcpText.includes("# MCP Skill Prompt") && mcpText.includes("Allowed tools updated"), mcpText)
+}
+
+{
+  // Claude Code image dimension note, ToolSearch tool_reference + Tool loaded., teammate-message, and /loop fold.
+  const first = { model, messages: [{ role: "user", content: "TOOL image dimension companion" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const second = continuation(first, events, [
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+  ])
+  second.messages.at(-1).content.push(
+    { type: "text", text: "[Image: original 3423x1834, displayed at 2000x1072. Multiply coordinates by 1.71 to map to original image.]" },
+    { type: "text", text: "<teammate-message teammate_id=\"worker-1\">check complete</teammate-message>" },
+    { type: "text", text: "[2 prior /loop wakeups found nothing actionable; loop is healthy.]" },
+  )
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === convId).at(-1)
+  const content = delivered?.result?.content || []
+  const texts = content.filter(part => part.type === "text").map(part => part.text).join("\n")
+  check("image dimension companion, teammate-message, and loop notice continue live turn",
+    response.status === 200 && stopOf(final) === "end_turn" && inits().length === before &&
+    content[0]?.type === "image" &&
+    texts.includes("Multiply coordinates by 1.71") &&
+    texts.includes("worker-1") &&
+    texts.includes("prior /loop wakeups"), JSON.stringify(content))
+
+  const searchTool = { name: "ToolSearch", description: "Search deferred tools", input_schema: { type: "object" } }
+  const searchFirst = { model, messages: [{ role: "user", content: "TOOLSEARCHCALL load WebFetch" }], tools: [searchTool] }
+  const searchEvents = (await readSSE(await callFetch(searchFirst))).events
+  const searchConv = inits().at(-1).convId
+  const beforeSearch = inits().length
+  const searchSecond = continuation(searchFirst, searchEvents, [
+    { type: "tool_reference", tool_name: "WebFetch" },
+  ])
+  searchSecond.messages.at(-1).content.push({ type: "text", text: "Tool loaded." })
+  const searchRes = await callFetch(searchSecond)
+  const searchFinal = (await readSSE(searchRes)).events
+  const searchDelivered = logs().filter(event => event.type === "mcpResult" && event.convId === searchConv).at(-1)
+  const searchText = searchDelivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("ToolSearch tool_reference and Tool loaded. companion continue live turn",
+    searchRes.status === 200 && stopOf(searchFinal) === "end_turn" && inits().length === beforeSearch &&
+    searchText.includes("Loaded tool: WebFetch") && searchText.includes("Tool loaded."), searchText)
+  const afterSearch = nextTurn(searchSecond, searchFinal, "MEMORY after tool search")
+  const afterSearchRes = await callFetch(afterSearch)
+  await readSSE(afterSearchRes)
+  check("turn after ToolSearch tool_reference reuses the live session",
+    afterSearchRes.status === 200 && inits().length === beforeSearch)
+}
+
+{
+  // Pressing Esc during a client tool run appends [Request interrupted by user] + the new user prompt.
+  const first = { model, messages: [{ role: "user", content: "ESCCALL interrupted by user" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const old = inits().at(-1)
+  const second = continuation(first, events, "partial tool output")
+  second.messages.at(-1).content.push(
+    { type: "text", text: "[Request interrupted by user]\n" },
+    { type: "text", text: "New instruction after Esc" },
+  )
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const replay = lastOf("user")
+  check("user-interrupted tool turn abandons old process and starts new turn cleanly",
+    response.status === 200 && stopOf(final) === "end_turn" && replay.convId !== old.convId &&
+    replay.text.includes("New instruction after Esc") && !fs.existsSync(old.cwd), `got ${response.status}`)
+  const third = nextTurn(second, final, "MEMORY after interrupted tool turn")
+  const thirdRes = await callFetch(third)
+  await readSSE(thirdRes)
+  check("turn after user-interrupted replay reuses the new session",
+    thirdRes.status === 200 && lastOf("user").convId === replay.convId)
+}
+
+{
+  // /v1/messages/count_tokens returns fast token estimate without spawning agy.
+  const before = logs().length
+  const countRes = await loader.fetch("agy://local/v1/messages/count_tokens?beta=true", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      system: "Be concise.",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Hello token counter 中文" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(4000) } },
+        ],
+      }],
+    }),
+  })
+  const countData = await countRes.json()
+  check("count_tokens returns JSON input_tokens without spawning agy",
+    countRes.status === 200 && countData.input_tokens >= 1600 && logs().length === before,
+    JSON.stringify(countData))
+}
+
+{
+  // Tool schema sanitization, stream: false JSON response, promptCapabilities.image, text/PDF documents, and clean refusal.
+  process.env.FAKE_AGY_PROMPT_IMAGE = "1"
+  const trickyTool = {
+    name: "tricky_schema",
+    description: "Schema sanitizer check",
+    input_schema: {
+      type: "object",
+      properties: {
+        union_arr: { type: ["object", "array"], items: { type: "string" } },
+        stale_items: { type: ["string", "number"], items: { type: "string" }, properties: { bad: { type: "string" } } },
+        num_enum: { type: "integer", enum: [0, 1, 2] },
+      },
+      required: ["union_arr", "missing_field"],
+    },
+  }
+  const syncRes = await callFetch({
+    model,
+    stream: false,
+    tools: [trickyTool],
+    messages: [{
+      role: "user",
+      content: [
+        { type: "document", title: "spec.txt", source: { type: "text", media_type: "text/plain", data: "DOC_MARKER_42" } },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } },
+        { type: "text", text: "inspect multimodal turn" },
+      ],
+    }],
+  })
+  const syncMsg = await syncRes.json()
+  const initTool = inits().at(-1)?.tools?.[0]
+  const lastUser = lastOf("user")
+  check("stream: false returns aggregated JSON message with image and text document",
+    syncRes.status === 200 && syncMsg.type === "message" && lastUser.images === 1 && lastUser.text.includes("DOC_MARKER_42"),
+    JSON.stringify(syncMsg))
+  check("sanitizeInputSchema normalizes union types, stale array/object fields, non-string enums, and dangling required",
+    initTool?.inputSchema?.properties?.union_arr?.type === "array" &&
+    initTool?.inputSchema?.properties?.stale_items?.items === undefined &&
+    initTool?.inputSchema?.properties?.stale_items?.properties === undefined &&
+    initTool?.inputSchema?.properties?.num_enum?.enum === undefined &&
+    /Allowed values: 0, 1, 2/.test(initTool?.inputSchema?.properties?.num_enum?.description || "") &&
+    JSON.stringify(initTool?.inputSchema?.required) === JSON.stringify(["union_arr"]),
+    JSON.stringify(initTool?.inputSchema))
+
+  const pdfRes = await callFetch({
+    model,
+    messages: [{
+      role: "user",
+      content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } }],
+    }],
+  })
+  check("binary PDF document block returns HTTP 400", pdfRes.status === 400)
+
+  const refusalRes = await callFetch({ model, stream: false, messages: [{ role: "user", content: "REFUSAL_CLEAN" }] })
+  const refusalMsg = await refusalRes.json()
+  check("clean ACP refusal stopReason maps to Anthropic refusal without killing session",
+    refusalRes.status === 200 && refusalMsg.stop_reason === "refusal", JSON.stringify(refusalMsg))
+  delete process.env.FAKE_AGY_PROMPT_IMAGE
+}
+
+{
+  // Magpie privacy-masking placeholder notice beside live tool_result + session history continuity.
+  const magpieNotice = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
+  const first = {
+    model,
+    tools: [echoTool],
+    messages: [{ role: "user", content: `TOOL masked {{TERM_vgth3dgg}}\n\n${magpieNotice}` }],
+  }
+  const events = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const before = inits().length
+  const second = {
+    ...first,
+    // Magpie moves its placeholder notice to the latest user message on Turn 2.
+    messages: [
+      { role: "user", content: "TOOL masked {{TERM_vgth3dgg}}" },
+      { role: "assistant", content: assistantBlocks(events) },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: toolCall(events).id, content: "SECRET={{SECRET_yv2yqxeq}}" },
+          { type: "text", text: magpieNotice },
+        ],
+      },
+    ],
+  }
+  const secondRes = await callFetch(second)
+  const secondFinal = (await readSSE(secondRes)).events
+  check("Magpie privacy-masking placeholder notice beside tool_result continues the live session",
+    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && inits().length === before,
+    `status=${secondRes.status}, inits=${inits().length - before}`)
+  const third = {
+    ...second,
+    messages: [
+      { role: "user", content: "TOOL masked {{TERM_vgth3dgg}}" },
+      { role: "assistant", content: assistantBlocks(events) },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: toolCall(events).id, content: "SECRET={{SECRET_yv2yqxeq}}" }] },
+      { role: "assistant", content: assistantBlocks(secondFinal) },
+      { role: "user", content: `MEMORY after masked turn\n\n${magpieNotice}` },
+    ],
+  }
+  const thirdRes = await callFetch(third)
+  const thirdEvents = (await readSSE(thirdRes)).events
+  check("moving Magpie placeholder notice to later user turns preserves convKey and live session",
+    thirdRes.status === 200 && stopOf(thirdEvents) === "end_turn" && inits().length === before && lastOf("user").convId === convId)
+}
+
+{
+  // Claude Code mid-turn queued_command + tool_addition + bounded <system-reminder id="..."> + post-failure unwedge.
+  const first = { model, messages: [{ role: "user", content: "ESCCALL queued command mid-turn" }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const old = inits().at(-1)
+  const second = continuation(first, events, "file-output")
+  second.messages.at(-1).content.push(
+    { type: "text", text: "<ide_opened_file>/project/a.ts</ide_opened_file>" },
+    { type: "text", text: '<system-reminder id="rem123">\nBounded reminder\n</system-reminder id="rem123">' },
+    {
+      type: "text",
+      text: "The user sent a new message while you were working:\nRemove invalid freejev accounts now\n\nThis is how Claude Code surfaces messages the user sends mid-turn — within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.",
+    },
+  )
+  second.messages.push({
+    role: "system",
+    content: [{ type: "tool_addition", tool: { type: "tool_definition", definition: { name: "Extra" } } }],
+  })
+  const secondRes = await callFetch(second)
+  const secondFinal = (await readSSE(secondRes)).events
+  const steeredUser = lastOf("user")
+  check("Claude Code mid-turn queued_command and tool_addition replay as clean user prompt",
+    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && steeredUser.convId !== old.convId &&
+    steeredUser.text.includes("Remove invalid freejev accounts now") &&
+    !steeredUser.text.includes("This is how Claude Code surfaces"),
+    JSON.stringify(steeredUser))
+
+  // Standalone follow-up user message after a failed/aborted tool turn unwedges the conversation.
+  const wFirst = { model, messages: [{ role: "user", content: "ESCCALL wedged follow-up" }], tools: [echoTool] }
+  const wEvents = (await readSSE(await callFetch(wFirst))).events
+  const wOld = inits().at(-1)
+  const wedged = continuation(wFirst, wEvents, "tool-output-before-abort")
+  wedged.messages.push({ role: "user", content: "Standalone follow-up user instruction" })
+  const wRes = await callFetch(wedged)
+  const wFinal = (await readSSE(wRes)).events
+  check("standalone follow-up user message after aborted tool turn replays instead of wedging with 400",
+    wRes.status === 200 && stopOf(wFinal) === "end_turn" && lastOf("user").convId !== wOld.convId &&
+    lastOf("user").text.includes("Standalone follow-up user instruction"),
+    `status=${wRes.status}`)
+}
+
+{
+  // Full Claude Code hook lifecycle: PreToolUse normalized input + additionalContext,
+  // PostToolUse blocking error, TaskCreated/Stop/PermissionDenied meta-feedback,
+  // rejected tool + merged user follow-up, prompt-hook json_schema, model aliases, and server_tool_use history.
+  const hFirst = { model, messages: [{ role: "user", content: "TOOL hook suite" }], tools: [echoTool] }
+  const hEvents = (await readSSE(await callFetch(hFirst))).events
+  const hConv = inits().at(-1).convId
+  const beforeHookInits = inits().length
+  const hSecond = continuation(hFirst, hEvents, "rtk-rewritten-output")
+  // Simulate Claude Code normalizing assistant tool_use.input (e.g. adding default flags) while keeping toolu_ ID.
+  hSecond.messages[1].content.find(block => block.type === "tool_use").input = { text: "probe", normalized_default: false }
+  // Pre-result system message + PostToolUse blocking error + TaskCreated hook feedback + PermissionDenied retry hint + channel tag.
+  hSecond.messages.splice(2, 0, {
+    role: "system",
+    content: [{ type: "text", text: "PreToolUse:echo hook additional context: PRE_HOOK_MARKER" }],
+  })
+  hSecond.messages.at(-1).content.push(
+    { type: "text", text: '<system-reminder>\nPostToolUse:echo hook blocking error from command: "lint.sh": POST_BLOCK_MARKER\n</system-reminder>' },
+    { type: "text", text: "TaskCreated hook feedback:\nTASK_FEEDBACK_MARKER" },
+    { type: "text", text: "The PermissionDenied hook indicated you may retry this tool call." },
+    { type: "text", text: '<channel source="mcp-webhook">CHANNEL_EVENT_MARKER</channel>' },
+  )
+  const hRes = await callFetch(hSecond)
+  const hFinal = (await readSSE(hRes)).events
+  const hDelivered = logs().filter(event => event.type === "mcpResult" && event.convId === hConv).at(-1)
+  const hMcpText = hDelivered?.result?.content?.map(part => part.text).join("\n") || ""
+  check("Claude Code PreToolUse/PostToolUse/TaskCreated/PermissionDenied hooks and normalized tool_use.input keep live session",
+    hRes.status === 200 && stopOf(hFinal) === "end_turn" && inits().length === beforeHookInits &&
+    hMcpText.includes("PRE_HOOK_MARKER") &&
+    hMcpText.includes("POST_BLOCK_MARKER") &&
+    hMcpText.includes("TASK_FEEDBACK_MARKER") &&
+    hMcpText.includes("PermissionDenied hook indicated you may retry") &&
+    hMcpText.includes("CHANNEL_EVENT_MARKER"),
+    hMcpText)
+  const hThird = nextTurn(hSecond, hFinal, "MEMORY after normalized tool_use input")
+  const hThirdRes = await callFetch(hThird)
+  await readSSE(hThirdRes)
+  check("turn after client-normalized tool_use.input reuses the same live session",
+    hThirdRes.status === 200 && inits().length === beforeHookInits && lastOf("user").convId === hConv)
+
+  // User rejects tool call in TUI and enters a new prompt merged into the same user message by Claude Code aLe().
+  const rFirst = { model, messages: [{ role: "user", content: "ESCCALL user rejected tool" }], tools: [echoTool] }
+  const rEvents = (await readSSE(await callFetch(rFirst))).events
+  const rOld = inits().at(-1)
+  const rSecond = continuation(
+    rFirst,
+    rEvents,
+    "The user doesn't want to proceed with this tool use. The tool use was rejected. STOP what you are doing and wait for the user to tell you how to proceed.",
+    { isError: true },
+  )
+  rSecond.messages.at(-1).content.push({ type: "text", text: "Write to /tmp/safe instead" })
+  const rRes = await callFetch(rSecond)
+  const rFinal = (await readSSE(rRes)).events
+  check("rejected tool_result merged with follow-up user prompt replays cleanly without 400",
+    rRes.status === 200 && stopOf(rFinal) === "end_turn" && lastOf("user").convId !== rOld.convId &&
+    lastOf("user").text.includes("Write to /tmp/safe instead"),
+    `status=${rRes.status}`)
+
+  // type:"prompt" hook request with claude-haiku small-fast model alias + output_config.format json_schema,
+  // plus historical server_tool_use/web_search_tool_result and search_result blocks.
+  const promptHookRes = await callFetch({
+    model: "antigravity-bridge/claude-haiku-4-5-20251001",
+    stream: false,
+    output_config: {
+      format: {
+        type: "json_schema",
+        schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+      },
+    },
+    messages: [
+      { role: "user", content: "Prior turn before /model switch" },
+      {
+        role: "assistant",
+        content: [
+          { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "agy" } },
+          { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [{ type: "web_search_result", url: "https://example.com" }] },
+          { type: "text", text: "Prior answer" },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "search_result", title: "Policy Doc", source: "kb://policy", content: [{ type: "text", text: "RAG_POLICY_MARKER" }] },
+          { type: "text", text: "Evaluate hook safety" },
+        ],
+      },
+    ],
+  })
+  const promptHookMsg = await promptHookRes.json()
+  const promptHookUser = lastOf("user")
+  check("prompt-hook json_schema, small-fast model alias, server_tool_use history, and search_result succeed without 400",
+    promptHookRes.status === 200 && promptHookMsg.type === "message" &&
+    promptHookUser.model === "gemini-test-low" &&
+    promptHookUser.text.includes("Structured output requirement") &&
+    promptHookUser.text.includes('"required":["ok"]') &&
+    promptHookUser.text.includes("RAG_POLICY_MARKER") &&
+    promptHookUser.text.includes("[server tool call web_search"),
+    JSON.stringify({ status: promptHookRes.status, user: promptHookUser }))
+}
+
+// Integration regressions for review findings: exercise the real fetch/MCP path.
+{
+  for (const [field, effortBody] of [
+    ['reasoning_effort', { reasoning_effort: 'low' }],
+    ['reasoningEffort', { reasoningEffort: 'low' }],
+    ['reasoning.effort', { reasoning: { effort: 'low' } }],
+    ['thinkingLevel', { generationConfig: { thinkingConfig: { thinkingLevel: 'low' } } }],
+  ]) {
+    check(`${field} selects effort without an Anthropic thinking block`,
+      await launchedModel({ model, ...effortBody, messages: [{ role: 'user', content: `MODEL generic effort ${field}` }] }) === 'gemini-test-low')
+  }
+}
+
+{
+  for (const companion of ['ARGUMENTS: please run the tests', 'Tool loaded.', '[Image: unrelated screenshot]']) {
+    const first = { model, messages: [{ role: 'user', content: `TOOL mismatched companion ${companion}` }], tools: [echoTool] }
+    const events = (await readSSE(await callFetch(first))).events
+    const second = continuation(first, events, 'ordinary echo output')
+    second.messages.at(-1).content.push({ type: 'text', text: companion })
+    const response = await callFetch(second)
+    check(`unmatched companion is not injected into another tool: ${companion}`, response.status === 400, `got ${response.status}`)
+    if (response.status === 400) {
+      await response.text()
+      await drive(first, events, 'cleanup unmatched companion')
+    } else await readSSE(response)
+  }
+}
+
+{
+  const skillTool = { name: 'Skill', description: 'Skill', input_schema: { type: 'object' } }
+  const first = { model, messages: [{ role: 'user', content: 'SKILLCALL ordinary user steering regression' }], tools: [skillTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const second = continuation(first, events, 'Launching skill: archive')
+  second.messages.at(-1).content.push({ type: 'text', text: 'Stop this task and explain something else' })
+  const response = await callFetch(second)
+  check('plain user instructions are not treated as a Skill prompt body', response.status === 400, `got ${response.status}`)
+  if (response.status === 400) {
+    await response.text()
+    await drive(first, events, 'cleanup ordinary Skill text')
+  } else await readSSE(response)
+}
+
+{
+  for (const suffix of ['', '\n\nPlease address this message and continue with your tasks.', '\n\nIMPORTANT: After completing your current task, you MUST address the user\'s message above. Do not ignore it.']) {
+    const first = { model, messages: [{ role: 'user', content: `ESCCALL queued envelope ${suffix.length}` }], tools: [echoTool] }
+    const events = (await readSSE(await callFetch(first))).events
+    const oldId = inits().at(-1).convId
+    const second = continuation(first, events, 'queued tool output')
+    second.messages.at(-1).content.push({ type: 'text', text: 'The user sent a new message while you were working:\nQUEUED_STEERING_MARKER' + suffix })
+    const response = await callFetch(second)
+    check(`queued prompt suffix ${suffix.length} is accepted beside a tool result`, response.status === 200, `got ${response.status}`)
+    if (response.status === 200) {
+      await readSSE(response)
+      check(`queued prompt suffix ${suffix.length} replays as user context in a new session`, lastOf('user').convId !== oldId && lastOf('user').text.includes('QUEUED_STEERING_MARKER'))
+    } else {
+      await response.text()
+      await drive(first, events, 'cleanup queued envelope')
+    }
+  }
+}
+
+{
+  const first = { model, messages: [{ role: 'user', content: 'ESCCALL replay tool image regression' }], tools: [echoTool] }
+  const events = (await readSSE(await callFetch(first))).events
+  const second = continuation(first, events, [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'cmVwbGF5aW1hZ2U=' } }])
+  second.messages.at(-1).content.push({ type: 'text', text: 'The user sent a new message while you were working:\nInspect that returned image' })
+  const response = await callFetch(second)
+  if (response.status === 200) await readSSE(response)
+  else await response.text()
+  check('fresh replay retains image bytes inside a tool_result', response.status === 200 && lastOf('user').content.some(part => part.type === 'image' && part.data === 'cmVwbGF5aW1hZ2U='))
+  if (response.status !== 200) await drive(first, events, 'cleanup replay image')
+}
+
+{
+  // A live owner must keep exclusive access, even if its lock is over five seconds old.
+  for (const age of [0, 10_000]) {
+    const snapshot = fs.readFileSync(bridgeStateFile, 'utf8')
+    fs.writeFileSync(bridgeStateFile + '.lock', JSON.stringify({ pid: process.pid }))
+    const when = new Date(Date.now() - age)
+    fs.utimesSync(bridgeStateFile + '.lock', when, when)
+    try {
+      await readSSE(await callFetch({ model, messages: [{ role: 'user', content: `MEMORY state lock regression ${age}` }] }))
+      check(`state writer leaves another live owner's lock intact at age ${age}`, fs.existsSync(bridgeStateFile + '.lock'))
+      check(`state writer never saves without acquiring the lock at age ${age}`, fs.readFileSync(bridgeStateFile, 'utf8') === snapshot)
+    } finally {
+      fs.rmSync(bridgeStateFile + '.lock', { force: true })
+    }
+  }
 }
 
 try { fs.unlinkSync(fakeAgy) } catch {}

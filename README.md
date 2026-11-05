@@ -18,6 +18,8 @@ Gemini、Claude、GPT-OSS 全系可用。
 - **全订阅模型可用**：Gemini、Claude、GPT-OSS 一应俱全，会话中可随时切换模型
   和思考等级。
 - **流式输出 + 思考摘要 + 图片输入**：文本、思考过程、图片按顺序完整呈现。
+- **Claude Code 兼容**：支持尾随 system/developer 上下文、hooks、Skill /
+  ToolSearch 工具附加内容和用户排队消息，兼容非流式 Messages 响应。
 - **工具调用零损耗**：客户端工具以 MCP 原生工具的形式出现在模型面前，
   支持长任务、并行调用；工具跑得再久也不会丢结果。
 - **会话不丢**：每轮结束自动记录会话状态（只存哈希，不落明文），
@@ -105,9 +107,10 @@ magpie quota refresh antigravity-bridge --json
 
 ## FAQ / 注意事项
 
-- **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和文档。
+- **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和二进制/PDF 文档；纯文本 document 和 search_result 可用。
   需要服务端声明 ACP 图片能力（agy 1.5.0 起）。
-- **平台**：Linux / macOS 已验证；Windows 的 `nc` 桥接未验证。
+- **平台**：Linux / macOS 已验证。Windows 已补充 `.exe` / `.cmd` / `.bat`
+  发现、启动和 WSL 路径处理，并有命令构造测试；维护者尚未完成 Windows 实机验证。
 - **账号**：一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
   `authenticate` 去切换登录。
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`

@@ -97,7 +97,7 @@ if (worker) {
       toolCalls += calls.length
       body = { ...body, messages: [...body.messages, { role: "assistant", content }, { role: "user", content: calls.map(call => ({
         type: "tool_result", tool_use_id: call.id, content: "Tool verified. Remember the code ORCHID-731.",
-      })) }] }
+      })) }, { role: "system", content: "PostToolUse hook additional context: Continue with the verified tool result." }] }
     }
     throw new Error("Model did not finish within four tool rounds")
   } catch (error) {
@@ -123,18 +123,19 @@ try {
     messages: [{ role: "user", content: [
       { type: "text", text: "Call bridge_echo with token bridge-integration exactly once. Then identify the dominant color in the attached image with one English color word. Remember the code returned by the tool for the next turn." },
       { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=" } },
-    ] }],
+    ] }, { role: "system", content: "SessionStart hook additional context: Keep the current user request and image together." }],
   })
   assert.equal(first.toolCalls, 1, "Expected exactly one native MCP tool call")
   assert.match(first.content.filter(block => block.type === "text").map(block => block.text).join(""), /\bred\b/i, "Model did not recognize the red image")
   const before = JSON.parse(await fs.readFile(process.env.AGY_BRIDGE_STATE_FILE, "utf8"))
   assert.equal(before.entries.length, 1, "Expected one persisted session")
-  console.log("ok - real image comprehension, native MCP round trip, final text and token usage")
+  console.log("ok - real image comprehension, native MCP round trip with trailing system hooks, final text and token usage")
   console.log(`info - thinking summary ${first.thinking ? "observed" : "not emitted by this model"}`)
 
   const second = await runWorker({ ...first.body, output_config: { effort: "high" }, messages: [
     ...first.body.messages, { role: "assistant", content: first.content },
     { role: "user", content: "Without calling tools, reply with the remembered code and the image's dominant color." },
+    { role: "developer", content: "UserPromptSubmit hook additional context: Answer the user's current question concisely." },
   ] })
   assert.equal(second.toolCalls, 0)
   const answer = second.content.filter(block => block.type === "text").map(block => block.text).join("")

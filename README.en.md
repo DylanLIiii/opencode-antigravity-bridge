@@ -118,14 +118,39 @@ magpie plugin add ./opencode-antigravity-bridge
 - **Subscription quota reporting** in Magpie through `auth.usage`, using the
   real CLI's structured `/usage` report.
 - **Client-compatible continuation**: cache markers, string/block text, split
-  assistant messages and outer text whitespace do not invalidate a turn.
-  Client-renamed tool IDs are matched only when history, tool names and
-  arguments identify one pending response. Real history edits (compaction)
-  start a fresh session and replay the current history and real results.
-- **Protocol context notices** beside tool results, including trailing
-  user/system/developer messages, reach MCP inside a separate `system-reminder`.
-  This covers OpenCode `<system-update>` messages, background task notifications,
-  and recognized hook/token-count notices without treating them as user messages.
+  assistant messages, outer text whitespace, client-normalized `tool_use.input`
+  arguments, and trailing `system`/`developer` context messages (such as Claude
+  Code's per-turn hook, environment, and deferred-tool reminders) do not
+  invalidate a turn or force a session restart. Client-renamed tool IDs are
+  matched only when history, tool names and arguments identify one pending
+  response. Real history edits (compaction), user-interrupted or rejected tool
+  turns (`[Request interrupted by user]`, tool-rejection prompts), and mid-turn
+  queued user commands (`<queued-command>` / Claude Code `queued_command`
+  envelopes) start a fresh session and replay the current history and real
+  results.
+- **Protocol context notices, Claude Code hooks, and tool companions** beside
+  tool results: trailing user/system/developer notices reach MCP inside a
+  separate `system-reminder` (OpenCode `<system-update>`, background task and
+  `<teammate-message>` / `<channel>` notifications, `/loop` status folds, Claude
+  Code environment/file-change/progress reminders, and `PreToolUse` /
+  `PostToolUse` / `PostToolUseFailure` / `Stop` / `TaskCreated` /
+  `PermissionDenied` hook outputs, while empty `hook success: Success` and
+  `<total_tokens>` boilerplate is stripped), and Claude Code's tool-companion
+  blocks (`Skill` prompt bodies, image coordinate dimensions and base64 images,
+  and `ToolSearch` `tool_reference` / `Tool loaded.` blocks) attach directly to
+  their preceding matching tool result. Skill companions must carry a `Base
+  directory for this skill:`, `ARGUMENTS:` / `Skill arguments:` prefix, or a
+  Markdown heading containing "skill" or "instructions"; unmarked user text
+  is rejected rather than treated as tool output.
+- **Broad Anthropic Messages compatibility**: `/v1/messages/count_tokens` (a local estimate, not a model tokenizer),
+  non-streaming `stream: false` responses, `output_config.format` /
+  `response_format` JSON schema reminders (used by Claude Code `type: "prompt"`
+  hooks), plain-text `document` and `search_result` blocks, historical
+  `server_tool_use` / `web_search_tool_result` blocks, MCP `input_schema`
+  keyword sanitization for Gemini/Vertex compatibility, effort selection via
+  `output_config.effort` / `thinking.budget_tokens`, Windows `.cmd` / `.bat` and
+  WSL `/mnt/<drive>` working-directory translation, and legacy/small-fast model
+  alias fallback.
 - **Conversation pooling**: at most four agy processes, idle reaping, LRU
   eviction, and HTTP 503 for conflicting concurrent responses.
 - **Isolation without a permission bypass.** The agent is defined with
@@ -141,10 +166,21 @@ magpie plugin add ./opencode-antigravity-bridge
 - **Actual HTTP 400 errors** for unsupported request content detected before
   streaming starts.
 
-The MCP transport forwards each declared `input_schema`, but that does not
-automatically execute full JSON Schema validation. The bridge validates tool
+The MCP transport sanitizes `input_schema` keywords for agy's Gemini/Vertex
+translator. Mixed unions are narrowed to a representable type, incompatible
+keywords are removed, and unsupported enum/const values become description
+hints. This does not execute full JSON Schema validation. The bridge validates tool
 names and argument shapes; the client that executes a tool must still validate
 its arguments and authorize the operation.
+
+`output_config.effort` and `thinking.budget_tokens` select a level when
+Anthropic `thinking.type` is `enabled` or `adaptive`. Generic
+`reasoning_effort`, `reasoningEffort`, `reasoning.effort` and
+`generationConfig.thinkingConfig.thinkingLevel` do not require that envelope;
+`thinking.type: "disabled"` suppresses these request-level overrides.
+`count_tokens` estimates text at roughly four ASCII bytes or three non-ASCII
+UTF-8 bytes per token and uses a fixed 1,600 tokens per image. It should not be
+used as an exact quota or context-limit measurement.
 
 ## Token cost
 
@@ -258,10 +294,12 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 
 ## Limitations
 
-- **Image URLs, malformed base64 and user documents** are rejected with HTTP
-  400. Provide image bytes inline; the bridge does not fetch remote URLs.
-  Older servers without ACP image capability reject user images. Base64
-  images returned inside a `tool_result` continue to use MCP image content.
+- **User images and binary documents**: user prompt images require an `agy`
+  process that advertises ACP `promptCapabilities.image` (agy 1.5.0 does;
+  older servers may return HTTP 400). Image URLs, malformed base64 and
+  binary/PDF documents return HTTP 400. Images inside or beside a
+  `tool_result` are passed through as MCP image content. Plain-text
+  `document` and `search_result` blocks are rendered as text.
 - **agy runs parallel IDE tool calls one after another.** Each call reaches the
   client in its own `tool_use` response; calls agy issues together still leave
   in one response.
@@ -270,10 +308,12 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   meaningful to this bridge (which needs nothing back: agy keeps its own
   context). The Anthropic API would reject them, so a client must not forward
   these blocks to a real Anthropic model after switching providers.
-- **User instructions beside a live `tool_result`** are still rejected with
-  HTTP 400. Complete `<system-update>` elements, task notifications, and
-  recognized hook/token-count notices are supported. Send user instructions
-  after the tool continuation completes.
+- **Plain user instructions beside a live `tool_result`** are still rejected
+  with HTTP 400. Complete `<system-update>` elements, task/channel/teammate
+  notifications, recognized Claude Code hook notices, and tool companions are
+  forwarded on the live MCP turn; explicit Claude Code mid-turn
+  `queued_command` envelopes and user follow-ups after a rejected/stopped tool
+  call cancel the live turn and replay cleanly in a new session.
 - **Ambiguous or unrecognized rewritten tool IDs** are not guessed. Ambiguous
   matches return 503; unrecognized results that conflict with a pending pooled
   conversation return 409. Conflicting duplicates and mixed-conversation result
@@ -282,9 +322,9 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   `authenticate` (it switches agy to a different sign-in path) and relies on the
   CLI's existing login.
 - **The IDE tool connection uses a private `nc`.** agy runs `nc host port` for
-  `--ide-mcp-port`; the bridge puts its own `nc` first in agy's PATH, which runs
-  `mcp-server.mjs` authenticated by a per-process token. Windows (`nc.cmd`) is
-  not verified.
+  `--ide-mcp-port`; the bridge puts its own `nc` (and `nc.cmd` on Windows) first
+  in agy's PATH, which runs `mcp-server.mjs` authenticated by a per-process
+  token.
 - **No automatic agy installation** and no support guarantee for CLI protocol
   changes. The MCP helper answers as a `2025-11-25` server, because agy's
   `2026-07-28` mode expects notifications through `subscriptions/listen`.
@@ -299,6 +339,7 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 |---|---|---|
 | `AGY_PATH` | PATH lookup | agy executable |
 | `AGY_BRIDGE_THINKING` | on | `0` stops forwarding thought summaries |
+| `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
@@ -320,7 +361,9 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. Its 208 checks pass under Node. They cover the minimal
+exercised. Its 266 checks pass under Node and Bun. The 25 focused tests cover
+usage, compatibility edge cases and Windows command construction. These tests
+do not substitute for Windows end-to-end validation. Together they cover the minimal
 agent and allowlisted client identity, session instructions, streaming, thought
 summaries with bridge-issued signatures, per-turn usage, session reuse, conversation isolation, native tool
 round-trips, parallel/consecutive calls, atomic result validation, failures,

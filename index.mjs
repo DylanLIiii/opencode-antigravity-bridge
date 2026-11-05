@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process"
+import { agyCandidates, spawnAgy, windowsMcpShim } from "./platform.mjs"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
 import fs from "node:fs"
@@ -81,18 +81,7 @@ function configuredTimeout(name, fallback) {
 
 function findAgy() {
   if (cachedAgyPath) return cachedAgyPath
-  const candidates = []
-  if (process.env.AGY_PATH) candidates.push(process.env.AGY_PATH)
-  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, process.platform === "win32" ? "agy.exe" : "agy"))
-  }
-  const home = os.homedir()
-  candidates.push(
-    path.join(home, ".local", "bin", "agy"),
-    path.join(home, ".gemini", "bin", "agy"),
-    "/usr/local/bin/agy",
-    "/opt/homebrew/bin/agy",
-  )
+  const candidates = agyCandidates(process.env, os.homedir())
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
@@ -107,8 +96,9 @@ function execOnce(file, args, opts = {}) {
   return new Promise((resolve) => {
     let child
     try {
-      child = spawn(file, args, {
+      child = spawnAgy(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
         ...opts,
       })
     } catch (err) {
@@ -201,7 +191,7 @@ function buildModelCatalog(list) {
     })
     routes.set(id, { byEffort, efforts, defaultEffort })
   }
-  return { models, routes }
+  return { models, routes, rawIds }
 }
 
 async function loadModelCatalog(agyPath, refresh = false) {
@@ -211,12 +201,23 @@ async function loadModelCatalog(agyPath, refresh = false) {
   return catalog
 }
 
-function requestedEffort(body) {
-  const thinking = body.thinking?.type
-  if (thinking !== "enabled" && thinking !== "adaptive") return ""
-  const direct = String(body.output_config?.effort || "").toLowerCase()
+function normalizeEffort(value) {
+  const direct = String(value || "").trim().toLowerCase()
   if (direct === "ultra") return "max"
-  if (EFFORT_ORDER.includes(direct)) return direct
+  return EFFORT_ORDER.includes(direct) ? direct : ""
+}
+
+function requestedEffort(body) {
+  const forced = normalizeEffort(process.env.AGY_BRIDGE_EFFORT)
+  if (forced) return forced
+  const thinking = body.thinking?.type
+  if (thinking === "disabled") return ""
+  const generic = [body.reasoning_effort, body.reasoningEffort, body.reasoning?.effort,
+    body.generationConfig?.thinkingConfig?.thinkingLevel].map(normalizeEffort).find(Boolean)
+  if (generic) return generic
+  if (thinking !== "enabled" && thinking !== "adaptive") return ""
+  const direct = normalizeEffort(body.output_config?.effort)
+  if (direct) return direct
   const budget = Number(body.thinking?.budget_tokens)
   if (!Number.isFinite(budget) || budget <= 0) return ""
   if (budget <= 4096) return "low"
@@ -238,10 +239,52 @@ function closestEffort(effort, efforts) {
   return best
 }
 
+function resolveCatalogAlias(catalog, model) {
+  if (!model || catalog.routes.has(model) || catalog.rawIds?.has(model)) {
+    return { id: model, inlineEffort: "" }
+  }
+  const undated = model.replace(/-\d{8}$/, "")
+  if (catalog.routes.has(undated) || catalog.rawIds?.has(undated)) {
+    return { id: undated, inlineEffort: "" }
+  }
+  const effortMatch = /^(.*)-(minimal|low|medium|high|xhigh|max)$/i.exec(undated)
+  const base = effortMatch ? effortMatch[1] : undated
+  const inlineEffort = effortMatch ? effortMatch[2].toLowerCase() : ""
+  if (catalog.routes.has(base) || catalog.rawIds?.has(base)) {
+    return { id: base, inlineEffort }
+  }
+  const routeKeys = [...catalog.routes.keys()]
+  if (/^(?:gemini-[0-9.]+-flash(?:-lite)?|claude-(?:[0-9.-]+-)?haiku(?:-[0-9.-]+)?)$/i.test(base)) {
+    const flashFamily = routeKeys.find((id) => /flash/i.test(id)) ||
+      catalog.models.find((item) => /flash/i.test(item.id))?.id
+    if (flashFamily) return { id: flashFamily, inlineEffort }
+    const fallbackGemini = routeKeys.find((id) => /^gemini-/i.test(id))
+    if (fallbackGemini) return { id: fallbackGemini, inlineEffort: inlineEffort || "low" }
+  }
+  if (/^gemini-[0-9.]+-(?:pro|ultra)(?:-[a-z0-9.]+)?$/i.test(base)) {
+    const proFamily = (catalog.routes.has("gemini-4-argon") ? "gemini-4-argon" : null) ||
+      routeKeys.find((id) => /^gemini-/i.test(id) && !/flash/i.test(id)) ||
+      catalog.models.find((item) => /^gemini-/i.test(item.id) && !/flash/i.test(item.id))?.id
+    if (proFamily) return { id: proFamily, inlineEffort }
+  }
+  if (/^claude-(?:[0-9.-]+-)?sonnet(?:-[0-9.-]+)?$/i.test(base)) {
+    const sonnet = routeKeys.find((id) => /^claude-.*sonnet/i.test(id)) ||
+      catalog.models.find((item) => /^claude-.*sonnet/i.test(item.id))?.id
+    if (sonnet) return { id: sonnet, inlineEffort }
+  }
+  if (/^claude-(?:[0-9.-]+-)?opus(?:-[0-9.-]+)?(?:-thinking)?$/i.test(base)) {
+    const opus = routeKeys.find((id) => /^claude-.*opus/i.test(id)) ||
+      catalog.models.find((item) => /^claude-.*opus/i.test(item.id))?.id
+    if (opus) return { id: opus, inlineEffort }
+  }
+  return { id: model, inlineEffort: "" }
+}
+
 function resolveAgyModel(catalog, model, body) {
-  const family = catalog.routes.get(model)
-  if (!family) return model
-  const requested = requestedEffort(body)
+  const { id: resolvedId, inlineEffort } = resolveCatalogAlias(catalog, model)
+  const family = catalog.routes.get(resolvedId)
+  if (!family) return resolvedId
+  const requested = requestedEffort(body) || inlineEffort
   const effort = requested ? closestEffort(requested, family.efforts) : family.defaultEffort
   return family.byEffort.get(effort)
 }
@@ -314,7 +357,7 @@ function ensureShimDir() {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-bin-"))
     if (process.platform === "win32") {
       await fs.promises.writeFile(path.join(dir, "nc.cmd"),
-        `@"${process.execPath}" "${MCP_SERVER_PATH}"\r\n`)
+        windowsMcpShim(process.execPath, MCP_SERVER_PATH))
     } else {
       await fs.promises.writeFile(path.join(dir, "nc"),
         `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(MCP_SERVER_PATH)}\n`, { mode: 0o700 })
@@ -456,7 +499,7 @@ class AcpConnection {
 class Turn {
   constructor(proc, messages) {
     this.proc = proc
-    this.baseHistory = messages.slice(0, -1).map((message) => ({ ...message }))
+    this.baseHistory = trailingMessages({ messages }).history.map((message) => ({ ...message }))
     this.events = []
     this.waiters = []
     this.calls = []
@@ -642,12 +685,18 @@ class Proc {
     ]
     if (this.workDir) args.push("--add-dir", this.workDir)
     try {
-      this.child = spawn(this.agyPath, args, {
+      const childEnv = { ...process.env }
+      const inheritedPath = process.env.PATH || childEnv.Path || ""
+      for (const key of Object.keys(childEnv)) {
+        if (/^path$/i.test(key) && key !== "PATH") delete childEnv[key]
+      }
+      this.child = spawnAgy(this.agyPath, args, {
         cwd: this.workspace,
         stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
         env: {
-          ...process.env,
-          PATH: bin + path.delimiter + (process.env.PATH || ""),
+          ...childEnv,
+          PATH: bin + path.delimiter + inheritedPath,
           AGY_BRIDGE_CONTROL_PORT: String(controlServer.address().port),
           AGY_BRIDGE_TOKEN: this.token,
           AGY_CLI_DISABLE_AUTO_UPDATE: "true",
@@ -703,7 +752,8 @@ class Proc {
     })
     this.agentVersion = init?.agentInfo?.version ?? null
     const capabilities = init?.agentCapabilities ?? {}
-    this.supportsImages = capabilities.promptCapabilities?.image === true
+    this.supportsImages = capabilities.promptCapabilities?.image === true ||
+      capabilities.prompt_capabilities?.image === true
     const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
@@ -720,6 +770,7 @@ class Proc {
           mcpServers: [],
           ...meta,
         })
+        if (!session || typeof session !== "object") throw new Error("empty session/resume result")
         this.sessionId = this.resumeFrom.sessionId
         this.resumed = true
         this.hasSentFirstTurn = true
@@ -728,7 +779,7 @@ class Proc {
         session = null
       }
     }
-    if (!session) {
+    if (!this.resumed) {
       session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
@@ -777,7 +828,7 @@ class Proc {
         }
       }
       if (!configured && (force || model !== this.currentModel || target)) {
-        await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model })
+        await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model }, 30_000)
       }
     } catch (error) {
       const wrapped = new Error(`agy bridge: model ${model} is unavailable to this agy account: ${error.message}`)
@@ -893,6 +944,39 @@ class Proc {
     return historyKey(this.expectedMessages) === historyKey(messages)
   }
 
+  // Clients such as Claude Code normalize tool_use inputs when recording an
+  // assistant message (e.g. filling default replace_all: false on Edit or
+  // stripping a redundant cd prefix on Bash). When the pending turn's exact
+  // CSPRNG toolu_ IDs and tool names match, allow canonicalized tool_use.input
+  // without tearing down the live ACP session.
+  matchesPendingTurnHistory(turn, history) {
+    if (this.matchesHistory(history)) return true
+    if (this.historyInvalid || !turn || this.turn !== turn || !Array.isArray(this.expectedMessages)) return false
+    let split = history.length
+    while (split > 0 && history[split - 1].role === "assistant") split--
+    let expectedSplit = this.expectedMessages.length
+    while (expectedSplit > 0 && this.expectedMessages[expectedSplit - 1].role === "assistant") expectedSplit--
+    if (historyKey(this.expectedMessages.slice(0, expectedSplit)) !== historyKey(history.slice(0, split))) return false
+    const actualAssistant = history.slice(split)
+    const expectedAssistant = this.expectedMessages.slice(expectedSplit)
+    const actualCalls = lastAssistantCalls(actualAssistant)
+    const expectedCalls = lastAssistantCalls(expectedAssistant)
+    if (!actualCalls.length || actualCalls.length !== expectedCalls.length) return false
+    if (actualCalls.some((call, index) =>
+      !call.id || call.id !== expectedCalls[index].id || call.name !== expectedCalls[index].name)) {
+      return false
+    }
+    const stripToolInputs = (messages) => messages.map((message) => ({
+      ...message,
+      content: Array.isArray(message.content)
+        ? message.content.map((block) => block?.type === "tool_use"
+          ? { type: "tool_use", id: block.id, name: block.name, input: {} }
+          : block)
+        : message.content,
+    }))
+    return historyKey(stripToolInputs(expectedAssistant)) === historyKey(stripToolInputs(actualAssistant))
+  }
+
   recordToolResults(turn, messages) {
     if (this.turn === turn) this.expectedMessages = messages.map((message) => ({ ...message }))
   }
@@ -905,32 +989,38 @@ class Proc {
 
   async #runTurn(turn, content, model, selection) {
     try {
+      turn.arm()
       if (model) await this.#setModel(model, selection)
-      // Text a cancelled turn never delivered still belongs to the session.
-      let prompt = this.unsentPrompt ? [...this.unsentPrompt, { type: "text", text: "\n\n" }, ...content] : content
+      // Content a cancelled turn never delivered still belongs to the session.
+      let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
       this.unsentPrompt = null
       let usage = null
       for (;;) {
         turn.logOffset = await fileSize(this.logPath)
         // A cancel that arrived before the prompt would be ignored by agy.
         if (turn.cancelRequested) {
-          if (this.hasSentFirstTurn) this.unsentPrompt = prompt
+          if (this.hasSentFirstTurn) this.unsentPrompt = promptParts
           turn.complete({ stopReason: "cancelled" })
           return
         }
         turn.arm()
+        unpark(this.convKey)
         this.hasSentFirstTurn = true
         const result = await this.conn.request("session/prompt", {
           sessionId: this.sessionId,
-          prompt,
+          prompt: promptParts.length ? promptParts : [{ type: "text", text: "" }],
         })
         usage = addUsage(usage, result?.usage)
         if (turn.cancelRequested) {
           turn.complete({ stopReason: "cancelled" })
           return
         }
-        if (turn.agentError || result?.stopReason === "refusal") {
-          throw await this.#agentError(turn, result)
+        if (turn.agentError) {
+          throw await this.#agentError(turn)
+        }
+        if (result?.stopReason === "refusal") {
+          const detail = await lastAgentError(this.logPath, turn.logOffset)
+          if (detail) throw this.#formatAgentError(detail)
         }
         turn.flushText()
         // agy ended the turn without waiting for a long-running client tool:
@@ -943,7 +1033,7 @@ class Proc {
         turn.arm()
         await turn.waitLate()
         for (const call of late) call.lateDelivered = true
-        prompt = [{ type: "text", text: renderLateResults(late) }]
+        promptParts = renderLateResultParts(late, this.supportsImages)
       }
     } catch (error) {
       if (turn.cancelRequested && !this.dead) {
@@ -967,9 +1057,13 @@ class Proc {
     }
   }
 
-  async #agentError(turn, result) {
+  async #agentError(turn) {
     const detail = await lastAgentError(this.logPath, turn.logOffset)
-    if (result?.stopReason === "refusal" || /QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|code 429\b/.test(detail)) {
+    return this.#formatAgentError(detail)
+  }
+
+  #formatAgentError(detail) {
+    if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
       return new AgentTurnError(
         `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}`,
         "rate_limit_error",
@@ -1083,12 +1177,14 @@ class Proc {
   }
 
   #deliverLate(turn, call) {
-    const waiter = turn.awaitCalls.find((item) => item.target === call)
-    if (waiter) {
-      clearTimeout(waiter.timer)
-      turn.awaitCalls = turn.awaitCalls.filter((item) => item !== waiter)
+    const waiters = turn.awaitCalls.filter((item) => item.target === call)
+    if (waiters.length) {
+      turn.awaitCalls = turn.awaitCalls.filter((item) => item.target !== call)
       call.lateDelivered = true
-      waiter.reply(call.result)
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer)
+        waiter.reply(call.result)
+      }
     }
     turn.notifyLate()
   }
@@ -1154,6 +1250,7 @@ class Proc {
       clearTimeout(call.deadline)
       if (call.id && toolCalls.get(call.id)?.call === call) toolCalls.delete(call.id)
       if (call.mcpSeen && !call.mcpResponded) {
+        this.historyInvalid = true
         this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
       }
     }
@@ -1216,8 +1313,12 @@ class Proc {
       const alive = () => child.exitCode === null && child.signalCode === null
       if (alive()) {
         const closed = once(child, "close").catch(() => {})
-        try { child.kill("SIGTERM") } catch {}
-        await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
+        if (process.platform === "win32" && child.pid) {
+          await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3_000 })
+        } else {
+          try { child.kill("SIGTERM") } catch {}
+          await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
+        }
         if (alive()) {
           try { child.kill("SIGKILL") } catch {}
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 1_000))])
@@ -1226,7 +1327,15 @@ class Proc {
     }
     this.child = null
     if (this.workspace) {
-      await fs.promises.rm(this.workspace, { recursive: true, force: true }).catch(() => {})
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          await fs.promises.rm(this.workspace, { recursive: true, force: true })
+          break
+        } catch (error) {
+          if (attempt === 3 || !["EBUSY", "EPERM", "ENOTEMPTY"].includes(error?.code)) break
+          await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)))
+        }
+      }
     }
     allProcs.delete(this)
   }
@@ -1238,7 +1347,7 @@ function stillRunningText(call) {
 }
 
 function resultText(result) {
-  return (result?.content || []).map((part) => part?.type === "text" ? part.text : "[image returned by tool]").join("")
+  return (result?.content || []).map((part) => part?.type === "text" ? part.text : "[image returned by tool]").join("\n\n")
 }
 
 function renderLateResults(calls) {
@@ -1247,6 +1356,50 @@ function renderLateResults(calls) {
     parts.push(`[tool result for ${call.name} call_id=${call.id}${call.result?.isError ? " (error)" : ""}]\n${resultText(call.result)}\n[end of tool result]`)
   }
   return parts.join("\n\n")
+}
+
+function renderLateResultParts(calls, includeImages = false) {
+  const out = [{ type: "text", text: renderLateResults(calls) }]
+  if (includeImages) {
+    for (const call of calls) {
+      for (const part of call.result?.content || []) {
+        if (part?.type === "image" && part.data) {
+          out.push({ type: "image", data: part.data, mimeType: part.mimeType || "image/png" })
+        }
+      }
+    }
+  }
+  return out
+}
+
+function toPromptParts(content) {
+  if (!content) return []
+  if (typeof content === "string") return content ? [{ type: "text", text: content }] : []
+  if (!Array.isArray(content)) return [{ type: "text", text: String(content) }]
+  const out = []
+  for (const part of content) {
+    if (!part) continue
+    if (part.type === "text") {
+      if (!part.text) continue
+      if (out.at(-1)?.type === "text") out.at(-1).text += part.text
+      else out.push({ type: "text", text: part.text })
+    } else if (part.type === "image" && part.data) {
+      out.push({ type: "image", data: part.data, mimeType: part.mimeType || "image/png" })
+    }
+  }
+  return out
+}
+
+function mergePromptParts(first, second) {
+  const a = toPromptParts(first)
+  const b = toPromptParts(second)
+  if (!a.length) return b
+  if (!b.length) return a
+  return toPromptParts([...a, { type: "text", text: "\n\n" }, ...b])
+}
+
+function promptHasImage(parts) {
+  return Array.isArray(parts) && parts.some((part) => part?.type === "image")
 }
 
 function addUsage(total, usage) {
@@ -1333,23 +1486,70 @@ function loadParked() {
   }
 }
 
-// Merge with the file so concurrent bridge processes do not erase each other.
-function saveParked() {
-  const merged = new Map()
-  for (const entry of readStateFile().filter(validEntry)) merged.set(entry.key, entry)
-  for (const key of unparked) merged.delete(key)
-  for (const [key, entry] of parked) {
-    if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
-  }
-  const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
-  const file = sessionStateFile()
+// Hold a short-lived lockfile around read-merge-rename so concurrent bridge
+// processes do not overwrite each other's parked session updates.
+function withStateLock(file, fn) {
+  const lock = `${file}.lock`
+  let fd = null
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-    const temp = `${file}.${process.pid}.tmp`
-    fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
-    fs.renameSync(temp, file)
-    unparked.clear()
+    const waitBuf = new Int32Array(new SharedArrayBuffer(4))
+    for (let attempt = 0; attempt < 40; attempt++) {
+      try {
+        fd = fs.openSync(lock, "wx", 0o600)
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid }))
+        break
+      } catch (error) {
+        if (error?.code !== "EEXIST") break
+        try {
+          if (Date.now() - fs.statSync(lock).mtimeMs > 5_000) {
+            const owner = JSON.parse(fs.readFileSync(lock, "utf8"))
+            if (Number.isSafeInteger(owner.pid) && owner.pid > 0) {
+              try { process.kill(owner.pid, 0) } catch (error) {
+                if (error.code === "ESRCH") fs.unlinkSync(lock)
+              }
+            }
+          }
+        } catch {}
+        Atomics.wait(waitBuf, 0, 0, 5)
+      }
+    }
+    if (fd === null) return
+    return fn()
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch {}
+      try { fs.unlinkSync(lock) } catch {}
+    }
+  }
+}
+
+// Merge with the file so concurrent bridge processes do not erase each other.
+function saveParked() {
+  const file = sessionStateFile()
+  try {
+    withStateLock(file, () => {
+      const merged = new Map()
+      for (const entry of readStateFile().filter(validEntry)) merged.set(entry.key, entry)
+      for (const key of unparked) merged.delete(key)
+      for (const [key, entry] of parked) {
+        if ((merged.get(key)?.at ?? 0) <= entry.at) merged.set(key, entry)
+      }
+      const entries = [...merged.values()].sort((a, b) => a.at - b.at).slice(-MAX_PARKED)
+      const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+      fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
+      fs.renameSync(temp, file)
+      unparked.clear()
+    })
   } catch {}
+}
+
+function unpark(convKey) {
+  loadParked()
+  if (!parked.has(convKey) && !readStateFile().some((entry) => entry?.key === convKey)) return
+  parked.delete(convKey)
+  unparked.add(convKey)
+  saveParked()
 }
 
 // Remember a session so a later request, or a restarted bridge, resumes it
@@ -1441,12 +1641,21 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
       if (!existing.dead && existing.turn) {
         throw new BusyError("agy bridge: this conversation still has an unfinished response")
       }
+      let matchedHistory = opts.history
+      if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
+        Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
+        const k = existing.expectedMessages.length
+        if (k > matchedHistory.length && k <= opts.messages.length &&
+          existing.matchesHistory(opts.messages.slice(0, k))) {
+          matchedHistory = opts.messages.slice(0, k)
+        }
+      }
       const compatible = !forceNew && !existing.dead && !existing.retiring &&
         existing.workDir === opts.workDir && existing.instructions === opts.instructions &&
-        existing.matchesHistory(opts.history)
+        existing.matchesHistory(matchedHistory)
       if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
         await existing.updateTools(opts.tools)
-        return existing
+        return { proc: existing, history: matchedHistory }
       }
       existing.retiring = true
       dropFromPool(existing)
@@ -1466,7 +1675,7 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
       throw error
     }
     pool.set(convKey, proc)
-    return proc
+    return { proc, history: opts.history }
   })
 }
 
@@ -1474,6 +1683,85 @@ function stableJSON(value) {
   return JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
     ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]))
     : item)
+}
+
+function parseUserImage(block) {
+  if (block?.type !== "image") return null
+  const mediaType = String(block.source?.media_type || "").toLowerCase()
+  return imageContent({ ...block, source: { ...block.source, media_type: mediaType === "image/jpg" ? "image/jpeg" : mediaType } })
+}
+
+function parseUserDocumentText(block) {
+  if (block?.type !== "document") return ""
+  const title = typeof block.title === "string" && block.title.trim() ? block.title.trim() : ""
+  const src = block.source
+  let text = null
+  if (src?.type === "text" && typeof src.data === "string") {
+    text = src.data
+  } else if (src?.type === "content") {
+    if (typeof src.content === "string") {
+      text = src.content
+    } else if (Array.isArray(src.content) && src.content.every((part) => part?.type === "text" && typeof part.text === "string")) {
+      text = src.content.map((part) => part.text).join("\n")
+    }
+  }
+  if (text === null) {
+    throw new UnsupportedContent("a binary or URL document block in a user message (agy's ACP prompt accepts text and images only)")
+  }
+  return title ? `[document: ${title}]\n${text}\n[end of document]` : text
+}
+
+function parseSearchResultText(block) {
+  if (block?.type !== "search_result") return ""
+  const header = [block.title, block.source].filter((item) => typeof item === "string" && item.trim()).join(" — ")
+  const body = Array.isArray(block.content)
+    ? block.content.map((part) => typeof part?.text === "string" ? part.text : "").join("\n")
+    : typeof block.content === "string" ? block.content : ""
+  return header ? `[search result: ${header}]\n${body}\n[end of search result]` : body
+}
+
+const SERVER_TOOL_RESULT_BLOCK_TYPES = new Set([
+  "web_search_tool_result",
+  "web_fetch_tool_result",
+  "code_execution_tool_result",
+  "bash_code_execution_tool_result",
+  "text_editor_code_execution_tool_result",
+  "tool_search_tool_result",
+  "mcp_tool_result",
+  "advisor_tool_result",
+])
+
+const ASSISTANT_ALLOWED_BLOCK_TYPES = new Set([
+  "text",
+  "tool_use",
+  "thinking",
+  "redacted_thinking",
+  "server_tool_use",
+  "mcp_tool_use",
+  "container_upload",
+  ...SERVER_TOOL_RESULT_BLOCK_TYPES,
+])
+
+function renderServerAssistantBlock(block) {
+  if (!block || typeof block !== "object") return ""
+  if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
+    return `[server tool call ${block.name || block.type} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`
+  }
+  if (block.type === "container_upload") {
+    return block.file_id ? `[container upload ${block.file_id}]` : ""
+  }
+  if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+    return `[${block.type}${block.tool_use_id ? " id=" + block.tool_use_id : ""}] ${JSON.stringify(block.content ?? "")}`
+  }
+  return ""
+}
+
+const MAGPIE_PLACEHOLDER_NOTICE = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
+const MAGPIE_PLACEHOLDER_NOTICE_RE = /(?:^|\n\n)Values written like \{\{NAME_ab12cd34\}\} are placeholders for real values\. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs\. Don't ask to verify them, and don't replace them with examples\.(?=\s|$)/g
+
+function stripMagpiePlaceholderNotice(text) {
+  if (typeof text !== "string" || !text.includes("{{NAME_ab12cd34}}")) return text
+  return text.replace(MAGPIE_PLACEHOLDER_NOTICE_RE, "")
 }
 
 // Compare conversation content, not transport metadata or client-assigned IDs.
@@ -1484,18 +1772,28 @@ function historyKey(messages) {
   for (const message of messages) {
     const blocks = Array.isArray(message.content) ? message.content : [{ type: "text", text: message.content ?? "" }]
     for (const block of blocks) {
-      if (block.type === "thinking" || block.type === "redacted_thinking") continue
+      if (!block) continue
+      if (block.type === "thinking" || block.type === "redacted_thinking" ||
+        block.type === "tool_addition" || block.type === "tool_removal") continue
       let value
       if (typeof block === "string" || block.type === "text") {
-        value = { type: "text", text: typeof block === "string" ? block : block.text || "" }
+        value = { type: "text", text: stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "") }
+      } else if (block.type === "document") {
+        value = { type: "text", text: parseUserDocumentText(block) }
+      } else if (block.type === "search_result") {
+        value = { type: "text", text: parseSearchResultText(block) }
+      } else if (block.type === "image") {
+        const image = parseUserImage(block)
+        value = { type: "image", mimeType: image.mimeType, sha256: digest(image.data) }
       } else if (block.type === "tool_use") {
         const ordinal = ids.size + 1
         ids.set(block.id, ordinal)
         value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
       } else if (block.type === "tool_result") {
         value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
-      } else if (block.type === "image") {
-        value = imageContent(block)
+      } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
+        block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+        value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }
       } else {
         value = block
       }
@@ -1530,7 +1828,7 @@ function lastAssistantCalls(messages) {
 
 function matchToolResults(body, blocks) {
   const direct = blocks.map(block => ({ block, match: toolCalls.get(block.tool_use_id) }))
-  if (direct.some(item => item.match)) return direct
+  if (direct.every(item => item.match)) return direct
   const { history } = trailingMessages(body)
   const calls = lastAssistantCalls(history)
   const byID = new Map(calls.map((call, index) => [call.id, index]))
@@ -1543,7 +1841,8 @@ function matchToolResults(body, blocks) {
     if (shown.length !== calls.length || shown.some((call, index) =>
       call.name !== calls[index].name || stableJSON(call.input ?? {}) !== stableJSON(calls[index].input ?? {}))) continue
     const mapped = blocks.map(block => ({ block, match: toolCalls.get(shown[byID.get(block.tool_use_id)].id) }))
-    if (mapped.some(item => !item.match) || !mapped.some(item => !item.match.call.mcpResponded)) continue
+    if (mapped.some((item, index) => direct[index].match && item.match !== direct[index].match)) continue
+    if (mapped.some(item => !item.match) || !mapped.some(item => !item.match.call.mcpResponded || (item.match.call.deferred && !item.match.call.result))) continue
     if (found) throw new BusyError("agy bridge: renamed tool IDs match more than one pending conversation")
     found = mapped
   }
@@ -1565,6 +1864,121 @@ function conversationKey(body) {
   return createHash("sha256").update(source).digest("hex")
 }
 
+function appendSchemaHint(node, hint) {
+  if (!hint) return
+  if (typeof node.description === "string" && node.description.trim()) {
+    if (!node.description.includes(hint)) node.description = `${node.description} (${hint})`
+  } else {
+    node.description = hint
+  }
+}
+
+// Sanitize JSON Schema constructs that agy's ACP -> Google Code Assist translator
+// converts into invalid Schema protos (e.g. union types leaving stale array/object
+// keywords, or non-string/empty enum entries producing `enum[0]: cannot be empty`).
+function sanitizeInputSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema
+  const out = { ...schema }
+
+  if (Array.isArray(out.type)) {
+    const types = out.type.filter((item) => typeof item === "string")
+    const nullable = types.includes("null")
+    const nonNull = types.filter((item) => item !== "null")
+    if (nonNull.length > 1) {
+      let chosen = nonNull[0]
+      if (nonNull.includes("array") && out.items !== undefined) chosen = "array"
+      else if (nonNull.includes("object") && (out.properties !== undefined || out.additionalProperties !== undefined)) {
+        chosen = "object"
+      }
+      out.type = nullable ? [chosen, "null"] : chosen
+      appendSchemaHint(out, `Accepts types: ${types.join(" | ")}`)
+    } else if (nonNull.length === 1) {
+      out.type = nullable ? [nonNull[0], "null"] : nonNull[0]
+    }
+  }
+
+  const resolvedType = typeof out.type === "string"
+    ? out.type
+    : Array.isArray(out.type)
+      ? out.type.find((item) => item !== "null") || null
+      : null
+
+  if (resolvedType && resolvedType !== "array") {
+    delete out.items
+    delete out.prefixItems
+    delete out.minItems
+    delete out.maxItems
+    delete out.uniqueItems
+    delete out.contains
+  }
+  if (resolvedType && resolvedType !== "object") {
+    delete out.properties
+    delete out.patternProperties
+    delete out.required
+    delete out.minProperties
+    delete out.maxProperties
+    delete out.dependentRequired
+  }
+
+  if (Array.isArray(out.enum)) {
+    const invalidEnum = out.enum.length === 0 ||
+      (resolvedType && resolvedType !== "string") ||
+      out.enum.some((item) => typeof item !== "string" || item.length === 0)
+    if (invalidEnum) {
+      if (out.enum.length) {
+        appendSchemaHint(out, `Allowed values: ${out.enum.map((item) => JSON.stringify(item)).join(", ")}`)
+      }
+      delete out.enum
+    }
+  }
+
+  if (out.const !== undefined && (typeof out.const !== "string" || out.const.length === 0 || (resolvedType && resolvedType !== "string"))) {
+    appendSchemaHint(out, `Must equal: ${JSON.stringify(out.const)}`)
+    delete out.const
+  }
+
+  if (out.properties && typeof out.properties === "object" && !Array.isArray(out.properties)) {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+    )
+    if (Array.isArray(out.required)) {
+      const filtered = out.required.filter((key) => typeof key === "string" && Object.hasOwn(out.properties, key))
+      if (filtered.length) out.required = filtered
+      else delete out.required
+    }
+  }
+  if (out.patternProperties && typeof out.patternProperties === "object" && !Array.isArray(out.patternProperties)) {
+    out.patternProperties = Object.fromEntries(
+      Object.entries(out.patternProperties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+    )
+  }
+  if (out.additionalProperties && typeof out.additionalProperties === "object" && !Array.isArray(out.additionalProperties)) {
+    out.additionalProperties = sanitizeInputSchema(out.additionalProperties)
+  }
+  if (Array.isArray(out.items)) {
+    out.items = out.items.map((item) => sanitizeInputSchema(item))
+  } else if (out.items && typeof out.items === "object") {
+    out.items = sanitizeInputSchema(out.items)
+  }
+  if (Array.isArray(out.prefixItems)) {
+    out.prefixItems = out.prefixItems.map((item) => sanitizeInputSchema(item))
+  }
+  for (const key of ["anyOf", "oneOf", "allOf"]) {
+    if (Array.isArray(out[key])) out[key] = out[key].map((item) => sanitizeInputSchema(item))
+  }
+  if (out.not && typeof out.not === "object" && !Array.isArray(out.not)) {
+    out.not = sanitizeInputSchema(out.not)
+  }
+  for (const defsKey of ["$defs", "definitions"]) {
+    if (out[defsKey] && typeof out[defsKey] === "object" && !Array.isArray(out[defsKey])) {
+      out[defsKey] = Object.fromEntries(
+        Object.entries(out[defsKey]).map(([key, value]) => [key, sanitizeInputSchema(value)]),
+      )
+    }
+  }
+  return out
+}
+
 function normalizeTools(body) {
   if (!Array.isArray(body.tools) || !body.tools.length) return []
   const choice = body.tool_choice
@@ -1579,10 +1993,11 @@ function normalizeTools(body) {
     if (seen.has(tool.name)) throw new UnsupportedContent(`duplicate tool ${tool.name}`)
     seen.add(tool.name)
     if (selected && tool.name !== selected) continue
-    const inputSchema = tool.input_schema ?? { type: "object", properties: {} }
-    if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
+    const rawSchema = tool.input_schema ?? { type: "object", properties: {} }
+    if (!rawSchema || typeof rawSchema !== "object" || Array.isArray(rawSchema)) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
+    const inputSchema = sanitizeInputSchema(rawSchema)
     tools.push({
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
@@ -1599,6 +2014,16 @@ function blockText(block) {
     throw new UnsupportedContent("a non-object content block")
   }
   if (block.type === "text") return typeof block.text === "string" ? block.text : ""
+  if (block.type === "tool_addition" || block.type === "tool_removal") return ""
+  if (block.type === "tool_reference" && typeof block.tool_name === "string") {
+    return `Loaded tool: ${block.tool_name}`
+  }
+  if (block.type === "document") return parseUserDocumentText(block)
+  if (block.type === "search_result") return parseSearchResultText(block)
+  if (block.type === "image") {
+    parseUserImage(block)
+    return "[image]"
+  }
   if (block.type === "tool_result") {
     const inner = Array.isArray(block.content)
       ? block.content.map((part) => {
@@ -1608,8 +2033,6 @@ function blockText(block) {
       : String(block.content ?? "")
     return `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n${inner}\n[end of tool result]`
   }
-  if (block.type === "image") throw new UnsupportedContent("an image beside a live tool_result; send it after the tool response completes")
-  if (block.type === "document") throw new UnsupportedContent("a document block in a user message")
   if (block.type === "tool_use") throw new UnsupportedContent("a tool_use block in a user message")
   throw new UnsupportedContent(`a content block of type ${JSON.stringify(block.type)}`)
 }
@@ -1646,15 +2069,6 @@ function appendPrompt(out, content) {
   }
 }
 
-function messagePrompt(message) {
-  const blocks = Array.isArray(message.content) ? message.content : [message.content]
-  const out = []
-  for (const block of blocks) {
-    appendPrompt(out, block?.type === "image" ? [imageContent(block)] : blockText(block))
-  }
-  return out.length ? out : [{ type: "text", text: "" }]
-}
-
 function renderAssistantTurn(message) {
   const parts = []
   const blocks = Array.isArray(message.content)
@@ -1664,9 +2078,33 @@ function renderAssistantTurn(message) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
       parts.push(`[tool call ${block.name} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`)
+    } else {
+      const rendered = renderServerAssistantBlock(block)
+      if (rendered) parts.push(rendered)
     }
   }
   return parts.join("\n")
+}
+
+function outputFormatReminder(body) {
+  const format = body?.output_config?.format || body?.response_format
+  if (!format || typeof format !== "object") return []
+  if (format.type === "json_schema") {
+    const schema = format.schema ?? format.json_schema?.schema
+    if (schema && typeof schema === "object") {
+      return [{
+        type: "text",
+        text: `<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON value (no Markdown code fences, no backticks, and no explanatory prose before or after) conforming strictly to this JSON Schema:\n${JSON.stringify(schema)}\n</system-reminder>`,
+      }]
+    }
+  }
+  if (format.type === "json_object") {
+    return [{
+      type: "text",
+      text: "<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON object (no Markdown code fences, no backticks, and no explanatory prose before or after).\n</system-reminder>",
+    }]
+  }
+  return []
 }
 
 function workDirNote(callerWorkDir) {
@@ -1682,11 +2120,118 @@ function sessionInstructions(body, callerWorkDir) {
   return parts.join("\n\n")
 }
 
-function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
-  const messages = body.messages || []
-  const split = extractToolResults(body).length ? messages.length - trailingMessages(body).messages.length : messages.length - 1
-  const history = messages.slice(0, split)
-  const current = messages.slice(split)
+const QUEUED_PROMPT_PREFIX_RE = /^(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):\n([\s\S]*)$/
+const QUEUED_PROMPT_SUFFIX_RE = /\n\n(?:This is how Claude Code surfaces (?:messages the user sends|prompts [^\r\n]+ submits) mid-turn[\s\S]*|IMPORTANT: After completing your current task, you MUST address the user's message above\. Do not ignore it\.|Please address this message and continue with your tasks\.)\s*$/
+
+function extractQueuedPrompt(raw) {
+  if (typeof raw !== "string") return null
+  const cleanedRaw = stripMagpiePlaceholderNotice(raw)
+  const hadPlaceholder = cleanedRaw !== raw
+  let trimmed = cleanedRaw.trim()
+  const reminder = /^<system-reminder(?:\s[^>]*)?>([\s\S]*)<\/system-reminder(?:\s[^>]*)?>$/.exec(trimmed)
+  if (reminder) trimmed = reminder[1].trim()
+  const match = QUEUED_PROMPT_PREFIX_RE.exec(trimmed)
+  if (!match) return null
+  const unwrapped = match[1].replace(QUEUED_PROMPT_SUFFIX_RE, "").trim()
+  if (!hadPlaceholder) return unwrapped
+  const placeholderTag = `<system-reminder>\n${MAGPIE_PLACEHOLDER_NOTICE}\n</system-reminder>`
+  return unwrapped ? `${unwrapped}\n\n${placeholderTag}` : placeholderTag
+}
+
+function renderTurnMessage(message) {
+  if (message.role === "user") {
+    if (typeof message.content === "string") {
+      const queued = extractQueuedPrompt(message.content)
+      return queued !== null ? queued : message.content
+    }
+    if (Array.isArray(message.content)) {
+      const out = []
+      let afterToolResult = false
+      for (const block of message.content) {
+        if (block?.type === "tool_result") {
+          out.push(blockText(block))
+          afterToolResult = true
+          continue
+        }
+        const raw = blockText(block)
+        const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
+        const rendered = queued !== null ? queued : raw
+        if (rendered && afterToolResult && !rendered.startsWith("\n")) {
+          out.push("\n\n" + rendered)
+        } else {
+          out.push(rendered)
+        }
+        if (rendered) afterToolResult = false
+      }
+      return out.join("")
+    }
+    return messageText(message)
+  }
+  const blocks = Array.isArray(message.content) ? message.content : [message.content]
+  const reminders = []
+  const queuedParts = []
+  for (const block of blocks) {
+    const raw = blockText(block)
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    const queued = extractQueuedPrompt(trimmed)
+    if (queued !== null) {
+      if (queued) queuedParts.push(queued)
+    } else {
+      reminders.push(raw)
+    }
+  }
+  const out = []
+  const joinedReminders = reminders.join("").trim()
+  if (joinedReminders) {
+    out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(joinedReminders)
+      ? joinedReminders
+      : `<system-reminder>\n${joinedReminders}\n</system-reminder>`)
+  }
+  out.push(...queuedParts)
+  return out.join("\n\n")
+}
+
+function renderTurnMessageParts(message) {
+  if (message.role !== "user" || !Array.isArray(message.content)) {
+    const text = renderTurnMessage(message)
+    return text === "" ? [] : [{ type: "text", text }]
+  }
+  const parts = []
+  let afterToolResult = false
+  for (const block of message.content) {
+    if (block?.type === "image") {
+      parts.push(parseUserImage(block))
+      afterToolResult = false
+    } else if (block?.type === "tool_result") {
+      appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
+      const result = toolResult(block)
+      for (const part of result.content) appendPrompt(parts, [part])
+      appendPrompt(parts, "\n[end of tool result]")
+      afterToolResult = true
+    } else {
+      const raw = blockText(block)
+      const queued = block?.type === "text" ? extractQueuedPrompt(raw) : null
+      const rendered = queued !== null ? queued : raw
+      appendPrompt(parts, rendered && afterToolResult && !rendered.startsWith("\n") ? "\n\n" + rendered : rendered)
+      if (rendered) afterToolResult = false
+    }
+  }
+  return toPromptParts(parts)
+}
+
+function renderTurnMessagesParts(messages) {
+  const groups = messages.map(renderTurnMessageParts).filter((group) => group.length > 0)
+  const out = []
+  for (let i = 0; i < groups.length; i++) {
+    if (i > 0) out.push({ type: "text", text: "\n\n" })
+    out.push(...groups[i])
+  }
+  return toPromptParts(out)
+}
+
+function renderInitialPromptParts(body, callerWorkDir, instructionsInSession) {
+  const { history, messages: current } = trailingMessages(body)
   const out = []
   if (!instructionsInSession) {
     const system = systemText(body)
@@ -1696,37 +2241,39 @@ function renderInitialPrompt(body, callerWorkDir, instructionsInSession) {
   if (history.length) {
     appendPrompt(out, "<conversation_history>\n")
     for (const message of history) {
-      if (message.role === "assistant") appendPrompt(out, `Assistant: ${renderAssistantTurn(message)}\n`)
-      else {
-        appendPrompt(out, message.role === "user" ? "Human: " : `${message.role}: `)
-        appendPrompt(out, messagePrompt(message))
+      if (message.role === "assistant") {
+        appendPrompt(out, `Assistant: ${renderAssistantTurn(message)}\n`)
+      } else {
+        const queued = message.role !== "user" && extractQueuedPrompt(messageText(message).trim()) !== null
+        appendPrompt(out, message.role === "user" || queued ? "Human: " : `${message.role}: `)
+        appendPrompt(out, renderTurnMessageParts(message))
         appendPrompt(out, "\n")
       }
     }
     appendPrompt(out, "Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
     appendPrompt(out, "</conversation_history>\n\n")
   }
-  const wrapped = out.length > 0
-  // A fresh conversation needs no wrapper; it would only add tokens.
-  if (wrapped) appendPrompt(out, "<current_turn>\n")
-  current.forEach((message, index) => {
-    if (index) appendPrompt(out, "\n\n")
-    if (message.role !== "user") appendPrompt(out, `${message.role}: `)
-    appendPrompt(out, messagePrompt(message))
-  })
-  if (wrapped) appendPrompt(out, "\n</current_turn>")
+  const currentParts = renderTurnMessagesParts(current)
+  if (!out.length) return currentParts
+  appendPrompt(out, "<current_turn>\n")
+  appendPrompt(out, currentParts)
+  appendPrompt(out, "\n</current_turn>")
   return out
 }
 
-function renderContinuedTurn(body) {
-  return messagePrompt(body.messages[body.messages.length - 1])
+function renderContinuedTurnParts(messages) {
+  return renderTurnMessagesParts(messages)
 }
 
 function validateBody(body) {
   if (!Array.isArray(body?.messages) || !body.messages.length) {
     throw new UnsupportedContent("a request without messages")
   }
-  if (body.messages.at(-1)?.role !== "user" && !extractToolResults(body).length) {
+  const trailing = trailingMessages(body)
+  const lastRole = body.messages.at(-1)?.role
+  const validTailRole = lastRole === "user" || lastRole === "system" || lastRole === "developer"
+  if (!validTailRole || (!extractToolResults(body).length &&
+    !trailing.messages.some((message) => message.role === "user") && !trailing.history.length)) {
     throw new UnsupportedContent("a request whose last message is not from the user or a tool-result notification")
   }
   if (body.system && typeof body.system !== "string") {
@@ -1737,20 +2284,30 @@ function validateBody(body) {
   for (const message of body.messages) {
     if (message.role === "assistant" && Array.isArray(message.content)) {
       for (const block of message.content) {
-        if (["text", "tool_use", "thinking", "redacted_thinking"].includes(block?.type)) continue
+        if (ASSISTANT_ALLOWED_BLOCK_TYPES.has(block?.type)) continue
         throw new UnsupportedContent(`an assistant content block of type ${JSON.stringify(block?.type)}`)
       }
     } else if (message.role === "system" || message.role === "developer") {
-      if (typeof message.content !== "string" && (!Array.isArray(message.content) ||
-        message.content.some(block => block?.type !== "text" || typeof block.text !== "string"))) {
-        throw new UnsupportedContent("a non-text system/developer message")
+      if (typeof message.content !== "string") {
+        if (!Array.isArray(message.content)) throw new UnsupportedContent("a non-text system/developer message")
+        for (const block of message.content) {
+          if (block?.type === "text" && typeof block.text === "string") continue
+          if (block?.type === "tool_addition" || block?.type === "tool_removal") continue
+          if (block && typeof block.type === "string" && block.type !== "text") {
+            throw new UnsupportedContent(`a non-text system/developer content block of type ${JSON.stringify(block.type)}`)
+          }
+          throw new UnsupportedContent("a non-text system/developer message")
+        }
       }
     } else if (message.role === "user") {
       if (Array.isArray(message.content)) {
         for (const block of message.content) {
           if (block?.type === "tool_result") toolResult(block)
-          else if (block?.type === "image") imageContent(block)
+          else if (block?.type === "image") parseUserImage(block)
           else if (block?.type === "text" || typeof block === "string") continue
+          else if (block?.type === "image") parseUserImage(block)
+          else if (block?.type === "document") parseUserDocumentText(block)
+          else if (block?.type === "search_result") parseSearchResultText(block)
           else blockText(block)
         }
       } else if (typeof message.content !== "string") {
@@ -1770,6 +2327,11 @@ function toolResult(block) {
   } else if (Array.isArray(block.content)) {
     content = block.content.map((part) => {
       if (part?.type === "text" && typeof part.text === "string") return { type: "text", text: part.text }
+      if (part?.type === "tool_reference" && typeof part.tool_name === "string") {
+        return { type: "text", text: `Loaded tool: ${part.tool_name}` }
+      }
+      if (part?.type === "document") return { type: "text", text: parseUserDocumentText(part) }
+      if (part?.type === "search_result") return { type: "text", text: parseSearchResultText(part) }
       if (part?.type === "image" && part.source?.type === "base64" && part.source.data) {
         return {
           type: "image",
@@ -1792,13 +2354,34 @@ function extractToolResults(body) {
     ? message.content.filter(block => block?.type === "tool_result") : [])
 }
 
-// Forward complete protocol-generated context notices without turning ordinary
-// user instructions into tool output. OpenCode can append a <system-update>
-// after a tool result when its dynamic tool catalog changes.
-function withContextNotices(results, body) {
-  const notices = []
+function isSkillResult(item) {
+  if (item.call?.name === "Skill") return true
+  const first = item.result?.content?.[0]
+  return first?.type === "text" &&
+    /^(?:Launching skill|Loaded skill instructions \(read-only\)): /.test(first.text || "")
+}
+
+function appendResultPart(results, index, part) {
+  if (index < 0 || index >= results.length) {
+    throw new UnsupportedContent("text beside a live tool_result; no matching tool companion")
+  }
+  const target = index
+  const targetCall = results[target]?.call
+  return results.map((item, i) => (targetCall ? item.call !== targetCall : i !== target) ? item : {
+    ...item,
+    result: {
+      ...item.result,
+      content: [...item.result.content, part],
+    },
+  })
+}
+
+function appendResultText(results, index, text) {
+  return appendResultPart(results, index, { type: "text", text })
+}
+
+function isInterruptedToolTurn(body) {
   let seenResult = false
-  const contextNotice = /<system-update(?:\s[^>]*)?>[\s\S]*?<\/system-update>|(?:\[SYSTEM NOTIFICATION - NOT USER INPUT\][^<]*)?<task-notification>[\s\S]*?<\/task-notification>/g
   for (const message of trailingMessages(body).messages) {
     const blocks = Array.isArray(message.content) ? message.content : [message.content]
     for (const block of blocks) {
@@ -1806,25 +2389,192 @@ function withContextNotices(results, body) {
         seenResult = true
         continue
       }
-      const text = blockText(block)
-      if (!seenResult && text.trim()) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      if (block?.type === "image") {
+        if (!seenResult) return false
+        continue
       }
-      notices.push(...Array.from(text.matchAll(contextNotice), match => match[0]))
-      const rest = text.replace(contextNotice, "").replace(/<\/?system-reminder(?:\s[^>]*)?>/g, "").trim()
-      if (/The user sent (?:a new message while you were working|the following message):/.test(rest) ||
-        (rest && !/^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining)$/.test(rest) &&
-        !/^[A-Z][A-Za-z]+(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/.test(rest))) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      const text = stripMagpiePlaceholderNotice(blockText(block))
+      if (!seenResult && message.role === "user" && text.trim()) return false
+      if (seenResult && message.role === "user" &&
+        /^\[Request interrupted by user(?:\s+for tool use)?\]\s*$/.test(text)) {
+        return true
       }
     }
   }
-  if (!notices.length) return results
-  const last = results.at(-1)
-  return [...results.slice(0, -1), { ...last, result: {
-    ...last.result,
-    content: [...last.result.content, { type: "text", text: `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>` }],
-  } }]
+  return false
+}
+
+const NOTICE_TAG_NAMES = "system-update|teammate-message|agent-message|cross-session-message|coordinator-relay|channel|ide_opened_file|ide_selection|mcp-resource|mcp-resource-update|mcp-polling-update|post-tool-use-hook|user-prompt-submit-hook"
+const CONTEXT_NOTICE_RE = new RegExp(
+  `<(${NOTICE_TAG_NAMES})(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1>|(?:\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\][^<]*)?<task-notification>[\\s\\S]*?<\\/task-notification>`,
+  "g",
+)
+const SYSTEM_REMINDER_RE = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder(?:\s[^>]*)?>/g
+const PROTOCOL_NOTICE_START_RE = new RegExp(
+  `^(?:<(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b|\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\])`,
+)
+const UNCLOSED_NOTICE_RE = new RegExp(
+  `<\\/?(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b`,
+)
+
+// Forward complete protocol-generated context notices, Claude Code hook outputs,
+// and tool-companion blocks without turning arbitrary inline user instructions
+// into MCP function_response text. Mid-turn queued_command prompts and follow-up
+// user instructions after a rejected/stopped tool call set userSteered so the
+// bridge replays them via session/prompt.
+function inspectToolTurn(results, body) {
+  let out = results
+  let userSteered = false
+  const notices = []
+  let seenResult = false
+  let resultIndex = -1
+  const stoppedByHookOrUser = out.some((item) => item.result?.isError &&
+    /^(?:The user doesn't want to proceed with this tool use\.|User rejected tool use\b|Operation stopped by hook\b|Execution stopped by hook\b|Blocked by PreToolUse hook\b|Hook PreToolUse:\S+ denied\b|API Error: Request was aborted\.|\[Request interrupted by user\b)/.test(resultText(item.result).trim()))
+  const userInterruption = /(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):/
+  const nonUserSourceNotice = /^\[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT\]\s*\n/
+  const skillCompanion = /^\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) /
+  const imageCompanion = /^\[Image(?: source)?: [^\r\n]+\]$/
+  const toolLoadedCompanion = /^Tools? loaded\.(?:\n\[id:[^\]\n]+\])*$/
+  const loopNotice = /^\[\d+ prior \/loop wakeups? found nothing actionable; loop is healthy\.\]$/
+  const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining|USD budget: \$\S+; \$\S+ remaining|Output tokens \u2014 turn: [^\r\n]+)$/
+  const hookBoilerplateNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook success:\s*(?:Success)?\s*$/
+  const hookOutput = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
+  const hookStoppedContinuation = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook stopped continuation:/
+  const claudeMetaFeedback = /^(?:(?:Stop|SubagentStop|TeammateIdle|TaskCreated|TaskCompleted|PermissionRequest|PermissionDenied|PreCompact|PostCompact|Elicitation|ElicitationResult|ConfigChange|CwdChanged|FileChanged|WorktreeCreate|WorktreeRemove|InstructionsLoaded) hook feedback:\n[\s\S]+|UserPromptSubmit operation blocked by hook:\n[\s\S]+|The PermissionDenied hook indicated you may retry this tool call\.|The turn did not end: a tool call in your last message asked to end it, but another call in that message failed\.[\s\S]*|Your response above was stopped by a safety classifier \u2014 this is not a tool or API error\.[\s\S]*|The previous response failed to produce a valid tool call\. Please retry the tool call now\.|Your tool call was malformed and could not be parsed\. Please retry\.|Output token limit hit[\s\S]*|Your response (?:was cut off|above was cut off)[\s\S]*|\[Your previous response (?:had no visible output|reached the output limit)[\s\S]*\]|\[structured-output-enforce\][\s\S]*|\[projects-reply-gate\][\s\S]*|Linked in your reply but not sent:[\s\S]*|Goal check-in: \u00ab[\s\S]*)$/
+  const isNoise = (value) => !value || tokenNoise.test(value) || hookBoilerplateNoise.test(value)
+  for (const message of trailingMessages(body).messages) {
+    const blocks = Array.isArray(message.content) ? message.content : [message.content]
+    for (const block of blocks) {
+      if (block?.type === "tool_result") {
+        seenResult = true
+        resultIndex = out.findIndex(item => item.block?.tool_use_id === block.tool_use_id)
+        continue
+      }
+      if (block?.type === "image") {
+        if (!seenResult) {
+          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        }
+        out = appendResultPart(out, resultIndex, parseUserImage(block))
+        continue
+      }
+      const rawText = blockText(block)
+      if (!seenResult && message.role === "user" && rawText.trim()) {
+        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+      const text = stripMagpiePlaceholderNotice(rawText)
+      if (text !== rawText && !notices.includes(MAGPIE_PLACEHOLDER_NOTICE)) {
+        notices.push(MAGPIE_PLACEHOLDER_NOTICE)
+      }
+      const trimmed = text.trim()
+      if (!trimmed) continue
+      const preceding = out[resultIndex]
+      const skillIndex = preceding && isSkillResult(preceding) ? resultIndex : -1
+      const imageIndex = preceding?.result?.content?.some(part => part?.type === "image") ? resultIndex : -1
+      const toolSearchIndex = preceding?.call?.name === "ToolSearch" ? resultIndex : -1
+      if (message.role === "user" && skillCompanion.test(text)) {
+        out = appendResultText(out, skillIndex, text)
+        continue
+      }
+      if (message.role === "user") {
+        if (extractQueuedPrompt(trimmed) !== null) {
+          userSteered = true
+          continue
+        }
+        if (nonUserSourceNotice.test(trimmed) && !/<task-notification\b/.test(trimmed)) {
+          const check = trimmed.replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+          if (UNCLOSED_NOTICE_RE.test(check)) {
+            throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+          }
+          notices.push(trimmed)
+          continue
+        }
+        if (imageCompanion.test(trimmed)) {
+          out = appendResultText(out, imageIndex, trimmed)
+          continue
+        }
+        if (toolLoadedCompanion.test(trimmed)) {
+          out = appendResultText(out, toolSearchIndex, trimmed)
+          continue
+        }
+        if (loopNotice.test(trimmed)) {
+          notices.push(trimmed)
+          continue
+        }
+        if (skillIndex >= 0 && /^#{1,6}\s+[^\r\n]*\b(?:skill|instructions)\b/i.test(trimmed) &&
+          !isNoise(trimmed) && !PROTOCOL_NOTICE_START_RE.test(trimmed) &&
+          !userInterruption.test(trimmed) && !hookOutput.test(trimmed) && !claudeMetaFeedback.test(trimmed)) {
+          out = appendResultText(out, skillIndex, text)
+          continue
+        }
+      }
+      notices.push(...Array.from(text.matchAll(CONTEXT_NOTICE_RE), (match) => match[0]))
+      const withoutNotices = text.replace(CONTEXT_NOTICE_RE, "")
+      for (const match of withoutNotices.matchAll(SYSTEM_REMINDER_RE)) {
+        const inner = match[1].trim()
+        if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) {
+          userSteered = true
+          continue
+        }
+        if (!isNoise(inner)) notices.push(inner)
+      }
+      const rest = withoutNotices.replace(SYSTEM_REMINDER_RE, "").trim()
+      if (UNCLOSED_NOTICE_RE.test(rest)) {
+        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+      }
+      if (message.role === "system" || message.role === "developer") {
+        if (extractQueuedPrompt(rest) !== null || userInterruption.test(rest)) {
+          userSteered = true
+        } else if (!isNoise(rest)) {
+          notices.push(rest)
+        }
+      } else if (!isNoise(rest)) {
+        if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
+          notices.push(rest)
+        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item))) {
+          userSteered = true
+        } else {
+          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        }
+      }
+    }
+  }
+  const finalResults = notices.length
+    ? appendResultText(out, out.length - 1, `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>`)
+    : out
+  return { results: finalResults, userSteered }
+}
+
+function withContextNotices(results, body) {
+  return inspectToolTurn(results, body).results
+}
+
+// When a previous tool-result HTTP request failed or was aborted before producing
+// an assistant message, and the user subsequently enters a new standalone user
+// message after the tool_result message, replay in a fresh session instead of
+// wedging the conversation with HTTP 400.
+function canReplayFollowUpAfterResults(body, rawResults) {
+  const { history, messages } = trailingMessages(body)
+  let lastResultIndex = -1
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    if (message.role === "user" && Array.isArray(message.content) &&
+      message.content.some((block) => block?.type === "tool_result")) {
+      lastResultIndex = i
+    }
+  }
+  if (lastResultIndex < 0 || lastResultIndex >= messages.length - 1) return false
+  const tail = messages.slice(lastResultIndex + 1)
+  if (!tail.some((message) => message.role === "user")) return false
+  try {
+    withContextNotices(rawResults, { ...body, messages: [...history, ...messages.slice(0, lastResultIndex + 1)] })
+  } catch {
+    return false
+  }
+  for (const message of tail) {
+    const rest = messageText(message).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "")
+    if (UNCLOSED_NOTICE_RE.test(rest)) return false
+  }
+  return true
 }
 
 function namedWorkDirectory(body, init) {
@@ -1832,9 +2582,10 @@ function namedWorkDirectory(body, init) {
   if (raw) {
     try { return decodeURIComponent(raw) } catch { return raw }
   }
+  const firstAssistant = body.messages.findIndex((message) => message.role === "assistant")
+  const opening = firstAssistant < 0 ? body.messages : body.messages.slice(0, firstAssistant)
   const texts = []
-  for (const message of [{ role: "system", content: body.system }, ...body.messages]) {
-    if (message.role === "assistant") continue
+  for (const message of [{ role: "system", content: body.system }, ...opening]) {
     if (typeof message.content === "string") texts.push(message.content)
     else if (Array.isArray(message.content)) {
       for (const block of message.content) if (block?.type === "text") texts.push(block.text || "")
@@ -1852,9 +2603,16 @@ function namedWorkDirectory(body, init) {
 }
 
 function workDirectory(directory) {
-  if (!directory || !path.isAbsolute(directory)) return null
+  if (!directory) return null
+  let candidate = directory
+  if (process.platform === "win32" && candidate.startsWith("/")) {
+    const wsl = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/.exec(candidate)
+    if (!wsl) return null
+    candidate = `${wsl[1].toUpperCase()}:\\${(wsl[2] || "").replace(/\//g, "\\")}`
+  }
+  if (!path.isAbsolute(candidate)) return null
   try {
-    if (fs.statSync(directory).isDirectory()) return path.resolve(directory)
+    if (fs.statSync(candidate).isDirectory()) return path.resolve(candidate)
   } catch {}
   return null
 }
@@ -2157,10 +2915,140 @@ function makeAnthropicStream(proc, turn, body, msgId, signal) {
   })
 }
 
+function estimateTextTokens(text) {
+  if (!text) return 0
+  let ascii = 0
+  let nonAsciiBytes = 0
+  const buf = Buffer.from(String(text), "utf8")
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] < 0x80) ascii++
+    else nonAsciiBytes++
+  }
+  return Math.ceil(ascii / 4 + nonAsciiBytes / 3)
+}
+
+function estimateInputTokens(body) {
+  let total = 0
+  let images = 0
+  const walk = (value) => {
+    if (value == null) return
+    if (typeof value === "string") {
+      total += estimateTextTokens(value)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item)
+      return
+    }
+    if (typeof value === "object") {
+      if (value.type === "image" && value.source?.type === "base64") {
+        images++
+        return
+      }
+      for (const [key, item] of Object.entries(value)) {
+        if (key === "cache_control" || key === "signature") continue
+        walk(item)
+      }
+    }
+  }
+  walk(body.system)
+  walk(body.messages)
+  if (Array.isArray(body.tools) && body.tools.length) {
+    total += estimateTextTokens(JSON.stringify(body.tools))
+  }
+  return Math.max(1, total + images * 1600)
+}
+
+async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let message = {
+    id: fallbackId,
+    type: "message",
+    role: "assistant",
+    model: fallbackModel,
+    content: [],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 0, output_tokens: 0 },
+  }
+  const blocks = new Map()
+  let streamError = null
+
+  const processBlock = (raw) => {
+    let eventName = ""
+    let dataLine = ""
+    for (const line of raw.split("\n")) {
+      if (line.startsWith("event:")) eventName = line.slice(6).trim()
+      else if (line.startsWith("data:")) dataLine += line.slice(5).trim()
+    }
+    if (!dataLine) return
+    let payload
+    try { payload = JSON.parse(dataLine) } catch { return }
+    if (eventName === "message_start" && payload.message) {
+      message = { ...message, ...payload.message, content: [] }
+    } else if (eventName === "content_block_start" && payload.content_block) {
+      blocks.set(payload.index, { ...payload.content_block, _json: "" })
+    } else if (eventName === "content_block_delta" && payload.delta) {
+      const current = blocks.get(payload.index)
+      if (!current) return
+      if (payload.delta.type === "text_delta") current.text = (current.text || "") + (payload.delta.text || "")
+      else if (payload.delta.type === "thinking_delta") current.thinking = (current.thinking || "") + (payload.delta.thinking || "")
+      else if (payload.delta.type === "signature_delta") current.signature = payload.delta.signature
+      else if (payload.delta.type === "input_json_delta") current._json += payload.delta.partial_json || ""
+    } else if (eventName === "content_block_stop") {
+      const current = blocks.get(payload.index)
+      if (!current) return
+      blocks.delete(payload.index)
+      if (current.type === "tool_use" && current._json) {
+        try { current.input = JSON.parse(current._json) } catch {}
+      }
+      delete current._json
+      message.content.push(current)
+    } else if (eventName === "message_delta") {
+      if (payload.delta?.stop_reason !== undefined) message.stop_reason = payload.delta.stop_reason
+      if (payload.delta?.stop_sequence !== undefined) message.stop_sequence = payload.delta.stop_sequence
+      if (payload.usage) message.usage = { ...message.usage, ...payload.usage }
+    } else if (eventName === "error") {
+      streamError = payload.error || { type: "api_error", message: "stream error" }
+    }
+  }
+
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let boundary
+    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      processBlock(frame)
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) processBlock(buffer)
+
+  if (streamError) {
+    const status = streamError.type === "rate_limit_error" ? 429 : 502
+    return new Response(JSON.stringify({ type: "error", error: streamError }), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    })
+  }
+  return new Response(JSON.stringify(message), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  })
+}
+
 function streamResponse(proc, turn, body, signal) {
   turn.attach()
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
   const stream = makeAnthropicStream(proc, turn, body, msgId, signal)
+  if (body.stream === false) {
+    return jsonResponseFromStream(stream, body.model, msgId)
+  }
   return new Response(stream, {
     status: 200,
     headers: {
@@ -2210,7 +3098,30 @@ export const AntigravityBridgePlugin = async () => {
         return {
           baseURL: "agy://local",
           apiKey: "agy",
-          fetch: async (fetchInput, init) => {
+          fetch: async (fetchInput, init = {}) => {
+            const requestUrl = typeof fetchInput === "string"
+              ? fetchInput
+              : fetchInput instanceof URL
+                ? fetchInput.href
+                : fetchInput?.url || ""
+            if (/\/count[_-]tokens(?:$|[/?#])/i.test(requestUrl)) {
+              try {
+                const raw = init.body != null
+                  ? (typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body))
+                  : (typeof fetchInput?.text === "function" ? await fetchInput.text() : "")
+                const parsed = JSON.parse(raw)
+                if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.messages)) {
+                  return jsonError(400, "invalid count_tokens request")
+                }
+                return new Response(JSON.stringify({ input_tokens: estimateInputTokens(parsed) }), {
+                  status: 200,
+                  headers: { "Content-Type": "application/json" },
+                })
+              } catch (error) {
+                return jsonError(400, error.message)
+              }
+            }
+
             const agy = findAgy()
             if (!agy) return jsonError(503, "agy CLI not found on this machine")
             let body
@@ -2223,12 +3134,13 @@ export const AntigravityBridgePlugin = async () => {
             }
 
             const rawModel = body.model || ""
-            const requestedModel = rawModel.includes("/") ? rawModel.split("/").pop() : rawModel
+            const requestedModel = (rawModel.includes("/") ? rawModel.split("/").pop() : rawModel).replace(/\[1m\]$/i, "")
             body = { ...body, model: requestedModel }
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
             const convKey = conversationKey(body)
-            const isFresh = body.messages.length <= 1
+            const trailing = trailingMessages(body)
+            const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
             const callerWorkDir = namedWorkDirectory(body, init)
             const workDir = workDirectory(callerWorkDir)
@@ -2250,16 +3162,37 @@ export const AntigravityBridgePlugin = async () => {
                   }
                   if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
                   if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
-                  const results = withContextNotices(matches.map(({ block, match }) => ({
+                  const rawResults = matches.map(({ block, match }) => ({
                     block,
                     call: match.call,
                     result: toolResult(block),
-                  })), body)
-                  proc.validateResults(results)
-                  if (!proc.matchesHistory(trailingMessages(body).history) || proc.workDir !== workDir ||
-                    proc.instructions !== instructions) {
-                    // A changed context needs a new session. Replay the real
-                    // results without resolving the old process's calls.
+                  }))
+                  proc.validateResults(rawResults)
+                  let interrupted = isInterruptedToolTurn(body)
+                  let results = rawResults
+                  if (!interrupted) {
+                    try {
+                      const inspected = inspectToolTurn(rawResults, body)
+                      results = inspected.results
+                      if (inspected.userSteered) interrupted = true
+                    } catch (error) {
+                      if (error instanceof UnsupportedContent && canReplayFollowUpAfterResults(body, rawResults)) {
+                        interrupted = true
+                      } else {
+                        throw error
+                      }
+                    }
+                  }
+                  if (!interrupted) proc.validateResults(results)
+                  const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
+                  const historyMatches = directIdsMatch
+                    ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
+                    : proc.matchesHistory(trailingMessages(body).history)
+                  if (interrupted || !historyMatches ||
+                    proc.workDir !== workDir || proc.instructions !== instructions) {
+                    // A changed context or user-interrupted tool turn needs a new
+                    // session. Replay the real results without resolving the old
+                    // process's calls.
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()
@@ -2279,17 +3212,25 @@ export const AntigravityBridgePlugin = async () => {
                 }
               }
 
-              const proc = await acquireProc(
+              const { proc, history } = await acquireProc(
                 agy,
                 convKey,
-                { model, selection, tools, workDir, instructions, history: body.messages.slice(0, -1) },
+                { model, selection, tools, workDir, instructions, history: trailing.history, messages: body.messages },
                 isFresh,
                 resultBlocks.length > 0,
               )
-              const content = proc.hasSentFirstTurn
-                ? renderContinuedTurn(body)
-                : renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession)
-              const turn = proc.startTurn(content, body.messages, model, selection)
+              const baseParts = proc.hasSentFirstTurn
+                ? renderContinuedTurnParts(body.messages.slice(history.length))
+                : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession)
+              const contentParts = mergePromptParts(baseParts, outputFormatReminder(body))
+              if (promptHasImage(contentParts) && !proc.supportsImages) {
+                if (!proc.hasSentFirstTurn) {
+                  dropFromPool(proc)
+                  await proc.stop().catch(() => {})
+                }
+                throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
+              }
+              const turn = proc.startTurn(contentParts, body.messages, model, selection)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
               return jsonError(error.statusCode ?? 502, error.message)

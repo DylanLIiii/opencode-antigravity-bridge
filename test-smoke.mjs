@@ -2004,6 +2004,182 @@ for (const location of ["inline", "system", "developer", "user"]) {
   }
 }
 
+// Stale-turn regressions use the same ACP/MCP fake and public fetch path above.
+{
+  const events = []
+  const replies = []
+  const { Socket } = await import("node:net")
+  const end = Socket.prototype.end
+  Socket.prototype.end = function (data, ...args) {
+    if (String(data).includes("was superseded")) replies.push(JSON.parse(String(data)))
+    return end.call(this, data, ...args)
+  }
+  const write = process.stderr.write
+  process.stderr.write = function (chunk, ...args) {
+    if (String(chunk).startsWith("[agy-bridge] ")) events.push(JSON.parse(String(chunk).slice(13)))
+    return write.call(this, chunk, ...args)
+  }
+  try {
+    const first = { model, metadata: { user_id: "lineage-sibling" }, system: "lineage system",
+      messages: [{ role: "user", content: "main before recap" }], tools: [echoTool] }
+    const base = (await readSSE(await callFetch(first))).events
+    const recap = nextTurn(first, base, "PARALLEL recap branch")
+    const orphan = (await readSSE(await callFetch(recap))).events
+    const old = inits().at(-1)
+    for (let attempt = 0; attempt < 20 && logs().filter(event => event.type === "mcpPending" && event.convId === old.convId).length < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 5))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    check("lineage fixture leaves concurrent orphan calls pending", toolCalls(orphan).length >= 1 && logs().filter(event => event.type === "mcpPending" && event.convId === old.convId).length === 2)
+    const before = inits().length
+    const response = await callFetch(nextTurn(first, base, "continue main without recap"))
+    const final = response.status === 200 ? (await readSSE(response)).events : []
+    if (response.status !== 200) await response.text()
+    check("lineage sibling prompt supersedes orphan instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+    check("lineage replacement replays only the client's branch", inits().length === before + 1 && lastOf("user").convId !== old.convId && lastOf("user").text.includes("continue main without recap") && !lastOf("user").text.includes("PARALLEL recap branch"))
+    const forks = events.filter(event => event.action === "superseded" && event.reason === "lineage_fork")
+    check("lineage supersession emits one content-free event", forks.length === 1 && !!forks[0].superseded_turn_id && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"))
+    check("lineage supersession stops the old process and forgets its parked session", !fs.existsSync(old.cwd) && !fs.readFileSync(bridgeStateFile, "utf8").includes(old.convId))
+    check("all orphan MCP sockets receive an explicit superseded error", replies.length === 2 && replies.every(reply => reply.result?.isError === true))
+    // Keep the original call alive long enough to clean up on the negative run.
+    if (response.status !== 200) await drive(recap, orphan, "cleanup orphan")
+  } finally { process.stderr.write = write; Socket.prototype.end = end }
+}
+
+{
+  const hook = "Opening hook context. ".repeat(1600)
+  const inline = { model, metadata: { user_id: "layout-flip" }, system: "base system",
+    messages: [{ role: "system", content: [{ type: "text", text: hook }] },
+      { role: "user", content: "TOOL layout continuation" }], tools: [echoTool], stream: false }
+  // Non-streaming fallback hoists exactly the same context with a different separator.
+  const hoisted = { ...inline, system: "base system\n" + hook, messages: inline.messages.slice(1) }
+  const before = inits().length
+  const response = await callFetch(hoisted)
+  const message = await response.json()
+  const owner = inits().at(-1).convId
+  check("layout fixture returns non-streaming tool_use", response.status === 200 && message.stop_reason === "tool_use")
+  const followup = { ...inline, stream: true, messages: [...inline.messages,
+    { role: "assistant", content: message.content }, { role: "user", content: message.content
+      .filter(block => block.type === "tool_use").map(block => ({ type: "tool_result", tool_use_id: block.id, content: "layout result" })) }] }
+  const result = await callFetch(followup)
+  const final = result.status === 200 ? (await readSSE(result)).events : []
+  if (result.status !== 200) await result.text()
+  check("inline and hoisted layouts continue the same tool turn", result.status === 200 && stopOf(final) === "end_turn" && inits().length === before + 1 && lastOf("user").convId === owner)
+  check("layout flip performs only the original full prompt", logs().filter(event => event.type === "user" && event.convId === owner).length === 1)
+}
+
+{
+  const orphan = { type: "tool_use", id: "toolu_lost_after_restart", name: "echo", input: { text: "old" } }
+  const body = { model, metadata: { user_id: "esc-orphan" }, messages: [
+    { role: "user", content: "a previous task" },
+    { role: "assistant", content: [orphan] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: orphan.id, content: "orphan result preserved" },
+      { type: "text", text: "[Request interrupted by user]" }, { type: "text", text: "continue now" }] },
+  ], tools: [echoTool] }
+  const response = await callFetch(body)
+  const final = response.status === 200 ? (await readSSE(response)).events : []
+  if (response.status !== 200) await response.text()
+  check("Esc plus an orphan result replays as a fresh prompt instead of 409", response.status === 200 && stopOf(final) === "end_turn")
+  check("Esc replay preserves the orphan result and the new instruction", lastOf("user").text.includes("orphan result preserved") && lastOf("user").text.includes("continue now"))
+}
+
+{
+  const body = { model, metadata: { user_id: "unknown-tool-result" }, messages: [
+    { role: "user", content: "incomplete history" },
+    { role: "assistant", content: "there was no tool call" },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_never_issued", content: "unknown result" }] },
+  ] }
+  const before = inits().length
+  const responses = await Promise.all([callFetch(body), callFetch(body)])
+  const payloads = await Promise.all(responses.map(response => response.text()))
+  check("permanent orphan conflicts are 400 with x-should-retry false", responses.every(response => response.status === 400 && response.headers.get("x-should-retry") === "false"))
+  check("permanent conflict retries return the same structured error", payloads[0] === payloads[1] && JSON.parse(payloads[0]).error?.code === "tool_history_incomplete")
+  check("permanent conflicts never start an agy process", inits().length === before)
+}
+
+{
+  const body = { model, metadata: { user_id: "pending-lineage-conflict" },
+    messages: [{ role: "user", content: "TOOL pending ownership" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(body))).events
+  const before = inits().length
+  const partial = continuation(body, pending, "known result")
+  partial.messages.at(-1).content.push({ type: "tool_result", tool_use_id: "toolu_partial_unknown", content: "unknown" })
+  const retryable = await callFetch(partial)
+  check("partial matches retain upstream 409 without a no-retry header", retryable.status === 409 && retryable.headers.get("x-should-retry") === null)
+  await retryable.text()
+  const unmatched = { ...body, messages: [...body.messages,
+    { role: "assistant", content: [{ type: "text", text: "a different recorded response" },
+      { type: "tool_use", id: "toolu_unmatched_lineage", name: "echo", input: { text: "different" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_unmatched_lineage", content: "unmatched" }] },
+  ] }
+  const live = await callFetch(unmatched)
+  check("unmatched results alone cannot supersede an unexpired tool owner", live.status === 409 && live.headers.get("x-should-retry") === null && inits().length === before)
+  await live.text()
+  const conflict = nextTurn(body, pending, "no result for this pending call")
+  const response = await callFetch(conflict)
+  const error = await response.json()
+  check("a request carrying the pending call without its result is terminal", response.status === 400 && response.headers.get("x-should-retry") === "false" && error.error?.code === "tool_state_conflict")
+  const done = await drive(body, pending, "real result after conflict")
+  check("terminal lineage conflicts leave the original tool turn usable", inits().length === before && stopOf(done.events) === "end_turn")
+}
+
+{
+  // The existing LONGTOOL fake repeats identical calls until told to stop.
+  // Speed up its MCP deadline, keeping the production default repeat cap of 8.
+  process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "25"
+  const body = { model, metadata: { user_id: "bounded-self-poll" },
+    messages: [{ role: "user", content: "LONGTOOL orphan poll regression" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(body))).events
+  const old = inits().at(-1)
+  for (let attempt = 0; attempt < 100 && fs.existsSync(old.cwd); attempt++) await new Promise(resolve => setTimeout(resolve, 10))
+  delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+  const replies = logs().filter(event => event.type === "mcpResult" && event.convId === old.convId)
+  const notes = replies.filter(event => /still running/.test(event.result?.content?.[0]?.text || ""))
+  check("self polling stops after the default eight still-running replies", notes.length === 8 && !fs.existsSync(old.cwd), `${notes.length} replies`)
+  // A real tool's late result can still be replayed after the bounded wait.
+  const late = continuation(body, pending, "actual long tool result")
+  late.messages.at(-1).content.push({ type: "text", text: "[Request interrupted by user]" })
+  const response = await callFetch(late)
+  const final = response.status === 200 ? (await readSSE(response)).events : []
+  if (response.status !== 200) await response.text()
+  check("late real results survive bounded self-poll reclamation", response.status === 200 && lastOf("user").text.includes("actual long tool result"))
+  if (stopOf(final) === "tool_use") await drive(late, final, "cleanup late replay")
+}
+
+{
+  // Advance only the bridge's wall clock; ACP/MCP still uses the upstream fake.
+  // Keep its tool deadline above 20 minutes so this exercises the self-poll
+  // idle limit, not the independent tool-result timeout.
+  const savedToolTimeout = process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = String(30 * 60 * 1000)
+  process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "100"
+  const { default: idleDefault } = await import("./index.mjs?self-poll-idle")
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = savedToolTimeout
+  const idleLoader = await (await idleDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const events = []
+  const write = process.stderr.write
+  const now = Date.now
+  process.stderr.write = function (chunk, ...args) {
+    if (String(chunk).startsWith("[agy-bridge] ")) events.push(JSON.parse(String(chunk).slice(13)))
+    return write.call(this, chunk, ...args)
+  }
+  try {
+    const response = await idleLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify({
+      model, metadata: { user_id: "self-poll-idle-deadline" }, tools: [echoTool],
+      messages: [{ role: "user", content: "LONGTOOL idle deadline" }],
+    }) })
+    const pending = (await readSSE(response)).events
+    const old = inits().at(-1)
+    Date.now = () => now() + 20 * 60 * 1000 + 1
+    for (let attempt = 0; attempt < 100 && fs.existsSync(old.cwd); attempt++) await new Promise(resolve => setTimeout(resolve, 10))
+    const cap = events.find(event => event.reason === "self_poll_cap")
+    check("twenty minutes of client inactivity beats the self-poll count cap", toolCalls(pending).length === 1 && cap?.self_poll_repeats === 1 && cap.client_idle_ms >= 20 * 60 * 1000 && !fs.existsSync(old.cwd))
+    check("agy traffic does not reset the client inactivity clock", cap?.client_idle_ms >= 20 * 60 * 1000)
+  } finally {
+    Date.now = now
+    process.stderr.write = write
+    delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+  }
+}
+
 try { fs.unlinkSync(fakeAgy) } catch {}
 try { fs.unlinkSync(wrapper) } catch {}
 try { fs.unlinkSync(logPath) } catch {}

@@ -27,6 +27,11 @@ function ideCallDeadline() {
   return positiveTimeout(process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS, 150_000)
 }
 const CANCEL_SETTLE_MS = 15_000
+const RECLAIM_STOP_TIMEOUT_MS = 10_000
+const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the client conversation continued without it; stop this turn"
+const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
+const SELF_POLL_LIMIT = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_LIMIT, 8)
+const SELF_POLL_NOTE = "agy bridge: gave up waiting for this tool: the client never returned a result for it; stop this turn"
 const TOOL_LIST_WAIT_MS = 5_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
@@ -327,6 +332,15 @@ class BusyError extends Error {
   }
 }
 
+class ConflictError extends Error {
+  constructor(message, code) {
+    super(message)
+    this.statusCode = 400
+    this.code = code
+    this.noRetry = true
+  }
+}
+
 class UnsupportedContent extends Error {
   constructor(what) {
     super(`agy bridge: ${what} is not supported`)
@@ -499,6 +513,10 @@ class AcpConnection {
 class Turn {
   constructor(proc, messages) {
     this.proc = proc
+    this.turnId = "turn_" + randomBytes(6).toString("hex")
+    this.lastProgressAt = Date.now()
+    this.clientProgressAt = this.lastProgressAt
+    this.deadlineAt = null
     this.baseHistory = trailingMessages({ messages }).history.map((message) => ({ ...message }))
     this.events = []
     this.waiters = []
@@ -614,10 +632,18 @@ class Turn {
     if (this.finalized) throw new BusyError("agy bridge: this response has already completed")
     if (this.attached) throw new BusyError("agy bridge: this conversation already has an active response")
     this.attached = true
+    this.touchClient()
   }
 
   detach() {
+    const wasAttached = this.attached
     this.attached = false
+    if (wasAttached) this.touchClient()
+  }
+
+  touchClient() {
+    this.clientProgressAt = Date.now()
+    if (this.timer && !this.done && !this.finalized && this.hasPendingMcp()) this.rearm()
   }
 
   push(event) {
@@ -699,16 +725,24 @@ class Turn {
 
   // Inactivity timeout: agy output, or the client's tool result while one is pending.
   arm() {
+    this.lastProgressAt = Date.now()
+    this.rearm()
+  }
+
+  // Internal agy traffic cannot extend a detached client's tool wait window.
+  rearm() {
     clearTimeout(this.timer)
     if (this.done || this.finalized) return
     const waitingForTools = this.hasPendingMcp()
     const timeout = waitingForTools ? TOOL_RESULT_TIMEOUT_MS : TURN_TIMEOUT_MS
+    const now = Date.now()
+    this.deadlineAt = (waitingForTools && !this.attached ? this.clientProgressAt : now) + timeout
     this.timer = setTimeout(() => {
       const what = waitingForTools ? "waiting for a client tool result" : "reading agy output"
       this.proc.timeoutTurn(this, new Error(
         `agy bridge: timed out ${what} after ${timeout}ms; stderr tail: ${this.proc.stderrTail.trim() || "(empty)"}`,
       ))
-    }, timeout)
+    }, Math.max(0, this.deadlineAt - now))
     this.timer.unref?.()
   }
 }
@@ -1224,6 +1258,8 @@ class Proc {
       deferred: false,
       lateDelivered: false,
       deadline: null,
+      stillRunning: 0,
+      clientSeen: false,
     }
     turn.flushText()
     turn.calls.push(call)
@@ -1246,10 +1282,23 @@ class Proc {
   async #deferCall(turn, call) {
     if (call.mcpResponded || call.result || turn.done || turn.finalized) return
     call.deferred = true
+    call.stillRunning++
     this.#respondMcp(call, { result: { content: [{ type: "text", text: stillRunningText(call) }], isError: false } })
   }
 
-  // A repeat of a still-running call waits for the original instead of running again.
+  #selfPollCapped(turn, target) {
+    return !turn.attached && !turn.calls.some((call) => call.clientSeen) && (
+      Date.now() - turn.clientProgressAt >= SELF_POLL_IDLE_TIMEOUT_MS || target.stillRunning >= SELF_POLL_LIMIT
+    )
+  }
+
+  #capSelfPoll(turn, target, reply) {
+    reply({ content: [{ type: "text", text: SELF_POLL_NOTE }], isError: true })
+    logBridgeEvent(this, turn, "reclaim", "self_poll_cap", {}, { self_poll_repeats: target.stillRunning })
+    reclaimStaleTurn(this, turn, SELF_POLL_NOTE).catch(() => {})
+  }
+
+  // A repeat waits for the original result, without renewing the client clock.
   #acceptWait(turn, target, socket) {
     const reply = (result) => {
       try { socket.end(JSON.stringify({ result }) + "\n") } catch {}
@@ -1259,9 +1308,14 @@ class Proc {
       reply(target.result)
       return null
     }
+    if (this.#selfPollCapped(turn, target)) {
+      this.#capSelfPoll(turn, target, reply)
+      return null
+    }
     const waiter = { socket, target, reply, timer: null }
     waiter.timer = setTimeout(() => {
       turn.awaitCalls = turn.awaitCalls.filter((item) => item !== waiter)
+      target.stillRunning++
       reply({ content: [{ type: "text", text: stillRunningText(target) }], isError: false })
     }, ideCallDeadline())
     waiter.timer.unref?.()
@@ -1270,7 +1324,6 @@ class Proc {
       clearTimeout(waiter.timer)
       turn.awaitCalls = turn.awaitCalls.filter((item) => item !== waiter)
     })
-    turn.arm()
     return null
   }
 
@@ -1307,6 +1360,7 @@ class Proc {
   continueWith(results) {
     const turn = this.turn
     if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
+    turn.touchClient()
     for (const { call, result } of this.validateResults(results).values()) {
       clearTimeout(call.deadline)
       if (call.deferred) {
@@ -1342,14 +1396,16 @@ class Proc {
     clearTimeout(turn.cleanupTimer)
     for (const waiter of turn.awaitCalls.splice(0)) {
       clearTimeout(waiter.timer)
-      waiter.reply({ content: [{ type: "text", text: "agy bridge: response closed" }], isError: true })
+      waiter.reply({ content: [{ type: "text", text: turn.closeNote || "agy bridge: response closed" }], isError: true })
     }
     for (const call of turn.calls) {
       clearTimeout(call.deadline)
       if (call.id && toolCalls.get(call.id)?.call === call) toolCalls.delete(call.id)
       if (call.mcpSeen && !call.mcpResponded) {
         this.historyInvalid = true
-        this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
+        this.#respondMcp(call, turn.closeNote
+          ? { result: { content: [{ type: "text", text: turn.closeNote }], isError: true } }
+          : { error: { code: -32603, message: "agy bridge: response closed before the tool result arrived" } })
       }
     }
     if (this.turn === turn) {
@@ -1661,7 +1717,7 @@ function park(proc) {
     key: proc.convKey,
     sessionId: proc.sessionId,
     historyHash: digest(historyKey(proc.expectedMessages)),
-    instructionsHash: digest(proc.instructions),
+    instructionsHash: digest(compactIdentity(proc.instructions)),
     workDir: proc.workDir,
     at: Date.now(),
   })
@@ -1677,7 +1733,7 @@ function takeParked(convKey, opts) {
   unparked.add(convKey)
   saveParked()
   if (Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(opts.instructions) ||
+    entry.instructionsHash !== digest(compactIdentity(opts.instructions)) ||
     entry.historyHash !== digest(historyKey(opts.history))) return null
   return { sessionId: entry.sessionId, expectedMessages: opts.history }
 }
@@ -1729,51 +1785,183 @@ async function withAcquireLock(key, fn) {
 }
 
 async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
-  return withAcquireLock(convKey, async () => {
-    await evictIdle()
-    const existing = pool.get(convKey)
-    if (existing?.turn?.cancelRequested) {
-      await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+  return withAcquireLock(convKey, () => acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew))
+}
+
+// Caller holds the conversation lock; recovery must not acquire it recursively.
+async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
+  await evictIdle()
+  let existing = pool.get(convKey)
+  if (existing?.turn?.cancelRequested) {
+    await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
+  }
+  if (existing && !existing.dead && existing.turn) {
+    const lineage = lineageVerdict(existing, existing.turn, opts)
+    if (lineage === "fork") {
+      const orphan = existing.turn
+      logBridgeEvent(existing, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
+      await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
+      existing = null
+    } else if (lineage === "conflict") {
+      throw new ConflictError("agy bridge: this request carries the pending tool call but no matching result. Stop resending it; send the tool result or continue from the last self-consistent message.", "tool_state_conflict")
     }
-    if (existing) {
-      if (!existing.dead && existing.turn) {
-        throw new BusyError("agy bridge: this conversation still has an unfinished response")
-      }
-      let matchedHistory = opts.history
-      if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
-        Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
-        const k = existing.expectedMessages.length
-        if (k > matchedHistory.length && k <= opts.messages.length &&
-          existing.matchesHistory(opts.messages.slice(0, k))) {
-          matchedHistory = opts.messages.slice(0, k)
-        }
-      }
-      const compatible = !forceNew && !existing.dead && !existing.retiring &&
-        existing.workDir === opts.workDir && existing.instructions === opts.instructions &&
-        existing.matchesHistory(matchedHistory)
-      if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
-        await existing.updateTools(opts.tools)
-        return { proc: existing, history: matchedHistory }
-      }
-      existing.retiring = true
-      dropFromPool(existing)
-      await existing.stop().catch(() => {})
+  }
+  if (existing) {
+    if (!existing.dead && existing.turn) {
+      throw new BusyError("agy bridge: this conversation still has an unfinished response")
     }
-    while (allProcs.size >= MAX_PROCS) {
-      if (!(await evictLRU())) {
-        throw new BusyError(`agy bridge: ${MAX_PROCS} agy processes are running and all have unfinished responses`)
+    let matchedHistory = opts.history
+    if (!forceNew && !existing.dead && !existing.retiring && existing.unsentPrompt &&
+      Array.isArray(opts.messages) && Array.isArray(existing.expectedMessages)) {
+      const k = existing.expectedMessages.length
+      if (k > matchedHistory.length && k <= opts.messages.length &&
+        existing.matchesHistory(opts.messages.slice(0, k))) {
+        matchedHistory = opts.messages.slice(0, k)
       }
     }
-    const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
-    const proc = new Proc(agyPath, convKey, { ...opts, resume })
-    try {
-      await proc.start()
-    } catch (error) {
-      await proc.stop().catch(() => {})
-      throw error
+    const compatible = !forceNew && !existing.dead && !existing.retiring &&
+      existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
+      existing.matchesHistory(matchedHistory)
+    if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
+      await existing.updateTools(opts.tools)
+      return { proc: existing, history: matchedHistory }
     }
-    pool.set(convKey, proc)
-    return { proc, history: opts.history }
+    existing.retiring = true
+    dropFromPool(existing)
+    await existing.stop().catch(() => {})
+  }
+  while (allProcs.size >= MAX_PROCS) {
+    if (!(await evictLRU())) {
+      throw new BusyError(`agy bridge: ${MAX_PROCS} agy processes are running and all have unfinished responses`)
+    }
+  }
+  const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
+  const proc = new Proc(agyPath, convKey, { ...opts, resume })
+  try {
+    await proc.start()
+  } catch (error) {
+    await proc.stop().catch(() => {})
+    throw error
+  }
+  pool.set(convKey, proc)
+  return { proc, history: opts.history }
+}
+
+// Bounded, content-free events: never log prompts, arguments, results or tool IDs.
+const HOST_EPOCH = randomBytes(4).toString("hex")
+let eventWindowStart = 0
+let eventWindowCount = 0
+function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
+  if (process.env.AGY_BRIDGE_EVENTS === "0") return
+  const now = Date.now()
+  if (now - eventWindowStart >= 60_000) { eventWindowStart = now; eventWindowCount = 0 }
+  if (eventWindowCount++ >= 30) return
+  const row = {
+    event: "agy_bridge_tool_state", host_epoch: HOST_EPOCH, ts: now,
+    conv: digest(proc.convKey).slice(0, 12), turn_id: turn.turnId,
+    action, reason, attached: turn.attached, done: turn.done, dead: proc.dead,
+    pending: turn.calls.filter((call) => !call.result).length,
+    client_idle_ms: Math.max(0, now - (turn.clientProgressAt ?? turn.lastProgressAt)),
+    self_poll_repeats: turn.calls.reduce((max, call) => Math.max(max, call.stillRunning || 0), 0),
+    ...(meta.layout ? { layout: meta.layout, nonstream: meta.nonstream } : {}), ...extra,
+  }
+  try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
+}
+
+function staleTurnVerdict(proc, turn, now = Date.now()) {
+  if (!turn || turn.cancelRequested) return { stale: false, reason: "cancelling" }
+  if (turn.attached) return { stale: false, reason: "attached" }
+  if (turn.finalized || proc.dead || proc.stopping || turn.done) return { stale: true, reason: "finished" }
+  if (turn.deadlineAt != null && now >= turn.deadlineAt) return { stale: true, reason: "expired" }
+  return { stale: false, reason: "pending_tool" }
+}
+
+// A pending tool turn only owns its own line of history, not a sibling request
+// that continues its base without carrying any of the emitted tool calls.
+function lineageVerdict(proc, turn, opts) {
+  if (!turn || turn.attached || turn.cancelRequested || turn.done || turn.finalized) return null
+  if (proc.dead || proc.stopping || proc.retiring || !turn.hasPendingMcp()) return null
+  const history = opts.history
+  const base = turn.baseHistory
+  if (!Array.isArray(history) || history.length < base.length ||
+    historyKey(history.slice(0, base.length)) !== historyKey(base)) return null
+  const ids = new Set(turn.calls.map((call) => call.id))
+  const carried = (opts.messages || []).some((message) => Array.isArray(message?.content) &&
+    message.content.some((block) => block?.type === "tool_use" && ids.has(block.id)))
+  const expected = proc.expectedMessages
+  const recorded = Array.isArray(expected) && expected.length > base.length &&
+    history.length >= expected.length &&
+    historyKey(history.slice(0, expected.length)) === historyKey(expected)
+  // A renamed call with edited arguments still belongs to the old response.
+  // Keep upstream's 409 and its live owner intact rather than replaying it as
+  // a sibling conversation just because its inputs no longer compare equal.
+  const withoutInputs = (messages) => messages.map((message) => ({ ...message,
+    content: Array.isArray(message.content) ? message.content.map((block) =>
+      block?.type === "tool_use" ? { ...block, input: {} } : block) : message.content,
+  }))
+  if (!carried && !recorded && Array.isArray(expected) && expected.length > base.length &&
+    history.length === expected.length &&
+    historyKey(withoutInputs(history)) === historyKey(withoutInputs(expected))) return null
+  return carried || recorded ? "conflict" : "fork"
+}
+
+function replayHistoryProblem(body, resultBlocks) {
+  const calls = lastAssistantCalls(trailingMessages(body).history)
+  if (!calls.length) return "no_tool_use"
+  const ids = new Set()
+  for (const call of calls) {
+    if (typeof call.id !== "string" || !call.id || ids.has(call.id)) return "bad_tool_use_id"
+    ids.add(call.id)
+    if (typeof call.name !== "string" || !call.name) return "bad_tool_use_name"
+    const input = call.input ?? {}
+    if (!input || typeof input !== "object" || Array.isArray(input)) return "bad_tool_use_input"
+  }
+  const answered = new Set()
+  for (const block of resultBlocks) {
+    if (!ids.has(block.tool_use_id) || answered.has(block.tool_use_id)) return "unmatched_tool_result"
+    answered.add(block.tool_use_id)
+  }
+  return answered.size === ids.size ? null : "missing_tool_result"
+}
+
+async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn closed") {
+  turn.closeNote = note
+  proc.retiring = true
+  proc.historyInvalid = true
+  dropFromPool(proc)
+  unpark(proc.convKey)
+  turn.fail(new Error(note))
+  proc.abandonTurn(turn)
+  let timer
+  try {
+    await Promise.race([proc.stop().catch(() => {}), new Promise((resolve) => {
+      timer = setTimeout(resolve, RECLAIM_STOP_TIMEOUT_MS)
+      timer.unref?.()
+    })])
+  } finally { clearTimeout(timer) }
+}
+
+// Recheck under the same lock and start at most one replacement turn.
+async function recoverStaleTurn(ctx) {
+  return withAcquireLock(ctx.convKey, async () => {
+    const current = pool.get(ctx.convKey)
+    if (current !== ctx.proc || current?.turn !== ctx.turn) {
+      throw new ConflictError("agy bridge: this turn was already replaced. Stop resending this request.", "tool_state_conflict")
+    }
+    const verdict = staleTurnVerdict(current, ctx.turn)
+    // As in the local fix, lineage supersession belongs to acquisition of a
+    // new prompt. Unmatched results alone must not reclaim an unexpired owner.
+    if (!verdict.stale) return null
+    const reason = verdict.reason
+    logBridgeEvent(current, ctx.turn, "reclaim", reason, ctx.acquireOpts)
+    await reclaimStaleTurn(current, ctx.turn)
+    if (replayHistoryProblem(ctx.body, ctx.resultBlocks)) {
+      throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
+    }
+    const { proc, history } = await acquireProcLocked(ctx.agy, ctx.convKey, ctx.acquireOpts, ctx.isFresh, true)
+    const turn = await ctx.begin(proc, history)
+    logBridgeEvent(proc, turn, "replay_started", reason, ctx.acquireOpts)
+    return { proc, turn }
   })
 }
 
@@ -1912,6 +2100,7 @@ function historyKey(messages) {
 }
 
 function trailingMessages(body) {
+  body = canonicalBody(body)
   let start = body.messages.length
   while (start > 0 && body.messages[start - 1].role !== "assistant") start--
   return { history: body.messages.slice(0, start), messages: body.messages.slice(start) }
@@ -1952,9 +2141,33 @@ function systemText(body) {
   return typeof body.system === "string" ? body.system : body.system.map((block) => block.text || "").join("")
 }
 
+// Streaming clients may inline the opening system prompt, then hoist it into
+// `system` on a non-streaming retry. Trailing system notifications remain turn
+// content, as in the existing protocol; only the opening prefix is lifted.
+function canonicalBody(body) {
+  const messages = body?.messages
+  if (!Array.isArray(messages)) return body
+  let count = 0
+  while (count < messages.length && messages[count]?.role === "system") count++
+  if (!count || count === messages.length) return body
+  const parts = [systemText(body), ...messages.slice(0, count).map((message) =>
+    typeof message.content === "string" ? message.content : (message.content || [])
+      .map((block) => typeof block === "string" ? block : block?.type === "text" ? block.text || "" : "").join(""))]
+  return { ...body, system: parts.filter((text) => text.trim()).join("\n\n"), messages: messages.slice(count) }
+}
+
+function compactIdentity(text) {
+  return String(text ?? "").replace(/\s+/g, "")
+}
+
+function sameInstructions(a, b) {
+  return compactIdentity(a) === compactIdentity(b)
+}
+
 // The model is not part of the key: agy switches models inside a live session.
-function conversationKey(body) {
-  const system = historyKey([{ role: "system", content: body.system || "" }])
+function conversationKey(rawBody) {
+  const body = canonicalBody(rawBody)
+  const system = historyKey([{ role: "system", content: compactIdentity(systemText(body)) }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
   const discriminator = body.metadata?.user_id || ""
@@ -2212,7 +2425,7 @@ function workDirNote(callerWorkDir) {
 // Session-level instructions: the client's system prompt plus where tools run.
 function sessionInstructions(body, callerWorkDir) {
   const parts = []
-  const system = systemText(body)
+  const system = systemText(canonicalBody(body))
   if (system.trim()) parts.push(system)
   if (callerWorkDir) parts.push(workDirNote(callerWorkDir))
   return parts.join("\n\n")
@@ -3244,6 +3457,21 @@ function streamResponse(proc, turn, body, signal) {
   })
 }
 
+async function beginTurn(proc, history, body, callerWorkDir, model, selection) {
+  const baseParts = proc.hasSentFirstTurn
+    ? renderContinuedTurnParts(body.messages.slice(history.length))
+    : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession)
+  const contentParts = mergePromptParts(baseParts, outputFormatReminder(body))
+  if (promptHasImage(contentParts) && !proc.supportsImages) {
+    if (!proc.hasSentFirstTurn) {
+      dropFromPool(proc)
+      await proc.stop().catch(() => {})
+    }
+    throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
+  }
+  return proc.startTurn(contentParts, body.messages, model, selection)
+}
+
 export const AntigravityBridgePlugin = async () => {
   const readUsage = createUsageReader(findAgy)
   return {
@@ -3320,7 +3548,8 @@ export const AntigravityBridgePlugin = async () => {
 
             const rawModel = body.model || ""
             const requestedModel = (rawModel.includes("/") ? rawModel.split("/").pop() : rawModel).replace(/\[1m\]$/i, "")
-            body = { ...body, model: requestedModel }
+            const layout = canonicalBody(body) === body ? "hoisted" : "inline"
+            body = { ...canonicalBody(body), model: requestedModel }
             const model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
             const selection = { model: requestedModel, effort: requestedEffort(body) }
             const convKey = conversationKey(body)
@@ -3333,6 +3562,19 @@ export const AntigravityBridgePlugin = async () => {
 
             try {
               const tools = normalizeTools(body)
+              for (const message of body.messages) {
+                if (message.role !== "assistant" || !Array.isArray(message.content)) continue
+                for (const block of message.content) {
+                  if (block?.type !== "tool_use") continue
+                  const entry = toolCalls.get(block.id)
+                  if (!entry || entry.call.clientSeen) continue
+                  entry.call.clientSeen = true
+                  entry.turn.touchClient()
+                }
+              }
+              const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
+                messages: body.messages, layout, nonstream: body.stream === false }
+              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection)
               if (resultBlocks.length) {
                 const matches = matchToolResults(body, resultBlocks)
                 const found = matches.filter((item) => item.match)
@@ -3374,7 +3616,7 @@ export const AntigravityBridgePlugin = async () => {
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
                     : proc.matchesHistory(trailingMessages(body).history)
                   if (interrupted || !historyMatches ||
-                    proc.workDir !== workDir || proc.instructions !== instructions) {
+                    proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
                     // A changed context or user-interrupted tool turn needs a new
                     // session. Replay the real results without resolving the old
                     // process's calls.
@@ -3393,32 +3635,28 @@ export const AntigravityBridgePlugin = async () => {
                   }
                 }
                 if (pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
+                  const proc = pool.get(convKey)
+                  const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,
+                    body, resultBlocks, acquireOpts, isFresh, begin })
+                  if (recovered) return streamResponse(recovered.proc, recovered.turn, body, init.signal)
                   return jsonError(409, "agy bridge: no active MCP call matches these tool results")
+                }
+                if (replayHistoryProblem(body, resultBlocks)) {
+                  throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
                 }
               }
 
               const { proc, history } = await acquireProc(
                 agy,
                 convKey,
-                { model, selection, tools, workDir, instructions, history: trailing.history, messages: body.messages },
+                acquireOpts,
                 isFresh,
                 resultBlocks.length > 0,
               )
-              const baseParts = proc.hasSentFirstTurn
-                ? renderContinuedTurnParts(body.messages.slice(history.length))
-                : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession)
-              const contentParts = mergePromptParts(baseParts, outputFormatReminder(body))
-              if (promptHasImage(contentParts) && !proc.supportsImages) {
-                if (!proc.hasSentFirstTurn) {
-                  dropFromPool(proc)
-                  await proc.stop().catch(() => {})
-                }
-                throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
-              }
-              const turn = proc.startTurn(contentParts, body.messages, model, selection)
+              const turn = await begin(proc, history)
               return streamResponse(proc, turn, body, init.signal)
             } catch (error) {
-              return jsonError(error.statusCode ?? 502, error.message)
+              return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
             }
           },
         }
@@ -3454,13 +3692,17 @@ export const AntigravityBridgePlugin = async () => {
   }
 }
 
-function jsonError(status, message) {
+// Only permanent tool-history 400s opt out of retries. Magpie header forwarding
+// has not been verified; busy responses and existing 409s retain their semantics.
+function jsonError(status, message, code, noRetry = false) {
   return new Response(
     JSON.stringify({
       type: "error",
-      error: { type: status === 400 ? "invalid_request_error" : "api_error", message: String(message || "unknown error") },
+      error: { type: status === 400 ? "invalid_request_error" : "api_error",
+        ...(code ? { code } : {}), message: String(message || "unknown error") },
     }),
-    { status, headers: { "Content-Type": "application/json" } },
+    { status, headers: { "Content-Type": "application/json",
+      ...(status === 400 && noRetry ? { "x-should-retry": "false" } : {}) } },
   )
 }
 

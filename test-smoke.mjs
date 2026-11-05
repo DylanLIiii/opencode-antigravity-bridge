@@ -131,10 +131,22 @@ async function invoke(name, args) {
 const textOf = result => (result.content || []).map(part => part.text || "").join("")
 
 function finish(reply, extra = {}) {
+  const cached = extra.cached || 0
+  const thought = extra.thought || 0
+  const input = extra.input ?? 10
   log({ type: "result", convId: session.id, prompt: session.prompts, response: reply })
   return {
     stopReason: "end_turn",
-    usage: { inputTokens: extra.input ?? 10 + (extra.cached || 0), outputTokens: reply.length, cachedReadTokens: extra.cached || 0, cachedWriteTokens: 0, thoughtTokens: extra.thought || 0, totalTokens: 10 + reply.length },
+    usage: {
+      // agy 1.5.1 reports cached reads separately; the older shape folded them
+      // into inputTokens. totalTokens includes both either way.
+      inputTokens: extra.exclusive ? input : input + cached,
+      outputTokens: reply.length,
+      cachedReadTokens: cached,
+      cachedWriteTokens: 0,
+      thoughtTokens: thought,
+      totalTokens: input + cached + reply.length + thought,
+    },
   }
 }
 
@@ -277,6 +289,14 @@ async function prompt(params) {
   if (text.includes("THINKING_USAGE")) {
     await reply("thinking usage")
     return finish("thinking usage", { thought: 7, cached: 3 })
+  }
+  if (text.includes("EXCLUSIVE_USAGE")) {
+    await reply("exclusive usage")
+    return finish("exclusive usage", { input: 2133, cached: 4899, exclusive: true })
+  }
+  if (text.includes("CACHED_ONLY_USAGE")) {
+    await reply("cached only")
+    return finish("cached only", { input: 0, cached: 4899, exclusive: true })
   }
   if (text.includes("CONFIGRESET")) {
     await reply("configuration updated")
@@ -671,6 +691,24 @@ async function launchedModel(body) {
   const secondEvents = (await readSSE(await callFetch(second))).events
   const secondUsage = secondEvents.find(event => event.event === "message_delta")?.data?.usage
   check("thinking usage is per turn", secondUsage?.output_tokens_details?.thinking_tokens === 7, JSON.stringify(secondUsage))
+}
+
+{
+  const body = { model, messages: [{ role: "user", content: "EXCLUSIVE_USAGE" }] }
+  const { events } = await readSSE(await callFetch(body))
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("agy 1.5.1 inputTokens is not reduced by cache reads",
+    usage?.input_tokens === 2133 && usage?.cache_read_input_tokens === 4899, JSON.stringify(usage))
+  check("exclusive input and cache read keep the ACP total",
+    usage?.input_tokens + usage?.cache_read_input_tokens === 7032, JSON.stringify(usage))
+}
+
+{
+  const body = { model, messages: [{ role: "user", content: "CACHED_ONLY_USAGE" }] }
+  const { events } = await readSSE(await callFetch(body))
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("a fully cached prompt keeps its cache read instead of dropping it",
+    usage?.input_tokens === 0 && usage?.cache_read_input_tokens === 4899, JSON.stringify(usage))
 }
 
 {

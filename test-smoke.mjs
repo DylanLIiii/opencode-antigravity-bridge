@@ -134,7 +134,7 @@ function finish(reply, extra = {}) {
   log({ type: "result", convId: session.id, prompt: session.prompts, response: reply })
   return {
     stopReason: "end_turn",
-    usage: { inputTokens: 10 + (extra.cached || 0), outputTokens: reply.length, cachedReadTokens: extra.cached || 0, cachedWriteTokens: 0, thoughtTokens: extra.thought || 0, totalTokens: 10 + reply.length },
+    usage: { inputTokens: extra.input ?? 10 + (extra.cached || 0), outputTokens: reply.length, cachedReadTokens: extra.cached || 0, cachedWriteTokens: 0, thoughtTokens: extra.thought || 0, totalTokens: 10 + reply.length },
   }
 }
 
@@ -255,6 +255,13 @@ async function prompt(params) {
     await invoke("echo", { text: "probe" })
     chunk("After esc.\n")
     return finish("After esc.\n")
+  }
+  if (text.includes("MULTISTEP")) {
+    chunk("Step one.\n")
+    await invoke("echo", { text: "probe" })
+    chunk("Step two.\n")
+    // ACP reports one accumulated total for both model steps of this prompt.
+    return finish("Step one.\nStep two.\n", { input: 9000 })
   }
   if (text.includes("TOOL")) {
     chunk("Before tool.\n")
@@ -753,6 +760,24 @@ let nativeConv
   check("MCP receives actual result without placeholder", delivered?.result?.content?.[0]?.text === "native-result")
   check("continuation sends no new agy prompt", logs().filter(event => event.type === "user" && event.convId === nativeConv).length === 1)
   check("native tool reuses the same agy session", inits().filter(event => event.convId === nativeConv).length === 1)
+}
+
+{
+  // One session/prompt spans two HTTP responses; ACP's accumulated 9000 input
+  // tokens must not all land on the last one.
+  const firstBody = { model, messages: [{ role: "user", content: "MULTISTEP usage" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(firstBody))).events
+  const lastEvents = (await readSSE(await callFetch(continuation(firstBody, firstEvents, "multistep-result")))).events
+  const window = (events) => {
+    const usage = events.find(event => event.event === "message_delta")?.data?.usage || {}
+    return (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0)
+  }
+  const stepUsage = firstEvents.find(event => event.event === "message_delta")?.data?.usage
+  const finalUsage = lastEvents.find(event => event.event === "message_delta")?.data?.usage
+  check("multi-step turn ends after the tool round-trip", stopOf(firstEvents) === "tool_use" && stopOf(lastEvents) === "end_turn")
+  check("tool step reports non-zero single-step usage", window(firstEvents) > 0 && stepUsage?.output_tokens > 0, JSON.stringify(stepUsage))
+  check("final response does not carry the accumulated ACP input", window(lastEvents) > 0 && window(lastEvents) < 9000, JSON.stringify(finalUsage))
+  check("responses together stay below the accumulated ACP input", window(firstEvents) + window(lastEvents) < 9000)
 }
 
 {

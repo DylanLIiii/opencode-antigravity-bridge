@@ -101,6 +101,11 @@ magpie quota refresh antigravity-bridge --json
 需要当前版本的 magpie（插件 usage 钩子，实测宿主 0.1.1599）。额度窗口仅作
 展示，不会自动在额度耗尽时停请求。
 
+额度探测使用独立的临时 Gemini 配置目录，不会扫描全局技能、规则、插件、MCP
+或设置；登录态仍复用 agy 自己的钥匙串/ADC，或链接本机已有的文件 token。
+旧版 agy 不支持该隔离参数时会回退到默认目录；设置 `AGY_BRIDGE_USAGE=0`
+可完全关闭自动额度探测。
+
 **客户端工具行为**：工具调用对客户端透明——模型发起 `tool_use`，客户端执行后
 回传 `tool_result`，同一个 agy 回合继续。运行超过 150 秒的工具会先收到
 "still running" 响应，结果最终送达，客户端每个调用只执行一次。

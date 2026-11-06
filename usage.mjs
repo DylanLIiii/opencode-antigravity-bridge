@@ -93,6 +93,30 @@ function timeout(value) {
   return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS
 }
 
+function usageDisabled(env) {
+  return /^(?:0|false|off|no|disabled)$/i.test(String(env?.AGY_BRIDGE_USAGE ?? "").trim())
+}
+
+// Keep the CLI's normal sign-in while leaving its global skills, rules, plugins,
+// MCP servers and settings behind. Keyring/ADC auth needs no seed; a file-based
+// token is linked, never copied.
+async function linkIsolatedAccount(home, geminiDir) {
+  const source = path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+  try {
+    await fs.access(source)
+  } catch {
+    return
+  }
+  const appDir = path.join(geminiDir, "antigravity-cli")
+  await fs.mkdir(appDir, { recursive: true, mode: 0o700 })
+  await fs.chmod(appDir, 0o700)
+  try {
+    await fs.symlink(source, path.join(appDir, "antigravity-oauth-token"))
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error
+  }
+}
+
 function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
   return new Promise((resolve, reject) => {
     let child
@@ -163,6 +187,7 @@ export async function fetchUsage(agy, {
   maxOutputBytes = MAX_OUTPUT_BYTES,
   signal,
   tempRoot = os.tmpdir(),
+  home = os.homedir(),
 } = {}) {
   if (!agy) throw new UsageError("agy CLI not found. Install it and run `agy` once to sign in.")
   // Browser launcher blocking and owned process-group cleanup are POSIX-specific.
@@ -171,11 +196,19 @@ export async function fetchUsage(agy, {
   const directory = await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-"))
   try {
     await fs.chmod(directory, 0o700)
+    // Print mode reloads system slash commands and global skills even when the
+    // selected agent opts out. A private Gemini dir keeps that discovery local.
+    const geminiDir = path.join(directory, "gemini")
+    await fs.mkdir(geminiDir, { recursive: true, mode: 0o700 })
+    await fs.chmod(geminiDir, 0o700)
+    await linkIsolatedAccount(home, geminiDir)
     const agentDir = path.join(directory, ".agents", "agents", "magpie-usage")
     await fs.mkdir(agentDir, { recursive: true })
     await fs.writeFile(path.join(agentDir, "agent.md"), [
       "---", "name: magpie-usage", "description: Read CLI usage only", "mainAgent: true", "subagent: false",
-      "tools: []", "mcpServers: []", "---", "Do not run model prompts or tools.", "",
+      "tools: []", "mcpServers: []",
+      "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true",
+      "---", "Do not run model prompts or tools.", "",
     ].join("\n"), { mode: 0o600 })
     for (const name of ["open", "xdg-open"]) {
       await fs.writeFile(path.join(directory, name), "#!/bin/sh\nexit 1\n", { mode: 0o700 })
@@ -187,10 +220,20 @@ export async function fetchUsage(agy, {
       BROWSER: path.join(directory, "open"),
     }
     const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes }
-    const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
+    // Probe the hidden profile flag within the version call. Older CLIs reject
+    // it; only then fall back to the user's real Gemini directory.
+    let version = await run(agy, [`--gemini_dir=${geminiDir}`, "--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
+    let isolated = version.code === 0
+    if (!isolated && /flags? provided but not defined|unknown (?:flag|option)|unrecognized/i.test(version.stderr + version.stdout)) {
+      version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
+    }
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
-    const result = await run(agy, ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`], options)
+    const args = [
+      ...(isolated ? [`--gemini_dir=${geminiDir}`] : []),
+      "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`,
+    ]
+    const result = await run(agy, args, options)
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
     return parseUsageReport(result.stdout)
   } finally {
@@ -202,6 +245,7 @@ export async function fetchUsage(agy, {
 export function createUsageReader(resolveAgy, options = {}) {
   const pending = new Map()
   return async () => {
+    if (usageDisabled(options.env ?? process.env)) return { windows: [], signIn: "kept" }
     try {
       const agy = resolveAgy()
       if (!pending.has(agy)) {

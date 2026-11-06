@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
+import childProcess from "node:child_process"
+import { syncBuiltinESMExports } from "node:module"
 import { test } from "node:test"
-import { agyCandidates, agySpawnSpec, windowsMcpShim } from "./platform.mjs"
+import { agyCandidates, agySpawnSpec, spawnAgy, windowsMcpShim } from "./platform.mjs"
 
 test("Windows discovery considers exe/cmd/bat, Path and LOCALAPPDATA", () => {
   const candidates = agyCandidates({ Path: 'C:\\Program Files\\agy;D:\\tools', LOCALAPPDATA: 'C:\\Users\\Test\\AppData\\Local' }, 'C:\\Users\\Test', 'win32')
@@ -49,3 +51,92 @@ test("npm cmd-shims escape metacharacters for the second expansion pass", () => 
   const spec = agySpawnSpec('C:\\project\\node_modules\\.bin\\agy.cmd', ['a & %NAME%!'], 'win32', {})
   for (const character of ['&', '%', '!']) assert.ok(spec.args.at(-1).includes('^^^' + character))
 })
+
+function captureSpawn(platform, inherited, callback) {
+  const originalSpawn = childProcess.spawn
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")
+  const originalEnv = process.env
+  const calls = []
+  const child = {}
+  try {
+    Object.defineProperty(process, "platform", { ...platformDescriptor, value: platform })
+    process.env = inherited
+    childProcess.spawn = (file, args, options) => {
+      calls.push({ file, args, options })
+      return child
+    }
+    syncBuiltinESMExports()
+    callback(calls, child)
+  } finally {
+    childProcess.spawn = originalSpawn
+    syncBuiltinESMExports()
+    process.env = originalEnv
+    Object.defineProperty(process, "platform", platformDescriptor)
+  }
+}
+
+for (const platform of ["win32", "linux", "darwin"]) {
+  test(`spawnAgy forces both protections with omitted or overriding options on ${platform}`, () => {
+    const parent = Object.freeze({ PATH: "parent-path", PARENT_ONLY: "kept", AGY_CLI_DISABLE_AUTO_UPDATE: "false" })
+    captureSpawn(platform, parent, (calls, child) => {
+      const file = platform === "win32" ? "C:\\Program Files\\Antigravity\\agy.exe" : "/opt/agy"
+      const args = Object.freeze(["models", "space & percent% quote\""])
+      const signal = new AbortController().signal
+      const env = Object.freeze({ PATH: "caller-path", CALLER_ONLY: "kept", AGY_CLI_DISABLE_AUTO_UPDATE: "false" })
+      const options = Object.freeze({ env, cwd: "workspace", stdio: ["ignore", "pipe", "pipe"], detached: true, windowsHide: false, signal })
+      const before = structuredClone({ parent, env, args, options: { ...options, signal: undefined } })
+      for (const supplied of [undefined, {}, { env: {} }, options]) {
+        assert.equal(spawnAgy(file, args, supplied), child)
+        const actual = calls.at(-1)
+        assert.equal(actual.file, file)
+        assert.equal(actual.args, args)
+        assert.equal(actual.options.windowsHide, true, "spawnAgy must hide every child window")
+        assert.equal(actual.options.env.AGY_CLI_DISABLE_AUTO_UPDATE, "true", "spawnAgy must disable auto update after all env overrides")
+        assert.equal(actual.options.env.PARENT_ONLY, "kept")
+        assert.notEqual(actual.options.env, parent)
+        assert.notEqual(actual.options.env, supplied?.env)
+      }
+      const actual = calls.at(-1).options
+      for (const key of ["cwd", "stdio", "detached", "signal"]) assert.equal(actual[key], options[key])
+      assert.equal(actual.env.PATH, "caller-path")
+      assert.equal(actual.env.CALLER_ONLY, "kept")
+      assert.deepEqual({ parent, env, args, options: { ...options, signal: undefined } }, before)
+    })
+  })
+}
+
+test("spawnAgy deduplicates Windows env aliases without losing caller PATH or MCP settings", () => {
+  const parent = Object.freeze({ Path: "parent-path", path: "duplicate-parent", agy_cli_disable_auto_update: "false", PARENT_ONLY: "kept", Mixed: "parent" })
+  const env = Object.freeze({ PATH: "shim;caller-path", AGY_CLI_DISABLE_AUTO_UPDATE: "false", Agy_Cli_Disable_Auto_Update: "false", MIXED: "caller", AGY_BRIDGE_CONTROL_PORT: "12345", AGY_BRIDGE_TOKEN: "fixture" })
+  captureSpawn("win32", parent, calls => {
+    spawnAgy("C:\\Program Files\\Antigravity\\agy.exe", [], { env, windowsHide: false })
+    const actual = calls[0].options.env
+    assert.deepEqual(Object.keys(actual).filter(key => /^path$/i.test(key)), ["PATH"])
+    assert.equal(actual.PATH, "shim;caller-path")
+    assert.deepEqual(Object.keys(actual).filter(key => /^agy_cli_disable_auto_update$/i.test(key)), ["AGY_CLI_DISABLE_AUTO_UPDATE"])
+    assert.equal(actual.AGY_CLI_DISABLE_AUTO_UPDATE, "true")
+    assert.equal(actual.MIXED, "caller")
+    assert.equal(actual.Mixed, undefined)
+    for (const key of ["AGY_BRIDGE_CONTROL_PORT", "AGY_BRIDGE_TOKEN"]) assert.equal(actual[key], env[key])
+    assert.equal(parent.Path, "parent-path")
+    assert.equal(parent.agy_cli_disable_auto_update, "false")
+    assert.equal(env.Agy_Cli_Disable_Auto_Update, "false")
+  })
+})
+
+for (const extension of ["cmd", "bat"]) {
+  test(`spawnAgy preserves Windows .${extension} escaping while forcing protections`, () => {
+    const parent = Object.freeze({ ComSpec: "C:\\Windows\\System32\\cmd.exe", AGY_CLI_DISABLE_AUTO_UPDATE: "false" })
+    captureSpawn("win32", parent, calls => {
+      const file = `C:\\Program Files\\Antigravity & Tools\\agy.${extension}`
+      const args = ["acp", "--add-dir", "C:\\space & percent% !\\"]
+      const expected = agySpawnSpec(file, args, "win32", parent)
+      spawnAgy(file, args, { windowsHide: false, windowsVerbatimArguments: false, env: { AGY_CLI_DISABLE_AUTO_UPDATE: "false" } })
+      assert.equal(calls[0].file, expected.file)
+      assert.deepEqual(calls[0].args, expected.args)
+      assert.equal(calls[0].options.windowsVerbatimArguments, true)
+      assert.equal(calls[0].options.windowsHide, true)
+      assert.equal(calls[0].options.env.AGY_CLI_DISABLE_AUTO_UPDATE, "true")
+    })
+  })
+}

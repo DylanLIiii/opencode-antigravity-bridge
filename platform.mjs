@@ -65,9 +65,22 @@ export function agySpawnSpec(file, args, platform = process.platform, env = proc
   }
 }
 
-export function spawnAgy(file, args, options) {
+export function spawnAgy(file, args, options = {}) {
   const command = agySpawnSpec(file, args)
-  return spawn(command.file, command.args, { ...options, ...command.options })
+  const env = {}
+  const names = new Map()
+  for (const source of [process.env, options?.env]) {
+    for (const [key, value] of Object.entries(source || {})) {
+      if (key.toUpperCase() === "AGY_CLI_DISABLE_AUTO_UPDATE") continue
+      // Windows treats env names case-insensitively; keep the caller's PATH.
+      const name = process.platform === "win32" ? key.toUpperCase() : key
+      if (names.has(name)) delete env[names.get(name)]
+      names.set(name, key)
+      env[key] = value
+    }
+  }
+  env.AGY_CLI_DISABLE_AUTO_UPDATE = "true"
+  return spawn(command.file, command.args, { ...options, ...command.options, windowsHide: true, env })
 }
 
 export function windowsMcpShim(executable, server) {

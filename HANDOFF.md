@@ -1,3 +1,18 @@
+# Handoff: opencode-antigravity-bridge
+
+## 2026-11-05：修复 ACP 缓存用量被重复扣减
+
+- agy 1.5.1 实测 ACP usage：`inputTokens` 是**未缓存**输入，
+  `cachedReadTokens` 单独计数，`totalTokens` 包含缓存。例：`2133 + 4899 + 6
+  = 7038`。旧代码把 `inputTokens` 当成包含缓存并相减，导致 Magpie Log 出现
+  `in=0`、`cache_read` 被截断（同一例会被报成 `0 / 2133`），缓存命中率和成本
+  都失真。
+- 现在用 `totalTokens` 判别新旧两种格式：新格式直接使用独立的 cache 字段；
+  旧格式才从 `inputTokens` 中扣除缓存。响应级 usage 拆分也使用同一份 prompt
+  总量，避免最终响应重复少算。
+- 验证：Node smoke **295 checks** 通过；真实 agy 1.5.1 ACP 探针确认
+  `2133 input + 4899 cache read + 6 output = 7038 total`。
+
 ## 2026-11-05：整合 PR #4 与 agy 1.5.0，维护者追加修复
 
 本段更新此前记录：输入 schema 现在做 Gemini/Vertex 兼容化处理（不是完整
@@ -19,8 +34,6 @@ schema 校验），用户图片通过协商后的 ACP image capability 发送；
 - Node/Bun：各 266 smoke checks + 25 focused tests 通过。Linux 真机 agy
   1.5.0：图片识别、原生 MCP 工具调用、跨进程 resume、思考等级变更通过；
   Flash 未输出思考摘要，不宣称本轮验证了思考文本。
-
-# Handoff: opencode-antigravity-bridge
 
 ## 2026-11-04：agy 1.5.0 图片输入和 ACP 配置选项
 
@@ -83,8 +96,9 @@ pingdotgg/t3code `apps/server/src/provider/acp/`（`b7ab02e0f6`）：它用独�
 - 上游错误是消息块 `⚠ Agent execution terminated due to error.` + `end_turn`
   无 usage；真实原因只在 `--log-file`（`errorreport.go ... agent executor error:`）。
 - `session/cancel` 后会话可继续；`session/resume` 跨进程、换 cwd 可用，但模型回到
-  账户默认，需重新 `set_model`。ACP usage 为每 prompt：`inputTokens` 含
-  `cachedReadTokens`（`input+output+thought = total`），与 T3 注释相反，以实测为准。
+  账户默认，需重新 `set_model`。ACP usage 为每 prompt；agy 1.5.1 的
+  `inputTokens` **不含** `cachedReadTokens`（`input+cacheRead+output+thought =
+  total`）。早期记录曾误以为 input 含 cache，已在本页顶部修复说明。
 - 用户消息中的 ACP image 块模型收不到（未声明 promptCapabilities.image），保留 400。
 
 实现（`index.mjs` 重写传输层，历史匹配/续接/通知逻辑保留）：AcpConnection、

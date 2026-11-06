@@ -3006,18 +3006,44 @@ function tokenCount(value) {
 }
 
 // ACP usage accumulates the internal model calls of one session/prompt.
-// Gemini includes read-cache input and excludes thought output in its totals.
+// agy 1.5.1 reports inputTokens as the uncached prompt tokens; cached reads and
+// writes are separate and totalTokens includes all of them (measured:
+// 2133 input + 4899 cache read + 6 output = 7038 total). Some earlier builds
+// folded cached reads into inputTokens. totalTokens tells the two shapes apart,
+// so both report the same uncached input and cache numbers.
+function promptUsage(usage) {
+  const rawInput = tokenCount(usage.inputTokens)
+  const cacheRead = tokenCount(usage.cachedReadTokens)
+  const cacheWrite = tokenCount(usage.cachedWriteTokens)
+  const output = tokenCount(usage.outputTokens)
+  const thinking = tokenCount(usage.thoughtTokens)
+  const total = tokenCount(usage.totalTokens)
+  const inclusive = total > 0
+    ? Math.abs(total - (rawInput + output + thinking)) <
+      Math.abs(total - (rawInput + cacheRead + cacheWrite + output + thinking))
+    : cacheRead <= rawInput
+  // Prompt input excludes cache creation, which is reported separately.
+  const promptInput = inclusive ? rawInput : rawInput + cacheRead
+  const read = Math.min(cacheRead, promptInput)
+  return {
+    input: promptInput - read,
+    read,
+    write: cacheWrite,
+    output: output + thinking,
+    thinking,
+    promptInput,
+  }
+}
+
 function translateUsage(usage) {
   if (!usage || typeof usage !== "object") return null
-  const input = tokenCount(usage.inputTokens)
-  const cacheRead = Math.min(input, tokenCount(usage.cachedReadTokens))
-  const thinking = tokenCount(usage.thoughtTokens)
+  const parts = promptUsage(usage)
   return {
-    input_tokens: input - cacheRead,
-    output_tokens: tokenCount(tokenCount(usage.outputTokens) + thinking),
-    cache_read_input_tokens: cacheRead,
-    cache_creation_input_tokens: tokenCount(usage.cachedWriteTokens),
-    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+    input_tokens: parts.input,
+    output_tokens: parts.output,
+    cache_read_input_tokens: parts.read,
+    cache_creation_input_tokens: parts.write,
+    ...(parts.thinking > 0 ? { output_tokens_details: { thinking_tokens: parts.thinking } } : {}),
   }
 }
 
@@ -3064,13 +3090,13 @@ function responseUsage(proc, turn, step, content, result) {
   if (final) {
     const sum = turn.stepInputEstimates.reduce((total, value) => total + value, 0)
     const weight = estimate / Math.max(estimate, sum)
-    const totalInput = tokenCount(result?.usage?.inputTokens)
-    const totalWrite = tokenCount(result?.usage?.cachedWriteTokens)
-    const read = Math.min(totalInput, tokenCount(result?.usage?.cachedReadTokens))
+    const parts = promptUsage(result?.usage || {})
+    const totalInput = parts.promptInput
+    const totalWrite = parts.write
     if (totalInput + totalWrite > 0) {
       input = tokenCount(totalInput * weight)
       write = tokenCount(totalWrite * weight)
-      cacheRatio = totalInput > 0 ? read / totalInput : 0
+      cacheRatio = totalInput > 0 ? parts.read / totalInput : 0
     }
     // The bound applies to the full window, including cache creation. Scale
     // both portions together before rounding, then split the exact integer.

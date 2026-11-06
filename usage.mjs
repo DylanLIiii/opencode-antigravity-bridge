@@ -198,7 +198,7 @@ export async function fetchUsage(agy, {
     await fs.chmod(directory, 0o700)
     // Print mode reloads system slash commands and global skills even when the
     // selected agent opts out. A private Gemini dir keeps that discovery local.
-    const geminiDir = path.join(directory, "gemini")
+    const geminiDir = path.resolve(directory, "gemini")
     await fs.mkdir(geminiDir, { recursive: true, mode: 0o700 })
     await fs.chmod(geminiDir, 0o700)
     await linkIsolatedAccount(home, geminiDir)

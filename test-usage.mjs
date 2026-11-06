@@ -88,7 +88,18 @@ import { spawn, spawnSync } from "node:child_process"
 import fs from "node:fs"
 import path from "node:path"
 const args = process.argv.slice(2)
-const version = args[0] === "--version"
+const version = args.includes("--version")
+if (process.env.TEST_GEMINI_DIR === "unsupported" && args.some(arg => arg.startsWith("--gemini_dir="))) {
+  fs.appendFileSync(process.env.TEST_LOG, JSON.stringify({ args, unsupported: true }) + "\n")
+  console.error("flag provided but not defined: -gemini_dir")
+  process.exit(2)
+}
+const geminiArg = args.find(arg => arg.startsWith("--gemini_dir="))
+const geminiPath = geminiArg?.slice("--gemini_dir=".length)
+let geminiToken = null
+if (geminiPath) {
+  try { geminiToken = fs.readlinkSync(path.join(geminiPath, "antigravity-cli", "antigravity-oauth-token")) } catch {}
+}
 const record = {
   args, cwd: process.cwd(), pid: process.pid,
   update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
@@ -96,6 +107,7 @@ const record = {
   agent: fs.readFileSync(path.join(process.cwd(), ".agents/agents/magpie-usage/agent.md"), "utf8"),
   mode: fs.statSync(process.cwd()).mode & 0o777,
   guard: spawnSync(process.env.BROWSER).status,
+  gemini: geminiPath ? { path: geminiPath, mode: fs.statSync(geminiPath).mode & 0o777, token: geminiToken } : null,
 }
 fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(record) + "\n")
 const mode = process.env.TEST_MODE
@@ -124,10 +136,19 @@ else if (version) {
 `)
   await fs.writeFile(executable, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"\n`, { mode: 0o700 })
   const env = { ...process.env, TEST_LOG: logPath, TEST_REPORT: JSON.stringify(report([group([bucket()])])), TEST_DESCENDANT: path.join(directory, "descendant"), ...extraEnv }
+  const home = path.join(directory, "home")
+  await fs.mkdir(home, { recursive: true })
   return {
     executable, env,
-    options: { env, tempRoot: directory },
-    async logs() { return (await fs.readFile(logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line)) },
+    options: { env, tempRoot: directory, home },
+    async logs() {
+      try {
+        return (await fs.readFile(logPath, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line))
+      } catch (error) {
+        if (error.code === "ENOENT") return []
+        throw error
+      }
+    },
     async assertClean() { assert.deepEqual((await fs.readdir(directory)).filter(name => name.startsWith("magpie-agy-usage-")), []) },
   }
 }
@@ -163,15 +184,22 @@ test("queries only the structured command in a private, restricted workspace and
     assert.equal(actual.options.env.TEST_LOG, f.env.TEST_LOG)
     assert.notEqual(actual.options.env, f.env)
   }
-  assert.deepEqual(logs[0].args, ["--version"])
-  assert.deepEqual(logs[1].args.slice(0, 6), ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage"])
-  assert.equal(logs[1].args[6], "--print-timeout")
-  assert.match(logs[1].args[7], /^\d+s$/)
+  assert.match(logs[0].args[0], /^--gemini_dir=/)
+  assert.deepEqual(logs[0].args.slice(1), ["--version"])
+  assert.match(logs[1].args[0], /^--gemini_dir=/)
+  assert.deepEqual(logs[1].args.slice(1, 7), ["-p", "/usage", "--output-format", "json", "--agent", "magpie-usage"])
+  assert.equal(logs[1].args[7], "--print-timeout")
+  assert.match(logs[1].args[8], /^\d+s$/)
+  assert.equal(logs[0].gemini.path, logs[1].gemini.path)
+  assert.equal(logs[0].gemini.path, logs[1].args[0].slice("--gemini_dir=".length))
   for (const log of logs) {
     assert.equal(log.mode, 0o700)
     assert.equal(log.update, "true")
     assert.ok(log.agent.includes("tools: []\nmcpServers: []"))
+    assert.ok(log.agent.includes("inheritMcp: false\ninheritCustomizations: false\nexcludeDefaultComponents: true"))
     assert.equal(log.guard, 1)
+    assert.equal(log.gemini.mode, 0o700)
+    assert.equal(log.gemini.token, null)
     // macOS process.cwd() canonicalizes /var to /private/var.
     assert.equal(path.basename(log.path.split(path.delimiter)[0]), path.basename(log.cwd))
     assert.equal(path.dirname(log.browser), log.path.split(path.delimiter)[0])
@@ -179,6 +207,46 @@ test("queries only the structured command in a private, restricted workspace and
     await assert.rejects(fs.stat(log.cwd), { code: "ENOENT" })
   }
   assert.equal(f.env.AGY_CLI_DISABLE_AUTO_UPDATE, "false")
+  await f.assertClean()
+})
+
+test("links a file-based sign-in into the isolated profile without copying it", async t => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "agy-usage-home-"))
+  t.after(() => fs.rm(home, { recursive: true, force: true }))
+  const token = path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+  await fs.mkdir(path.dirname(token), { recursive: true })
+  await fs.writeFile(token, "test-token")
+  const f = await fixture(t)
+  const result = await fetchUsage(f.executable, { ...f.options, home })
+  assert.equal(result.windows[0].used, 25)
+  const logs = await f.logs()
+  assert.equal(logs[1].gemini.token, token)
+  await f.assertClean()
+})
+
+test("falls back to the real Gemini dir when the CLI lacks the profile flag", async t => {
+  const f = await fixture(t, { TEST_GEMINI_DIR: "unsupported" })
+  const result = await fetchUsage(f.executable, f.options)
+  assert.equal(result.windows[0].used, 25)
+  const logs = await f.logs()
+  assert.equal(logs.length, 3)
+  assert.equal(logs[0].unsupported, true)
+  assert.deepEqual(logs[1].args, ["--version"])
+  assert.ok(!logs[2].args.some(arg => arg.startsWith("--gemini_dir=")))
+  await f.assertClean()
+})
+
+test("AGY_BRIDGE_USAGE=0 skips automatic quota probes entirely", async t => {
+  const f = await fixture(t)
+  for (const value of ["0", "false", "off", "no", "disabled"]) {
+    const read = createUsageReader(() => f.executable, { ...f.options, env: { ...f.env, AGY_BRIDGE_USAGE: value } })
+    assert.deepEqual(await read(), { windows: [], signIn: "kept" })
+  }
+  assert.deepEqual(await f.logs(), [])
+  await f.assertClean()
+  const read = createUsageReader(() => f.executable, { ...f.options, env: { ...f.env, AGY_BRIDGE_USAGE: "1" } })
+  assert.equal((await read()).windows.length, 1)
+  assert.equal((await f.logs()).length, 2)
   await f.assertClean()
 })
 

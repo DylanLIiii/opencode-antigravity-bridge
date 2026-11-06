@@ -1,5 +1,22 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-11-06：额度探测隔离全局技能扫描（#10）
+
+- macOS 上 `agy -p /usage` 的 print-mode 启动会在选择 agent 之前重载系统
+  slash commands 和 skills；`~/.gemini/config/skills` 指向 iCloud 时可能
+  触发大量 sandboxd/FileProvider 审批。
+- 额度探测现在给 `agy` 传隐藏参数 `--gemini_dir=<临时目录>`，使用独立空配置，
+  不再扫描全局 skills/rules/plugins/MCP/settings。登录态仍由 keyring/ADC
+  提供；文件 token 只做符号链接（不读取、不复制，随工作区删除）。版本探测
+  同时检测该参数，旧版 CLI 不识别时回退到默认目录。
+- quota agent 增加 `inheritMcp: false`、`inheritCustomizations: false`、
+  `excludeDefaultComponents: true`。
+- 新增 `AGY_BRIDGE_USAGE=0`（也接受 false/off/no/disabled）关闭自动额度探测。
+- 验证：Node 39 tests + 301 smoke checks 通过；本机 agy 1.5.2 的真实
+  `/usage` 在隔离目录下成功（keyring 登录）；`agy models` 与 ACP
+  initialize/session-new 未观察到 skills reload。1.5.1 是否支持
+  `--gemini_dir` 未实测，代码已做回退。
+
 ## 2026-11-05：修复 ACP 缓存用量被重复扣减
 
 - agy 1.5.1 实测 ACP usage：`inputTokens` 是**未缓存**输入，

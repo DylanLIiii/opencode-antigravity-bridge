@@ -1,5 +1,32 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-11-07：Prompt 过滤经验、异常幂等与 P1 会话治理
+
+- 参考 Antigravity-Manager / CLIProxyAPI 的公开 A/B 经验，新增结构化
+  `prompt-guard.mjs`：只移除独立 Claude billing 元数据 block，并精确规范化两个
+  Agent SDK 身份句；不全局替换厂商名，不处理 user/tool 正文，可用
+  `AGY_BRIDGE_PROMPT_GUARD=0` 关闭。
+- 新增 `upstream-error.mjs`：区分明确 quota、model capacity、forbidden、通用 429；
+  通用 RESOURCE_EXHAUSTED 不再宣称为确定配额耗尽，默认不可自动重试。streaming 与
+  non-streaming 错误共享分类、reason code 和 retryable 信息。
+- 新增有界内存 Prompt claim（128 条、沿用 6 小时 TTL）：同一 conversation/history/
+  current prompt 在提交后失败、取消或进程死亡时，相同 retry 返回 409
+  `prompt_outcome_unknown`，不再调用 `session/prompt`；未提交的启动/配置失败可重试。
+  状态不跨 bridge 进程重启，淘汰后无法识别旧请求。
+- ACP `clientInfo` 按维护者决定保持原来的 `zed / 0.0.0`，用于 agy 非 Gemini 模型
+  allowlist；未引入 bridge 身份或额外 ACP 身份环境变量。
+- `systemPrompt.append` 仅随 session/new；resume 使用 reserve/commit/restore，失败不丢
+  持久化快照，仅 Conversation Not Found/方法不支持等明确缺失回退 new。
+- 工具目录未确认时发送前失败（`tool_list_unconfirmed`），相同请求可在确认后重试；
+  MCP watch 有界退避重连并强制重新 list，control call 新增 `mcpRequestId` 关联字段。
+  长工具仍沿用 agy 180 秒限制下的同参重调等待；MCP request ID 已保留，ACP
+  toolCallId 尚未接入关联，agy 重调是否能提供稳定上游 ID 也未实测，不宣称该协议限制已消失。
+- Claude Haiku 不再默认落到 Gemini Flash；无真实 Haiku family 时返回
+  `model_unavailable`。
+- 验证：合并最新 origin/main 后，Node 默认测试 **67 focused tests + 330 smoke checks**
+  全部通过；包括真实
+  MCP helper 子进程和 localhost watch 重连。未运行真实 agy/Google、Windows 或 Bun
+  全量测试，未提交、推送或发布。
 ## 2026-11-06：额度探测隔离全局技能扫描（#10）
 
 - macOS 上 `agy -p /usage` 的 print-mode 启动会在选择 agent 之前重载系统

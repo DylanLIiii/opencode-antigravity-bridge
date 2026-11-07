@@ -16,7 +16,11 @@ Gemini、Claude、GPT-OSS 全系可用。
 ## 核心特性
 
 - **全订阅模型可用**：Gemini、Claude、GPT-OSS 一应俱全，会话中可随时切换模型
-  和思考等级。
+  和思考等级；ACP 保持 Zed 兼容身份以支持 agy 的非 Gemini 模型 allowlist。
+- **Prompt 风险收敛**：精确移除独立计费伪 header、规范化已知 Agent SDK 身份句，
+  不全局改写用户正文；通用 429 不再被直接当作确定配额耗尽。
+- **异常防重发**：同一逻辑 Prompt 在提交后失败、取消或进程退出时，不会因客户端
+  自动重试再次交给 agy。
 - **流式输出 + 思考摘要 + 图片输入**：文本、思考过程、图片按顺序完整呈现。
 - **Claude Code 兼容**：支持尾随 system/developer 上下文、hooks、Skill /
   ToolSearch 工具附加内容和用户排队消息，兼容非流式 Messages 响应。
@@ -66,7 +70,7 @@ agy
 ```
 
 客户端侧零配置：不需要改全局 MCP 配置，插件为每个 agy 进程创建隔离的临时
-agent。
+agent。ACP `clientInfo` 固定使用 `zed / 0.0.0`，兼容 agy 的非 Gemini 模型 allowlist。
 
 ## 它是怎么工作的
 
@@ -118,8 +122,13 @@ magpie quota refresh antigravity-bridge --json
   发现、启动和 WSL 路径处理，并有命令构造测试；维护者尚未完成 Windows 实机验证。
 - **账号**：一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
   `authenticate` 去切换登录。
+- **Prompt Guard**：默认开启，仅处理 system 中的独立计费元数据和已知 Agent SDK
+  身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭。不会全局替换厂商名称或清洗 user 正文。
+- **错误与重试**：通用 `RESOURCE_EXHAUSTED` 不再被当作确定配额耗尽；已提交 Prompt
+  的相同请求重试会返回 `prompt_outcome_unknown`，不会再次调用 `session/prompt`。
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
-  （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。
+  （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。system instructions 只在
+  `session/new` 安装，resume 不重复 append；恢复失败保留旧快照。
 - **超时**：启动 60s、agy 空闲 5min、等客户端工具结果 30min，可用
   `AGY_BRIDGE_START_TIMEOUT_MS` / `AGY_BRIDGE_TURN_TIMEOUT_MS` /
   `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整。

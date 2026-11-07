@@ -591,6 +591,7 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
   const calls = logs().filter(event => event.type === "usage")
   check("auth.usage uses a separate cleaned workspace", calls.length === 1 && !fs.existsSync(calls[0].cwd))
   check("auth.usage runs only the native usage command", calls[0]?.args.includes("/usage") && calls[0]?.args.includes("magpie-usage"))
+  check("auth.usage isolates the CLI profile", calls[0]?.args.some(arg => arg.startsWith("--gemini_dir=")))
 }
 
 {

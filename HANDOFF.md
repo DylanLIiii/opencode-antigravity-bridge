@@ -23,9 +23,26 @@
   toolCallId 尚未接入关联，agy 重调是否能提供稳定上游 ID 也未实测，不宣称该协议限制已消失。
 - Claude Haiku 不再默认落到 Gemini Flash；无真实 Haiku family 时返回
   `model_unavailable`。
-- 验证：Node 默认测试 **64 focused tests + 329 smoke checks** 全部通过；包括真实
+- 验证：合并最新 origin/main 后，Node 默认测试 **67 focused tests + 330 smoke checks**
+  全部通过；包括真实
   MCP helper 子进程和 localhost watch 重连。未运行真实 agy/Google、Windows 或 Bun
   全量测试，未提交、推送或发布。
+## 2026-11-06：额度探测隔离全局技能扫描（#10）
+
+- macOS 上 `agy -p /usage` 的 print-mode 启动会在选择 agent 之前重载系统
+  slash commands 和 skills；`~/.gemini/config/skills` 指向 iCloud 时可能
+  触发大量 sandboxd/FileProvider 审批。
+- 额度探测现在给 `agy` 传隐藏参数 `--gemini_dir=<临时目录>`，使用独立空配置，
+  不再扫描全局 skills/rules/plugins/MCP/settings。登录态仍由 keyring/ADC
+  提供；文件 token 只做符号链接（不读取、不复制，随工作区删除）。版本探测
+  同时检测该参数，旧版 CLI 不识别时回退到默认目录。
+- quota agent 增加 `inheritMcp: false`、`inheritCustomizations: false`、
+  `excludeDefaultComponents: true`。
+- 新增 `AGY_BRIDGE_USAGE=0`（也接受 false/off/no/disabled）关闭自动额度探测。
+- 验证：Node 39 tests + 301 smoke checks 通过；本机 agy 1.5.2 的真实
+  `/usage` 在隔离目录下成功（keyring 登录）；`agy models` 与 ACP
+  initialize/session-new 未观察到 skills reload。1.5.1 是否支持
+  `--gemini_dir` 未实测，代码已做回退。
 
 ## 2026-11-05：修复 ACP 缓存用量被重复扣减
 

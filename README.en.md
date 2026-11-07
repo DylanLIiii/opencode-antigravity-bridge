@@ -261,14 +261,25 @@ gain the hook automatically). This is Magpie's `auth.usage` extension, not a
 native OpenCode V2 quota UI. A current Magpie with plugin usage support is
 required; the hook was verified with the **0.1.1599** host.
 
-The plugin runs `agy --version`, then `agy -p /usage --output-format json`
-with a restricted custom agent and a bounded print timeout. It reads the
-**current agy sign-in**, not a Google account separately added to Magpie. It
-does not read, copy, or save Google tokens, impersonate the IDE, scrape the TUI,
-or send a model prompt. `agy` remains responsible for authentication and quota
-requests. An unrecognized version, or one older than **1.1.11**, is rejected
-before print mode because older slash-command implementations could treat
-`/usage` as a model prompt.
+The plugin queries `agy --version`, then runs
+`agy -p /usage --output-format json` with a restricted custom agent and a
+bounded print timeout. It reads the **current agy sign-in**, not a Google
+account separately added to Magpie. It does not read, copy, or save Google
+tokens, impersonate the IDE, scrape the TUI, or send a model prompt. `agy`
+remains responsible for authentication and quota requests. An unrecognized
+version, or one older than **1.1.11**, is rejected before print mode because
+older slash-command implementations could treat `/usage` as a model prompt.
+
+Quota probes use a private `--gemini_dir` profile. Print-mode startup therefore
+discovers only that empty profile instead of the user's global
+`~/.gemini/config` skills, rules, plugins, MCP servers and settings. A
+file-based agy sign-in is linked into the profile when present; otherwise the
+probe relies on the same keyring/ADC credentials as the CLI. The link is
+removed with the workspace and the token contents are never copied. Hidden
+`--gemini_dir` support is probed with the version call; older CLIs fall back to
+the normal Gemini directory. Set `AGY_BRIDGE_USAGE=0` to skip automatic quota
+probes entirely (for example while investigating a CLI or macOS approval
+service problem).
 
 - Each returned group/cadence becomes a named window with percent used and,
   when available, its absolute reset time. Weekly-only plans do not gain a
@@ -287,8 +298,10 @@ before print mode because older slash-command implementations could treat
   to 18 seconds, below Magpie's 20-second usage-hook deadline. Version probing
   is capped at three seconds within that budget.
 - A private temporary workspace contains the custom agent (`tools: []`,
-  `mcpServers: []`) and failing `open`/`xdg-open`/`BROWSER` launchers, preventing
-  background usage refreshes from opening OAuth browser login. Queries set
+  `mcpServers: []`, `inheritMcp: false`, `inheritCustomizations: false`,
+  `excludeDefaultComponents: true`) and failing
+  `open`/`xdg-open`/`BROWSER` launchers, preventing background usage refreshes
+  from opening OAuth browser login. Queries set
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` only for their child processes. They do
   not change global agy settings or the user's updater preferences.
 - On completion, failure, timeout, or cancellation, the query's owned POSIX
@@ -364,6 +377,8 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume and submitted-prompt dedupe retention |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | startup, agy inactivity, client tool result |
+| `AGY_BRIDGE_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips automatic quota probes entirely |
+| `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | quota subprocess budget, capped at 18000 ms |
 | `AGY_BRIDGE_MCP_TRACE` | unset | file that receives the MCP helper's traffic (diagnostics) |
 
 ## Development
@@ -379,7 +394,7 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. The current suite has 329 smoke checks and 64 focused Node tests.
+exercised. The current suite has 330 smoke checks and 67 focused Node tests.
 Historical Bun results are documented below; the current expanded suite has not
 been rerun on Bun. These tests do not substitute for Windows end-to-end
 validation. Together they cover the minimal agent, the allowlisted ACP identity,

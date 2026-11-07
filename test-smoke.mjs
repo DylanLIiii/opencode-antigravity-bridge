@@ -61,6 +61,7 @@ let clientInfo = null
 let session = null
 let model = "gemini-test-medium"
 let tools = []
+let toolListTimeouts = Number(process.env.FAKE_AGY_TOOL_LIST_TIMEOUTS) || 0
 let mcp = null
 let mcpReady = null
 let nextMcpId = 0
@@ -82,6 +83,11 @@ function mcpRequest(method, params) {
 }
 
 async function listTools(reason) {
+  if (reason === "list_changed" && toolListTimeouts > 0) {
+    toolListTimeouts--
+    log({ type: "toolsListTimeout", reason, convId: session?.id })
+    return
+  }
   tools = (await mcpRequest("tools/list", {})).tools
   log({ type: "toolsList", reason, convId: session?.id, tools: tools.map(tool => tool.name) })
 }
@@ -183,6 +189,11 @@ async function prompt(params) {
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: FAILED_PRECONDITION (code 400): fake upstream failure.\n")
     chunk("\n⚠ Agent execution terminated due to error.\n")
     log({ type: "agentError", convId: session.id })
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("GENERIC429")) {
+    fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): upstream rejected request.\n")
+    chunk("\n⚠ Agent execution terminated due to error.\n")
     return { stopReason: "end_turn" }
   }
   if (text.includes("QUOTA")) {
@@ -349,6 +360,13 @@ async function handle(message) {
     case "session/resume": {
       if (process.env.FAKE_AGY_INIT_MODE === "slow") await new Promise(resolve => setTimeout(resolve, 100))
       if (process.env.FAKE_AGY_INIT_MODE === "early-error") throw { code: -32603, message: "Eligibility check failed: test EOF" }
+      if (message.method === "session/resume" && process.env.FAKE_AGY_RESUME_ERROR) {
+        const mode = process.env.FAKE_AGY_RESUME_ERROR
+        log({ type: "resumeError", convId: params.sessionId, mode })
+        if (mode === "permission") throw { code: -32603, message: "Permission denied by test account" }
+        if (mode === "method") throw { code: -32601, message: "Method not found" }
+        if (mode === "not-found") throw { code: -32602, message: "Conversation Not Found" }
+      }
       let prompts = 0
       if (message.method === "session/resume") {
         if (!fs.existsSync(statePath(params.sessionId))) throw { code: -32602, message: "Conversation Not Found" }
@@ -618,6 +636,22 @@ async function launchedModel(body) {
 }
 
 {
+  const beforeInits = inits().length
+  const beforePrompts = logs().filter(event => event.type === "user").length
+  const response = await callFetch({
+    model: "antigravity-bridge/claude-haiku-4-5-20251001",
+    messages: [{ role: "user", content: "Haiku must not borrow Gemini small-fast routing" }],
+  })
+  const payload = await response.json()
+  check("Claude Haiku without an advertised Haiku family is explicitly unavailable",
+    response.status === 400 && response.headers.get("x-should-retry") === "false" &&
+    payload.error?.code === "model_unavailable" && payload.error?.message?.includes("no Claude Haiku family"),
+    JSON.stringify({ status: response.status, payload }))
+  check("unavailable Haiku never starts or prompts a Gemini session",
+    inits().length === beforeInits && logs().filter(event => event.type === "user").length === beforePrompts)
+}
+
+{
   process.env.FAKE_AGY_CONFIG = "grouped"
   const first = { model: "gemini-config-only", metadata: { user_id: "grouped-config" }, thinking: { type: "adaptive" }, output_config: { effort: "max" }, messages: [{ role: "user", content: "config only maximum" }] }
   const firstEvents = (await readSSE(await callFetch(first))).events
@@ -647,11 +681,17 @@ async function launchedModel(body) {
 
   process.env.FAKE_AGY_CONFIG = "error"
   const before = logs().filter(event => event.type === "setModel").length
-  const rejected = await callFetch({ model, messages: [{ role: "user", content: "rejected config" }] })
+  const rejectedBody = { model, messages: [{ role: "user", content: "rejected config" }] }
+  const rejected = await callFetch(rejectedBody)
   const error = await rejected.json()
   check("real config errors remain visible before streaming", rejected.status === 400 && error.error?.message.includes("Configuration rejected"))
   check("real config errors do not trigger a legacy fallback", logs().filter(event => event.type === "setModel").length === before)
   delete process.env.FAKE_AGY_CONFIG
+  const retryResponse = await callFetch(rejectedBody)
+  const retryEvents = (await readSSE(retryResponse)).events
+  check("a failure before session/prompt can retry the same request",
+    retryResponse.status === 200 && stopOf(retryEvents) === "end_turn" &&
+    logs().filter(event => event.type === "user" && event.text === "rejected config").length === 1)
 
   const body = { model, messages: [{ role: "user", content: "CONFIGRESET first turn" }] }
   const events = (await readSSE(await callFetch(body))).events
@@ -677,10 +717,41 @@ async function launchedModel(body) {
   const init = inits().at(-1)
   const user = lastOf("user")
   check("ACP session uses the minimal isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true"].every(line => init.agentConfig.includes(line)), init.agentConfig)
-  check("ACP client identifies as an allowlisted client", init.clientInfo?.name === "zed")
+  check("ACP client identifies as an allowlisted client", init.clientInfo?.name === "zed" && init.clientInfo?.version === "0.0.0")
   check("client system prompt is appended to the session instructions", init.systemAppend?.includes("SYSTEM-PROMPT-MARKER"))
   check("fresh prompt carries only the user text", user.text === "hello world", JSON.stringify(user.text))
   check("client tools are served through the ide-tools port", !!init.idePort && !logs().some(event => event.type === "ncExit"))
+}
+
+{
+  const billing = "x-anthropic-billing-header: cc_version=2.1.234; cc_entrypoint=sdk-cli;"
+  const sdkIdentity = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+  const inlineIdentity = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+  const body = {
+    model,
+    system: [
+      { type: "text", text: billing },
+      { type: "text", text: `${sdkIdentity}\nKeep Anthropic, OpenAI and Deepseek as ordinary words.`, cache_control: { type: "ephemeral" } },
+    ],
+    messages: [
+      { role: "system", content: inlineIdentity },
+      { role: "user", content: `PROMPTGUARD user text stays unchanged: ${sdkIdentity}` },
+    ],
+  }
+  const response = await callFetch(body)
+  const events = (await readSSE(response)).events
+  const init = inits().at(-1)
+  const user = lastOf("user")
+  check("prompt guard covers top-level and inline system blocks before flattening",
+    response.status === 200 && stopOf(events) === "end_turn" &&
+    !init.systemAppend?.includes("x-anthropic-billing-header") &&
+    !init.systemAppend?.includes("Claude Agent SDK") &&
+    (init.systemAppend?.match(/You are an AI coding assistant\./g) || []).length === 2,
+    init.systemAppend)
+  check("prompt guard preserves ordinary vendor words and user text",
+    init.systemAppend?.includes("Anthropic, OpenAI and Deepseek") &&
+    user.text === `PROMPTGUARD user text stays unchanged: ${sdkIdentity}`,
+    JSON.stringify({ system: init.systemAppend, user: user.text }))
 }
 
 {
@@ -1077,6 +1148,39 @@ let nativeConv
 }
 
 {
+  process.env.FAKE_AGY_TOOL_LIST_TIMEOUTS = "1"
+  process.env.AGY_BRIDGE_TOOL_LIST_WAIT_MS = "150"
+  try {
+    const first = { model, messages: [{ role: "user", content: "catalog timeout setup" }], tools: [echoTool] }
+    const firstEvents = (await readSSE(await callFetch(first))).events
+    const convId = inits().at(-1)?.convId
+    const second = {
+      ...nextTurn(first, firstEvents, "catalog change must wait"),
+      tools: [echoTool, { name: "timeout_other", input_schema: { type: "object" } }],
+    }
+    const promptCount = () => logs().filter(event => event.type === "user" && event.text === "catalog change must wait").length
+    const failed = await callFetch(second)
+    const payload = await failed.json()
+    check("an unconfirmed tools/list_changed fails explicitly before prompt",
+      failed.status === 503 && payload.error?.code === "tool_list_unconfirmed" &&
+      payload.error?.message?.includes("no prompt was sent") && promptCount() === 0,
+      JSON.stringify({ status: failed.status, payload, prompts: promptCount() }))
+    check("the fake really withheld one changed-tool confirmation",
+      logs().filter(event => event.type === "toolsListTimeout" && event.convId === convId).length === 1)
+    const retried = await callFetch(second)
+    const events = (await readSSE(retried)).events
+    check("the identical prompt retries after catalog confirmation",
+      retried.status === 200 && stopOf(events) === "end_turn" && promptCount() === 1 && lastOf("user").convId === convId,
+      `status=${retried.status}, prompts=${promptCount()}`)
+    check("retry performs the normal list_changed catalog refresh",
+      logs().some(event => event.type === "toolsList" && event.reason === "list_changed" && event.convId === convId && event.tools.includes("timeout_other")))
+  } finally {
+    delete process.env.FAKE_AGY_TOOL_LIST_TIMEOUTS
+    delete process.env.AGY_BRIDGE_TOOL_LIST_WAIT_MS
+  }
+}
+
+{
   const firstBody = { model, messages: [{ role: "user", content: "MODEL switching" }] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
   const convId = inits().at(-1).convId
@@ -1121,18 +1225,69 @@ for (const change of ["tools", "model"]) {
   const before = inits().length
   const convId = inits().at(-1).convId
   const body = nextTurn(opening, openingEvents, "AGENTERROR upstream")
+  const promptCount = () => logs().filter(event => event.type === "user" && event.text.includes("AGENTERROR upstream")).length
   const { events } = await readSSE(await callFetch(body))
   const error = events.find(event => event.event === "error")?.data?.error
   check("agy's in-band failure becomes an error frame", error?.message?.includes("fake upstream failure"), JSON.stringify(error))
   check("error marker text is not streamed as content", textOf(events) === "partial before failure", JSON.stringify(textOf(events)))
-  const retry = (await readSSE(await callFetch(body))).events
-  check("retry after an upstream error reuses the session", inits().length === before && lastOf("user").convId === convId && lastOf("user").text === "AGENTERROR upstream" && retry.some(event => event.event === "error"), JSON.stringify({ inits: inits().length - before, user: lastOf("user"), kinds: retry.map(event => event.event) }))
+  const retryResponse = await callFetch(body)
+  const retryError = await retryResponse.json()
+  check("retry after an upstream error returns outcome_unknown without another prompt",
+    retryResponse.status === 409 && retryResponse.headers.get("x-should-retry") === "false" &&
+    retryError.error?.code === "prompt_outcome_unknown" && promptCount() === 1 && inits().length === before,
+    JSON.stringify({ status: retryResponse.status, error: retryError, prompts: promptCount() }))
+  const nonstreamRetry = await callFetch({ ...body, stream: false })
+  const nonstreamError = await nonstreamRetry.json()
+  check("streaming and non-streaming retries share the submitted-prompt record",
+    nonstreamRetry.status === 409 && nonstreamError.error?.code === "prompt_outcome_unknown" && promptCount() === 1)
+
+  const changedPrompt = { ...body, messages: [...body.messages] }
+  changedPrompt.messages[changedPrompt.messages.length - 1] = { role: "user", content: "a different prompt after the upstream failure" }
+  const changedResponse = await callFetch(changedPrompt)
+  const changedEvents = (await readSSE(changedResponse)).events
+  check("a different current prompt is not swallowed by prompt dedupe",
+    changedResponse.status === 200 && stopOf(changedEvents) === "end_turn" &&
+    lastOf("user").convId === convId && lastOf("user").text === "a different prompt after the upstream failure" && promptCount() === 1)
+
+  const changedHistory = { ...body, messages: [...body.messages] }
+  changedHistory.messages[1] = { role: "assistant", content: [{ type: "text", text: "an edited prior answer" }] }
+  const changedHistoryEvents = (await readSSE(await callFetch(changedHistory))).events
+  check("the same current prompt with different base history is not deduped",
+    promptCount() === 2 && changedHistoryEvents.some(event => event.event === "error"), `prompts=${promptCount()}`)
+}
+
+{
+  const body = { model, stream: false, messages: [{ role: "user", content: "AGENTERROR nonstream origin" }] }
+  const failed = await callFetch(body)
+  await failed.json()
+  const promptCount = () => logs().filter(event => event.type === "user" && event.text === "AGENTERROR nonstream origin").length
+  const retry = await callFetch({ ...body, stream: true })
+  const error = await retry.json()
+  check("a non-streaming failure also blocks its streaming retry without resending",
+    failed.status === 502 && retry.status === 409 && error.error?.code === "prompt_outcome_unknown" && promptCount() === 1,
+    JSON.stringify({ first: failed.status, retry: retry.status, prompts: promptCount() }))
 }
 
 {
   const { events } = await readSSE(await callFetch({ model, messages: [{ role: "user", content: "QUOTA exhausted" }] }))
   const error = events.find(event => event.event === "error")?.data?.error
   check("split error marker and quota map to rate_limit_error", error?.type === "rate_limit_error" && error.message.includes("quota exhausted") && textOf(events) === "", JSON.stringify({ error, text: textOf(events) }))
+}
+
+{
+  const streamBody = { model, messages: [{ role: "user", content: "GENERIC429 streaming" }] }
+  const { events } = await readSSE(await callFetch(streamBody))
+  const error = events.find(event => event.event === "error")?.data?.error
+  check("unspecified resource exhaustion is not presented as confirmed quota exhaustion",
+    error?.type === "rate_limit_error" && error?.code === "AGY_ERROR_RESOURCE_EXHAUSTED_UNSPECIFIED" &&
+    error?.retryable === false && error.message.includes("quota exhaustion is not confirmed"), JSON.stringify(error))
+
+  const response = await callFetch({ model, stream: false, messages: [{ role: "user", content: "GENERIC429 nonstream" }] })
+  const payload = await response.json()
+  check("nonstream generic 429 carries an explicit no-retry contract",
+    response.status === 429 && response.headers.get("x-should-retry") === "false" &&
+    payload.error?.code === "AGY_ERROR_RESOURCE_EXHAUSTED_UNSPECIFIED" && payload.error?.retryable === false,
+    JSON.stringify({ status: response.status, headers: Object.fromEntries(response.headers), payload }))
 }
 
 {
@@ -1282,6 +1437,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
   await reader.cancel()
   await new Promise(resolve => setTimeout(resolve, 200))
   check("cancellation sends session/cancel instead of killing agy", lastOf("cancel")?.convId === init.convId && lastOf("cancelled")?.convId === init.convId && fs.existsSync(init.cwd))
+  const cancelledRetry = await callFetch(body)
+  const cancelledError = await cancelledRetry.json()
+  check("retrying a cancelled submitted prompt does not send it again",
+    cancelledRetry.status === 409 && cancelledError.error?.code === "prompt_outcome_unknown" &&
+    logs().filter(event => event.type === "user" && event.text === "SLOW cancellation").length === 1)
   const next = {
     ...body,
     messages: [...body.messages, { role: "assistant", content: [{ type: "text", text: "partial slow answer" }] }, { role: "user", content: "after cancel" }],
@@ -1357,8 +1517,96 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const crashFirstEvents = (await readSSE(await callFetch(crashFirst))).events
   const crashTarget = inits().at(-1)
   check("completed turn parks session before crash test", fs.readFileSync(bridgeStateFile, "utf8").includes(crashTarget.convId))
-  await readSSE(await callFetch(nextTurn(crashFirst, crashFirstEvents, "DIE mid-turn crash")))
+  const crashBody = nextTurn(crashFirst, crashFirstEvents, "DIE mid-turn crash")
+  await readSSE(await callFetch(crashBody))
   check("in-flight prompt crash removes stale pre-turn snapshot from state file", !fs.readFileSync(bridgeStateFile, "utf8").includes(crashTarget.convId))
+  const crashRetry = await callFetch(crashBody)
+  const crashError = await crashRetry.json()
+  check("an agy process death cannot cause the same prompt to be sent again",
+    crashRetry.status === 409 && crashError.error?.code === "prompt_outcome_unknown" &&
+    logs().filter(event => event.type === "user" && event.text.includes("DIE mid-turn crash")).length === 1)
+}
+
+{
+  const first = { model, system: "CONSECUTIVE-RESUME-SYSTEM", messages: [{ role: "user", content: "MEMORY append installed on new" }] }
+  let previous = first
+  let events = (await readSSE(await callFetch(first))).events
+  const target = inits().at(-1)
+  check("the initial session/new installs the system append", target.resumed === false && target.systemAppend?.includes("CONSECUTIVE-RESUME-SYSTEM"))
+  for (const round of [1, 2]) {
+    const { default: resumedDefault } = await import(`./index.mjs?consecutive-resume-${round}`)
+    const resumedLoader = await (await resumedDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+    previous = nextTurn(previous, events, `MEMORY consecutive resume ${round}`)
+    const response = await resumedLoader.fetch("agy://local/messages", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(previous),
+    })
+    events = (await readSSE(response)).events
+    check(`consecutive resume ${round} reuses the official session without replaying instructions`,
+      response.status === 200 && stopOf(events) === "end_turn" && inits().at(-1)?.resumed === true &&
+      inits().at(-1)?.convId === target.convId && lastOf("user").text === `MEMORY consecutive resume ${round}` &&
+      !lastOf("user").text.includes("CONSECUTIVE-RESUME-SYSTEM"))
+  }
+  const related = inits().filter(event => event.convId === target.convId)
+  check("system append appears only on new across consecutive resumes",
+    related.length === 3 && related.filter(event => event.resumed).length === 2 &&
+    related.filter(event => event.resumed).every(event => event.systemAppend === null),
+    JSON.stringify(related.map(event => ({ resumed: event.resumed, append: event.systemAppend }))))
+}
+
+{
+  const cases = []
+  for (const mode of ["permission", "model"]) {
+    const first = { model, system: `ATOMIC-RESUME-${mode}`, messages: [{ role: "user", content: `MEMORY before ${mode} resume failure` }] }
+    const firstEvents = (await readSSE(await callFetch(first))).events
+    cases.push({ mode, target: inits().at(-1), request: nextTurn(first, firstEvents, `MEMORY after ${mode} resume failure`) })
+  }
+  const { default: atomicDefault } = await import("./index.mjs?atomic-resume")
+  const atomicLoader = await (await atomicDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  for (const { mode, target, request } of cases) {
+    const fetchRetry = () => atomicLoader.fetch("agy://local/messages", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
+    })
+    const newCount = () => inits().filter(event => !event.resumed).length
+    const beforeNew = newCount()
+    if (mode === "permission") process.env.FAKE_AGY_RESUME_ERROR = "permission"
+    else process.env.FAKE_AGY_CONFIG = "error"
+    const failed = await fetchRetry()
+    const payload = await failed.json()
+    delete process.env.FAKE_AGY_RESUME_ERROR
+    delete process.env.FAKE_AGY_CONFIG
+    check(`${mode} resume/startup failure is surfaced instead of creating a new session`,
+      (mode === "permission" ? failed.status === 502 && payload.error?.message?.includes("Permission denied")
+        : failed.status === 400 && payload.error?.message?.includes("Configuration rejected")) && newCount() === beforeNew,
+      JSON.stringify({ status: failed.status, payload, beforeNew, afterNew: newCount() }))
+    check(`${mode} failure restores the durable resume snapshot`,
+      fs.readFileSync(bridgeStateFile, "utf8").includes(target.convId) &&
+      !logs().some(event => event.type === "user" && event.text === `MEMORY after ${mode} resume failure`))
+    const retried = await fetchRetry()
+    const events = (await readSSE(retried)).events
+    check(`${mode} failure can retry the same prompt and resume the old session`,
+      retried.status === 200 && stopOf(events) === "end_turn" && inits().at(-1)?.resumed === true &&
+      inits().at(-1)?.convId === target.convId && newCount() === beforeNew && textOf(events).includes("prompts so far 2"),
+      `status=${retried.status}, text=${textOf(events)}`)
+  }
+}
+
+{
+  const first = { model, system: "RESUME-METHOD-FALLBACK", messages: [{ role: "user", content: "before unsupported resume" }] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const target = inits().at(-1)
+  const { default: fallbackDefault } = await import("./index.mjs?resume-method-fallback")
+  const fallbackLoader = await (await fallbackDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  process.env.FAKE_AGY_RESUME_ERROR = "method"
+  const response = await fallbackLoader.fetch("agy://local/messages", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(nextTurn(first, firstEvents, "after unsupported resume")),
+  })
+  delete process.env.FAKE_AGY_RESUME_ERROR
+  const events = (await readSSE(response)).events
+  check("method-not-supported resume explicitly falls back to session/new",
+    response.status === 200 && stopOf(events) === "end_turn" && inits().at(-1)?.resumed === false && inits().at(-1)?.convId !== target.convId)
+  check("the fallback new session installs instructions exactly once",
+    inits().at(-1)?.systemAppend?.includes("RESUME-METHOD-FALLBACK") &&
+    logs().filter(event => event.type === "resumeError" && event.convId === target.convId && event.mode === "method").length === 1)
 }
 
 {
@@ -1497,8 +1745,12 @@ for (const location of ["inline", "system", "developer", "user"]) {
   }
   const errEvents = (await readSSE(await callFetch(errBody))).events
   check("upstream error on trailing-system turn emits error frame", errEvents.some(event => event.event === "error"))
-  await readSSE(await callFetch(errBody))
-  check("retry after upstream error reuses session and preserves trailing-system turn",
+  const errorPromptCount = () => logs().filter(event => event.type === "user" && event.convId === convId &&
+    event.text.includes("AGENTERROR with trailing system")).length
+  const retryResponse = await callFetch(errBody)
+  const retryError = await retryResponse.json()
+  check("trailing-system retry preserves its terminal error without another prompt",
+    retryResponse.status === 409 && retryError.error?.code === "prompt_outcome_unknown" && errorPromptCount() === 1 &&
     inits().length === beforeErrorInits && lastOf("user").convId === convId &&
     lastOf("user").text.includes("AGENTERROR with trailing system") &&
     lastOf("user").text.includes("retry-system"))
@@ -1924,10 +2176,10 @@ for (const location of ["inline", "system", "developer", "user"]) {
     lastOf("user").text.includes("Write to /tmp/safe instead"),
     `status=${rRes.status}`)
 
-  // type:"prompt" hook request with claude-haiku small-fast model alias + output_config.format json_schema,
+  // type:"prompt" hook request with Gemini Flash small-fast model alias + output_config.format json_schema,
   // plus historical server_tool_use/web_search_tool_result and search_result blocks.
   const promptHookRes = await callFetch({
-    model: "antigravity-bridge/claude-haiku-4-5-20251001",
+    model: "antigravity-bridge/gemini-3.8-flash",
     stream: false,
     output_config: {
       format: {
@@ -1956,7 +2208,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   })
   const promptHookMsg = await promptHookRes.json()
   const promptHookUser = lastOf("user")
-  check("prompt-hook json_schema, small-fast model alias, server_tool_use history, and search_result succeed without 400",
+  check("prompt-hook json_schema, Gemini Flash alias, server_tool_use history, and search_result succeed without 400",
     promptHookRes.status === 200 && promptHookMsg.type === "message" &&
     promptHookUser.model === "gemini-test-low" &&
     promptHookUser.text.includes("Structured output requirement") &&

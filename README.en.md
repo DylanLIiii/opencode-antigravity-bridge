@@ -10,9 +10,10 @@ The plugin translates Anthropic Messages to the **Agent Client Protocol (ACP)**
 that `agy acp` serves on stdio, following the approach of
 [T3 Code's Antigravity driver](https://github.com/pingdotgg/t3code/tree/main/apps/server/src/provider/acp).
 It keeps one agy session per conversation and serves the client's tools to agy
-as its IDE tools over MCP. Google sees requests made by the real CLI; this
-avoids client-identity spoofing, but it is not a guarantee against account
-restrictions or changes to Google's policies.
+as its IDE tools over MCP. Google sees requests made by the real CLI; ACP keeps
+the `zed / 0.0.0` compatibility identity required by agy's non-Gemini model
+allowlist. This is not a guarantee against account restrictions or changes to
+Google's policies.
 
 ```
 Client (OpenCode, Amp, Claude Code, ...)
@@ -71,9 +72,10 @@ magpie plugin add ./opencode-antigravity-bridge
   an HMAC-SHA256 over the session and the block text under a per-process key.
   Send `thinking: { "type": "disabled" }` or set `AGY_BRIDGE_THINKING=0` to
   suppress them.
-- **All account models.** The ACP client identifies as an allowlisted client,
-  which is how agy offers Claude and GPT-OSS models besides Gemini (as T3 Code
-  does). Changing the model, or the effort level, uses the server's ACP
+- **All account models.** The ACP client identifies as `zed / 0.0.0`, the
+  allowlisted compatibility identity used by T3 Code, which is how agy offers
+  Claude and GPT-OSS models besides Gemini. Changing the model, or the effort
+  level, uses the server's ACP
   `model` and `thought_level` configuration options inside the live session.
   Model changes refresh the available thinking levels; configuration update
   notifications keep the selection current. Older servers without these
@@ -93,7 +95,9 @@ magpie plugin add ./opencode-antigravity-bridge
   prompt within the same response. The client runs each call exactly once.
 - **Live tool catalog changes** (for example OpenCode Code Mode) reach agy
   through MCP `notifications/tools/list_changed`, including in the middle of a
-  tool continuation; the session is kept.
+  tool continuation; the session is kept. A catalog that cannot be confirmed
+  fails before `session/prompt` with `tool_list_unconfirmed`, and a disconnected
+  MCP watch reconnects with bounded backoff and requests a fresh tool list.
 - **Session resume, including across restarts.** After every completed turn,
   and when an idle (10 minutes, `AGY_BRIDGE_IDLE_MS`) or LRU-evicted process is
   stopped, the bridge records the conversation's agy session in a private state
@@ -103,15 +107,27 @@ magpie plugin add ./opencode-antigravity-bridge
   text. The next request whose history and instructions hash the same, also
   after a Magpie or plugin restart, starts agy with `session/resume` and sends
   only the new message (within `AGY_BRIDGE_RESUME_TTL_MS`, default 6 hours).
-  Concurrent bridge processes merge the file instead of overwriting it.
+  Instructions are appended only on `session/new`, never appended again on
+  resume. A failed resume or startup restores the durable snapshot instead of
+  discarding it; only a missing/unsupported conversation falls back to
+  `session/new`. Concurrent bridge processes merge the file instead of
+  overwriting it.
 - **Cancellation without loss.** A client that stops reading gets
   `session/cancel`; the session stays alive and the partial answer the client
   saw becomes part of the expected history.
-- **Upstream errors.** agy reports API failures as an in-band
-  `⚠ Agent execution terminated due to error.` message and `end_turn`. The
-  bridge withholds that marker, reads the real reason from the process's own
-  log, and sends an error frame (`rate_limit_error` for quota/429). The session
-  survives, so a retry does not replay history.
+- **Upstream errors without retry amplification.** agy reports API failures as
+  an in-band `⚠ Agent execution terminated due to error.` message and
+  `end_turn`. The bridge withholds that marker and reads the real reason from
+  the process's own log. Generic `RESOURCE_EXHAUSTED`/429 is no longer described
+  as confirmed quota exhaustion and is not automatically retryable. Once a
+  prompt has been submitted, an identical streaming or non-streaming retry gets
+  `prompt_outcome_unknown` rather than issuing another `session/prompt`; a
+  different follow-up can continue the surviving session without replaying it.
+- **Scoped system-prompt guard.** Standalone Claude billing metadata blocks and
+  two exact Claude Agent SDK identity sentences are normalized before system
+  blocks are flattened. User messages, tool results, code quotations, vendor
+  names and safety instructions are not globally rewritten. Set
+  `AGY_BRIDGE_PROMPT_GUARD=0` to disable this compatibility layer.
 - **Per-turn token usage** from ACP prompt usage: cached prompt tokens are
   reported as `cache_read_input_tokens`, and thought tokens are included in
   `output_tokens` and itemized in `output_tokens_details.thinking_tokens`.
@@ -149,8 +165,8 @@ magpie plugin add ./opencode-antigravity-bridge
   `server_tool_use` / `web_search_tool_result` blocks, MCP `input_schema`
   keyword sanitization for Gemini/Vertex compatibility, effort selection via
   `output_config.effort` / `thinking.budget_tokens`, Windows `.cmd` / `.bat` and
-  WSL `/mnt/<drive>` working-directory translation, and legacy/small-fast model
-  alias fallback.
+  WSL `/mnt/<drive>` working-directory translation, and same-family model alias
+  fallback. Claude Haiku never silently routes to Gemini Flash.
 - **Conversation pooling**: at most four agy processes, idle reaping, LRU
   eviction, and HTTP 503 for conflicting concurrent responses.
 - **Isolation without a permission bypass.** The agent is defined with
@@ -341,9 +357,11 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 | `AGY_BRIDGE_THINKING` | on | `0` stops forwarding thought summaries |
 | `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
+| `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
+| `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
-| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | how long a parked session can be resumed |
+| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume and submitted-prompt dedupe retention |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | startup, agy inactivity, client tool result |
 | `AGY_BRIDGE_MCP_TRACE` | unset | file that receives the MCP helper's traffic (diagnostics) |
@@ -361,10 +379,12 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. Its 266 checks pass under Node and Bun. The 25 focused tests cover
-usage, compatibility edge cases and Windows command construction. These tests
-do not substitute for Windows end-to-end validation. Together they cover the minimal
-agent and allowlisted client identity, session instructions, streaming, thought
+exercised. The current suite has 329 smoke checks and 64 focused Node tests.
+Historical Bun results are documented below; the current expanded suite has not
+been rerun on Bun. These tests do not substitute for Windows end-to-end
+validation. Together they cover the minimal agent, the allowlisted ACP identity,
+scoped prompt guarding, submitted-prompt dedupe, session
+instructions, streaming, thought
 summaries with bridge-issued signatures, per-turn usage, session reuse, conversation isolation, native tool
 round-trips, parallel/consecutive calls, atomic result validation, failures,
 permission denial, in-band upstream errors and quota errors, startup timeouts and

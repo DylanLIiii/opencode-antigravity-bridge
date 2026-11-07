@@ -6,6 +6,9 @@ const SERVER_INFO = { name: "magpie-antigravity-bridge", version: "0.1.0" }
 // The bridge swaps tool catalogs in place and pushes list_changed over a watch channel.
 const CAPABILITIES = { tools: { listChanged: true } }
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+const WATCH_RECONNECT_INITIAL_MS = 100
+const WATCH_RECONNECT_MAX_MS = 2000
+const WATCH_RECONNECT_MAX_ATTEMPTS = 6
 const CONTROL_PORT = Number(process.env.AGY_BRIDGE_CONTROL_PORT)
 const CONTROL_TOKEN = process.env.AGY_BRIDGE_TOKEN
 const CONTROL_CONFIGURED = Number.isInteger(CONTROL_PORT)
@@ -45,7 +48,11 @@ function closeInput() {
   inputChunks = []
   inputLength = 0
   closeAllControls()
-  watchSocket?.destroy()
+  clearTimeout(watchReconnectTimer)
+  watchReconnectTimer = null
+  const socket = watchSocket
+  watchSocket = null
+  socket?.destroy()
 }
 
 function handleStdoutError(error) {
@@ -181,21 +188,52 @@ function controlRequest(payload) {
 }
 
 let watchSocket = null
+let watchReconnectTimer = null
+let watchReconnectAttempts = 0
+
+function scheduleWatchReconnect() {
+  if (!CONTROL_CONFIGURED || inputClosed || watchSocket || watchReconnectTimer) return
+  if (watchReconnectAttempts >= WATCH_RECONNECT_MAX_ATTEMPTS) return
+  const delay = Math.min(
+    WATCH_RECONNECT_MAX_MS,
+    WATCH_RECONNECT_INITIAL_MS * 2 ** watchReconnectAttempts,
+  )
+  watchReconnectAttempts++
+  watchReconnectTimer = setTimeout(() => {
+    watchReconnectTimer = null
+    startWatch(true)
+  }, delay)
+}
 
 // One long-lived control connection; each line announces a changed tool catalog.
-function startWatch() {
-  if (!CONTROL_CONFIGURED || watchSocket || inputClosed) return
+function startWatch(reconnecting = false) {
+  if (!CONTROL_CONFIGURED || watchSocket || watchReconnectTimer || inputClosed) return
+  if (!reconnecting) watchReconnectAttempts = 0
   let socket
   try {
     socket = net.createConnection({ host: "127.0.0.1", port: CONTROL_PORT })
   } catch {
+    scheduleWatchReconnect()
     return
   }
   watchSocket = socket
   socket.setEncoding("utf8")
   let buffer = ""
   socket.on("connect", () => {
-    try { socket.write(JSON.stringify({ token: CONTROL_TOKEN, kind: "watch" }) + "\n") } catch {}
+    try {
+      socket.write(JSON.stringify({ token: CONTROL_TOKEN, kind: "watch" }) + "\n", error => {
+        if (error) {
+          socket.destroy()
+          return
+        }
+        if (watchSocket !== socket || socket.destroyed || inputClosed) return
+        watchReconnectAttempts = 0
+        // A catalog change may have been missed while the watch was down.
+        if (reconnecting) send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })
+      })
+    } catch {
+      socket.destroy()
+    }
   })
   socket.on("data", chunk => {
     buffer += chunk
@@ -214,9 +252,11 @@ function startWatch() {
       }
     }
   })
-  socket.on("error", () => {})
+  socket.on("error", () => socket.destroy())
   socket.on("close", () => {
-    if (watchSocket === socket) watchSocket = null
+    if (watchSocket !== socket) return
+    watchSocket = null
+    scheduleWatchReconnect()
   })
 }
 
@@ -267,6 +307,7 @@ async function callTool(message, hasId) {
     name: params.name,
     arguments: params.arguments === undefined ? {} : params.arguments,
     meta: params._meta || {},
+    mcpRequestId: message.id,
   })
   if (hasId) pendingCalls.set(message.id, request)
 

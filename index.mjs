@@ -2009,9 +2009,20 @@ function lineageVerdict(proc, turn, opts) {
   if (!turn || turn.attached || turn.cancelRequested || turn.done || turn.finalized) return null
   if (proc.dead || proc.stopping || proc.retiring || !turn.hasPendingMcp()) return null
   const history = opts.history
+  // The client already recorded results for every open call in this request's
+  // history, so the live turn can never receive them: it was abandoned (e.g. its
+  // tool-result request failed, or client-side compaction rewrote the base).
+  if (pendingCallsAnsweredIn(turn, history)) return "fork"
   const base = turn.baseHistory
-  if (!Array.isArray(history) || history.length < base.length ||
-    historyKey(history.slice(0, base.length)) !== historyKey(base)) return null
+  if (!Array.isArray(history)) return null
+  // The request no longer follows the conversation the waiting turn was told
+  // (client-side compaction or a rewind rewrote it): as Magpie's Claude bridge
+  // does (`follows`), it goes on in a run of its own instead of 503.
+  if (history.length < base.length || historyKey(history.slice(0, base.length)) !== historyKey(base)) {
+    // The conversation key already pins the opening message, so a non-empty
+    // history here is this conversation rewritten, not another one.
+    return history.length ? "fork" : null
+  }
   const ids = new Set(turn.calls.map((call) => call.id))
   const carried = (opts.messages || []).some((message) => Array.isArray(message?.content) &&
     message.content.some((block) => block?.type === "tool_use" && ids.has(block.id)))
@@ -2030,6 +2041,19 @@ function lineageVerdict(proc, turn, opts) {
     history.length === expected.length &&
     historyKey(withoutInputs(history)) === historyKey(withoutInputs(expected))) return null
   return carried || recorded ? "conflict" : "fork"
+}
+
+function pendingCallsAnsweredIn(turn, history) {
+  const open = turn.calls.filter((call) => !call.result && typeof call.id === "string" && call.id)
+  if (!open.length || !Array.isArray(history)) return false
+  const answered = new Set()
+  for (const message of history) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      if (block?.type === "tool_result" && typeof block.tool_use_id === "string") answered.add(block.tool_use_id)
+    }
+  }
+  return open.every((call) => answered.has(call.id))
 }
 
 function replayHistoryProblem(body, resultBlocks) {
@@ -3856,6 +3880,10 @@ export const AntigravityBridgePlugin = async () => {
                     result: toolResult(block),
                   }))
                   proc.validateResults(rawResults)
+                  const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
+                  const historyMatches = directIdsMatch
+                    ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
+                    : proc.matchesHistory(trailingMessages(body).history)
                   let interrupted = isInterruptedToolTurn(body)
                   let results = rawResults
                   if (!interrupted) {
@@ -3864,7 +3892,11 @@ export const AntigravityBridgePlugin = async () => {
                       results = inspected.results
                       if (inspected.userSteered) interrupted = true
                     } catch (error) {
-                      if (error instanceof UnsupportedContent && canReplayFollowUpAfterResults(body, rawResults)) {
+                      // A rewritten history (client-side compaction) is replayed in a
+                      // fresh session anyway, so text beside its results never has to
+                      // join the live MCP call and can travel with the replay.
+                      if (error instanceof UnsupportedContent &&
+                        (!historyMatches || canReplayFollowUpAfterResults(body, rawResults))) {
                         interrupted = true
                       } else {
                         throw error
@@ -3872,10 +3904,6 @@ export const AntigravityBridgePlugin = async () => {
                     }
                   }
                   if (!interrupted) proc.validateResults(results)
-                  const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
-                  const historyMatches = directIdsMatch
-                    ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
-                    : proc.matchesHistory(trailingMessages(body).history)
                   if (interrupted || !historyMatches ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
                     // A changed context or user-interrupted tool turn needs a new

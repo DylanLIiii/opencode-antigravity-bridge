@@ -2485,6 +2485,77 @@ for (const location of ["inline", "system", "developer", "user"]) {
   }
 }
 
+// Hermes-style client compaction: the pending tool turn's history is rewritten,
+// and a restated user request is merged into the same message as the result.
+{
+  const first = { model, metadata: { user_id: "hermes-compaction" }, system: "hermes system",
+    messages: [{ role: "user", content: "ESCCALL hermes compaction" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const old = inits().at(-1)
+  const calls = toolCalls(pending)
+  const compactedAssistant = { role: "assistant", content: [{ type: "text", text: "[CONTEXT COMPACTION] summary of earlier turns" }, ...calls] }
+  const results = calls.map(call => ({ type: "tool_result", tool_use_id: call.id, content: "compacted result" }))
+  const body = { ...first, messages: [first.messages[0], compactedAssistant,
+    { role: "user", content: [...results, { type: "text", text: "[STILL IN PROGRESS] restated request" }] }] }
+  const response = await callFetch(body)
+  const final = response.status === 200 ? (await readSSE(response)).events : []
+  if (response.status !== 200) await response.text()
+  check("compacted history with merged restated request replays instead of 400", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+  check("compaction replay carries the real result and the restated request",
+    lastOf("user").convId !== old.convId && lastOf("user").text.includes("compacted result") && lastOf("user").text.includes("restated request"))
+}
+
+// After a failed tool-result request the client moves on with a new prompt whose
+// history already holds the pending calls and their results.
+for (const compacted of [true, false]) {
+  const label = compacted ? "rewritten" : "unchanged"
+  const first = { model, metadata: { user_id: `moved-on-${label}` }, system: "hermes system",
+    messages: [{ role: "user", content: `ESCCALL moved on ${label}` }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const old = inits().at(-1)
+  const calls = toolCalls(pending)
+  const assistant = compacted
+    ? { role: "assistant", content: [{ type: "text", text: "[CONTEXT COMPACTION] summary" }, ...calls] }
+    : { role: "assistant", content: assistantBlocks(pending) }
+  const body = { ...first, messages: [first.messages[0], assistant,
+    { role: "user", content: calls.map(call => ({ type: "tool_result", tool_use_id: call.id, content: `answered ${label}` })) },
+    { role: "assistant", content: "This turn did not complete." },
+    { role: "user", content: `continue after ${label} history` }] }
+  const response = await callFetch(body)
+  const final = response.status === 200 ? (await readSSE(response)).events : []
+  if (response.status !== 200) await response.text()
+  check(`new prompt carrying answered pending calls (${label} history) supersedes instead of wedging`, response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+  check(`moved-on replay (${label}) keeps the answered result and the new prompt`,
+    lastOf("user").convId !== old.convId && lastOf("user").text.includes(`answered ${label}`) && lastOf("user").text.includes(`continue after ${label} history`))
+}
+
+{
+  const first = { model, metadata: { user_id: "dropped-calls" }, system: "hermes system",
+    messages: [{ role: "user", content: "ESCCALL dropped calls" }], tools: [echoTool] }
+  await readSSE(await callFetch(first))
+  const body = { ...first, messages: [{ role: "user", content: "ESCCALL dropped calls" },
+    { role: "assistant", content: "[CONTEXT COMPACTION] summary, the pending call was summarized away" },
+    { role: "user", content: "continue after the call was dropped" }] }
+  const response = await callFetch(body)
+  if (response.status === 200) await readSSE(response); else await response.text()
+  check("a rewritten history that summarized the pending call away goes on", response.status === 200, `got ${response.status}`)
+}
+
+{
+  const t1 = { model, metadata: { user_id: "gap-rewrite-base" }, system: "hermes system",
+    messages: [{ role: "user", content: "first plain question" }], tools: [echoTool] }
+  const e1 = (await readSSE(await callFetch(t1))).events
+  const t2 = nextTurn(t1, e1, "ESCCALL second turn")
+  await readSSE(await callFetch(t2))
+  // compaction rewrites the first reply AND drops the pending call
+  const body = { ...t1, messages: [t1.messages[0], { role: "assistant", content: "[CONTEXT COMPACTION] summary" },
+    { role: "user", content: "continue after compaction" }] }
+  const response = await callFetch(body)
+  const st = response.status
+  if (st === 200) await readSSE(response); else await response.text()
+  check("a compaction that rewrote earlier replies and dropped the pending call supersedes instead of 503", st === 200, `got ${st}`)
+}
+
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))
 check("child launches never mutate the parent's update setting", process.env.AGY_CLI_DISABLE_AUTO_UPDATE === "false")
 if (originalAutoUpdate === undefined) delete process.env.AGY_CLI_DISABLE_AUTO_UPDATE

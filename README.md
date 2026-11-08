@@ -114,6 +114,11 @@ magpie quota refresh antigravity-bridge --json
 回传 `tool_result`，同一个 agy 回合继续。运行超过 150 秒的工具会先收到
 "still running" 响应，结果最终送达，客户端每个调用只执行一次。
 
+工具 schema 会先展开本地 `$ref`，再将可空类型、组合类型和元组转换为 agy
+可接受的保守格式；无法直接表达的约束保留在描述中，执行参数仍由客户端校验。
+客户端声明的 `ToolSearch` 若缺少 schema，会补齐 `query` / `max_results`；搜索后
+新增的工具会先刷新目录，再继续同一回合。插件无法发现客户端未发送定义的工具。
+
 ## FAQ / 注意事项
 
 - **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和二进制/PDF 文档；纯文本 document 和 search_result 可用。

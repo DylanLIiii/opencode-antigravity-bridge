@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
+import { lastModelStep, modelStepsAfter, sessionDbPath } from "./step-usage.mjs"
+import { OutputLimitFilter } from "./output-limit.mjs"
 
 const PROVIDER_ID = "antigravity-bridge"
 const AGENT_NAME = "magpie-bridge"
@@ -43,6 +45,16 @@ const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = 15_000
+// A prompt that stops on max_tokens is continued in the same session, inside
+// the same response, at most this many times (0 turns it off).
+const MAX_CONTINUATIONS = (() => {
+  const value = Number(process.env.AGY_BRIDGE_MAX_CONTINUATIONS)
+  return Number.isSafeInteger(value) && value >= 0 ? value : 3
+})()
+const CONTINUE_PROMPT = "Continue exactly where your previous output stopped. Do not repeat any earlier text."
+// agy commits a model call to its conversation store just after the call ends.
+const STEP_USAGE_WAIT_MS = 1_000
+const STEP_USAGE_POLL_MS = 25
 // agy reports an upstream failure as an ordinary message chunk followed by end_turn.
 const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n"
 const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim()
@@ -565,6 +577,12 @@ class Turn {
     this.cancelRequested = false
     this.agentError = false
     this.heldText = ""
+    this.outputLimit = new OutputLimitFilter()
+    this.continuations = 0
+    // Index of the last model call in agy's conversation store already
+    // reported; null when the store can't be read and usage is estimated.
+    this.stepsFile = null
+    this.stepCursor = null
     this.timer = null
     this.cleanupTimer = null
     this.logOffset = 0
@@ -697,9 +715,14 @@ class Turn {
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }))
   }
 
-  // Withholds a possible prefix of agy's error marker until it can be classified.
   pushText(chunk) {
     if (this.done || this.agentError) return
+    const text = this.outputLimit.push(chunk)
+    if (text) this.#pushVisible(text)
+  }
+
+  // Withholds a possible prefix of agy's error marker until it can be classified.
+  #pushVisible(chunk) {
     let text = this.heldText + chunk
     this.heldText = ""
     const marker = text.indexOf(AGENT_ERROR_CORE)
@@ -720,6 +743,9 @@ class Turn {
   }
 
   flushText() {
+    if (this.agentError) return
+    const rest = this.outputLimit.flush()
+    if (rest) this.#pushVisible(rest)
     if (!this.heldText || this.agentError) return
     const text = this.heldText
     this.heldText = ""
@@ -1204,6 +1230,8 @@ class Proc {
     try {
       turn.arm()
       if (model) await this.#setModel(model, selection)
+      turn.stepsFile = sessionDbPath(this.sessionId)
+      turn.stepCursor = turn.stepsFile ? lastModelStep(turn.stepsFile) : null
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
       this.unsentPrompt = null
@@ -1249,6 +1277,14 @@ class Proc {
         // agy ended the turn without waiting for a long-running client tool:
         // deliver its real result in a follow-up prompt of the same response.
         const late = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
+        if (!late.length && result?.stopReason === "max_tokens" && turn.continuations < MAX_CONTINUATIONS) {
+          // The answer was cut at the output cap: let agy go on in the same
+          // session, streaming into the same response.
+          turn.continuations++
+          promptParts = [{ type: "text", text: CONTINUE_PROMPT }]
+          lateCalls = null
+          continue
+        }
         if (!late.length) {
           turn.complete({ ...(result ?? {}), usage })
           return
@@ -3351,6 +3387,60 @@ function responseUsage(proc, turn, step, content, result) {
   }
 }
 
+// Usage of one HTTP response from agy's own per-call records (step-usage.mjs):
+// the model calls since the last settled response. Its prompt buckets are the
+// latest call's, which is how full the context is; output adds up all of them.
+// Returns null, keeping the estimate, when the store has no new completed call
+// in time or, at the end of a prompt, its calls don't yet add up to ACP's total.
+async function measuredUsage(turn, step, result) {
+  if (step.settled || !turn.stepsFile || turn.stepCursor == null) return null
+  const final = result !== undefined
+  const acp = final && result?.usage ? promptUsage(result.usage) : null
+  const measured = turn.measured || { prompt: 0, output: 0 }
+  const complete = (steps) => {
+    if (!steps?.length) return false
+    if (!acp) return true
+    const prompt = steps.reduce((sum, item) => sum + item.input + item.read + item.write, measured.prompt)
+    return prompt >= acp.promptInput + acp.write
+  }
+  const deadline = Date.now() + STEP_USAGE_WAIT_MS
+  // agy has written the store by its first tool call; none means none kept here.
+  if (!fs.existsSync(turn.stepsFile)) return null
+  // A read can also fail while agy is writing; that is retried too.
+  let steps = modelStepsAfter(turn.stepsFile, turn.stepCursor)
+  while (!complete(steps) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
+    steps = modelStepsAfter(turn.stepsFile, turn.stepCursor)
+  }
+  if (!complete(steps)) return null
+  const last = steps.at(-1)
+  const output = steps.reduce((sum, item) => sum + item.output + item.thinking, 0)
+  const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
+  turn.stepCursor = last.idx
+  turn.measured = {
+    prompt: steps.reduce((sum, item) => sum + item.input + item.read + item.write, measured.prompt),
+    output: measured.output + output,
+  }
+  step.usageKind = "agy_model_call"
+  step.modelCalls = steps.length
+  return {
+    input_tokens: last.input,
+    cache_read_input_tokens: last.read,
+    cache_creation_input_tokens: last.write,
+    output_tokens: output,
+    ...(thinking > 0 ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+  }
+}
+
+async function settleUsage(proc, turn, step, content, result) {
+  if (step.settled) return step.usage
+  const measured = result?.stopReason === "cancelled" ? null : await measuredUsage(turn, step, result)
+  if (measured) return measured
+  // The store's later calls would no longer line up with what was reported.
+  turn.stepCursor = null
+  return responseUsage(proc, turn, step, content, result)
+}
+
 // agy's ACP stream carries thought summaries without the model's own signature.
 // Clients keep and replay a thinking block only with a signature, so the bridge
 // issues one: an HMAC over the session and text under a per-process key. It is
@@ -3506,7 +3596,11 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             emitToolUse(event.call)
             // Calls agy issued together leave in the same response.
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
-            stopMessage("tool_use", responseUsage(proc, turn, step, responseContent))
+            const usage = await settleUsage(proc, turn, step, responseContent)
+            if (finished) return
+            // Parallel calls that arrived while the usage was read belong here too.
+            while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
+            stopMessage("tool_use", usage, false, step.usageKind === "agy_model_call")
             proc.recordAssistantResponse(turn, responseContent)
             detach()
             controller.close()
@@ -3515,7 +3609,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           if (event.type === "result") {
             closeBlock()
             turn.rawUsage = event.result.usage ?? turn.rawUsage
-            const usage = responseUsage(proc, turn, step, responseContent, event.result)
+            const usage = await settleUsage(proc, turn, step, responseContent, event.result)
+            if (finished) return
             stopMessage(STOP_REASONS[event.result.stopReason] || "end_turn", usage, true, event.result.stopReason !== "cancelled")
             proc.recordAssistantResponse(turn, responseContent)
             proc.finalizeTurn(turn)

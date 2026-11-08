@@ -132,6 +132,11 @@ magpie quota refresh antigravity-bridge --json
 - **超时**：启动 60s、agy 空闲 5min、等客户端工具结果 30min，可用
   `AGY_BRIDGE_START_TIMEOUT_MS` / `AGY_BRIDGE_TURN_TIMEOUT_MS` /
   `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整。
+- **用量**：ACP 一轮只给一次累计值、agy 不推 `usage_update`；插件从 agy 本地会话库
+  （`~/.gemini/antigravity-cli/conversations/<sessionId>.db`）读每次模型调用的真实用量，
+  每个响应报自己覆盖的调用（含缓存读）。运行时没有 SQLite（Node < 22.5）或读不到库时回落估算。
+- **长输出续写**：撞 `max_tokens` 时在同一会话、同一响应里自动续写，最多 3 次
+  （`AGY_BRIDGE_MAX_CONTINUATIONS`，`0` 关闭）；agy 自己插入的"输出被截断"提示不会出现在正文里。
 
 完整环境变量表、限制条件和开发/测试说明见
 [README.en.md](README.en.md#environment-variables)。

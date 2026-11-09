@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Antigravity subscription provider that bridges to a real agy CLI over the Agent Client Protocol (agy acp), avoiding HTTP impersonation",
   "type": "module",
   "main": "./index.mjs",
@@ -14,6 +14,7 @@
     "usage.mjs",
     "output-limit.mjs",
     "step-usage.mjs",
+    "CHANGELOG.md",
     "README.md",
     "README.en.md"
   ],

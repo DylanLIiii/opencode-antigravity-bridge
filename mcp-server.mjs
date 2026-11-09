@@ -2,7 +2,8 @@ import fs from "node:fs"
 import net from "node:net"
 
 const PROTOCOL_VERSION = "2025-11-25"
-const SERVER_INFO = { name: "magpie-antigravity-bridge", version: "0.1.0" }
+const { version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
+const SERVER_INFO = { name: "magpie-antigravity-bridge", version }
 // The bridge swaps tool catalogs in place and pushes list_changed over a watch channel.
 const CAPABILITIES = { tools: { listChanged: true } }
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024

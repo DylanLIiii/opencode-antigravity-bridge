@@ -1996,9 +1996,41 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   return withAcquireLock(convKey, () => acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew))
 }
 
+// The opening-message key identifies a family, not a single line of history.
+// Fork slots retain their own pool/persistence keys; exact history routes later
+// prompts (including after parking/restart) back to the appropriate session.
+function conversationSlot(convKey, opts, forceNew) {
+  if (opts.ownerKey) return opts.ownerKey
+  const inFamily = (key) => key === convKey || key.startsWith(`${convKey}:fork:`)
+  const owners = new Set()
+  for (const message of opts.messages || []) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      const owner = block?.type === "tool_use" ? toolCalls.get(block.id)?.proc : null
+      if (owner?.turn && inFamily(owner.convKey)) owners.add(owner.convKey)
+    }
+  }
+  if (owners.size === 1) return [...owners][0]
+  if (owners.size > 1) throw new ConflictError("agy bridge: pending calls from different conversation branches cannot be combined", "tool_state_conflict")
+  const matches = [...pool].filter(([key, proc]) => inFamily(key) && !proc.dead && !proc.retiring &&
+    Array.isArray(proc.expectedMessages) &&
+    proc.workDir === opts.workDir && sameInstructions(proc.instructions, opts.instructions) &&
+    proc.matchesHistory(opts.history))
+  if (matches.length === 1) return matches[0][0]
+  if (matches.length > 1) throw new BusyError("agy bridge: history matches more than one conversation branch")
+  if (!forceNew) {
+    loadParked()
+    const saved = [...parked.keys()].filter(key => inFamily(key) && !pool.has(key) && peekParked(key, opts))
+    if (saved.length === 1) return saved[0]
+    if (saved.length > 1) throw new BusyError("agy bridge: history matches more than one parked conversation branch")
+  }
+  return convKey
+}
+
 // Caller holds the conversation lock; recovery must not acquire it recursively.
 async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
   await evictIdle()
+  convKey = conversationSlot(convKey, opts, forceNew)
   let existing = pool.get(convKey)
   if (existing?.turn?.cancelRequested) {
     await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
@@ -2007,8 +2039,13 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     const lineage = lineageVerdict(existing, existing.turn, opts)
     if (lineage === "fork") {
       const orphan = existing.turn
-      logBridgeEvent(existing, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
-      await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
+      if (!staleTurnVerdict(existing, orphan).stale && !pendingCallsAnsweredIn(orphan, opts.history)) {
+        logBridgeEvent(existing, orphan, "isolated", "lineage_fork", opts)
+        convKey = `${convKey.split(":fork:")[0]}:fork:${randomUUID()}`
+      } else {
+        logBridgeEvent(existing, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
+        await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
+      }
       existing = null
     } else if (lineage === "conflict") {
       throw new ConflictError("agy bridge: this request carries the pending tool call but no matching result. Stop resending it; send the tool result or continue from the last self-consistent message.", "tool_state_conflict")
@@ -2984,8 +3021,6 @@ function inspectToolTurn(results, body) {
   const notices = []
   let seenResult = false
   let resultIndex = -1
-  const stoppedByHookOrUser = out.some((item) => item.result?.isError &&
-    /^(?:The user doesn't want to proceed with this tool use\.|User rejected tool use\b|Operation stopped by hook\b|Execution stopped by hook\b|Blocked by PreToolUse hook\b|Hook PreToolUse:\S+ denied\b|API Error: Request was aborted\.|\[Request interrupted by user\b)/.test(resultText(item.result).trim()))
   const userInterruption = /(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):/
   const nonUserSourceNotice = /^\[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT\]\s*\n/
   const skillCompanion = /^\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) /
@@ -2995,7 +3030,6 @@ function inspectToolTurn(results, body) {
   const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining|USD budget: \$\S+; \$\S+ remaining|Output tokens \u2014 turn: [^\r\n]+)$/
   const hookBoilerplateNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook success:\s*(?:Success)?\s*$/
   const hookOutput = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
-  const hookStoppedContinuation = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook stopped continuation:/
   const claudeMetaFeedback = /^(?:(?:Stop|SubagentStop|TeammateIdle|TaskCreated|TaskCompleted|PermissionRequest|PermissionDenied|PreCompact|PostCompact|Elicitation|ElicitationResult|ConfigChange|CwdChanged|FileChanged|WorktreeCreate|WorktreeRemove|InstructionsLoaded) hook feedback:\n[\s\S]+|UserPromptSubmit operation blocked by hook:\n[\s\S]+|The PermissionDenied hook indicated you may retry this tool call\.|The turn did not end: a tool call in your last message asked to end it, but another call in that message failed\.[\s\S]*|Your response above was stopped by a safety classifier \u2014 this is not a tool or API error\.[\s\S]*|The previous response failed to produce a valid tool call\. Please retry the tool call now\.|Your tool call was malformed and could not be parsed\. Please retry\.|Output token limit hit[\s\S]*|Your response (?:was cut off|above was cut off)[\s\S]*|\[Your previous response (?:had no visible output|reached the output limit)[\s\S]*\]|\[structured-output-enforce\][\s\S]*|\[projects-reply-gate\][\s\S]*|Linked in your reply but not sent:[\s\S]*|Goal check-in: \u00ab[\s\S]*)$/
   const isNoise = (value) => !value || tokenNoise.test(value) || hookBoilerplateNoise.test(value)
   for (const message of trailingMessages(body).messages) {
@@ -3015,6 +3049,12 @@ function inspectToolTurn(results, body) {
       }
       const rawText = blockText(block)
       if (!seenResult && message.role === "user" && rawText.trim()) {
+        // Queued user text may precede the result in the same message. It must
+        // travel as user input in a fresh prompt, never as MCP result content.
+        if (!UNCLOSED_NOTICE_RE.test(rawText)) {
+          userSteered = true
+          continue
+        }
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
       const text = stripMagpiePlaceholderNotice(rawText)
@@ -3086,10 +3126,8 @@ function inspectToolTurn(results, body) {
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
           notices.push(rest)
-        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item))) {
-          userSteered = true
         } else {
-          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+          userSteered = true
         }
       }
     }
@@ -4007,9 +4045,14 @@ export const AntigravityBridgePlugin = async () => {
                   if (!interrupted) proc.validateResults(results)
                   if (interrupted || !historyMatches ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
+                    if (replayHistoryProblem(body, resultBlocks)) {
+                      throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
+                    }
+                    claim()
                     // A changed context or user-interrupted tool turn needs a new
                     // session. Replay the real results without resolving the old
                     // process's calls.
+                    acquireOpts.ownerKey = proc.convKey.split(":fork:")[0] === convKey ? proc.convKey : convKey
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()
@@ -4018,13 +4061,21 @@ export const AntigravityBridgePlugin = async () => {
                       // A changed tool catalog applies to the rest of this turn;
                       // a model change applies from the next prompt.
                       await proc.updateTools(tools)
+                      // Catalog acknowledgement yields to timeouts and competing
+                      // continuations. Only the still-live, unattached owner may
+                      // consume this batch after that await.
+                      if (proc.turn !== turn || proc.dead || turn.done || turn.finalized || turn.cancelRequested) {
+                        return jsonError(409, "agy bridge: the tool response has already completed")
+                      }
+                      if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
+                      proc.validateResults(results)
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }
                     return streamResponse(proc, turn, body, init.signal)
                   }
                 }
-                if (pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
+                if (!acquireOpts.ownerKey && pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
                   const proc = pool.get(convKey)
                   const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,
                     body, resultBlocks, acquireOpts, isFresh, begin, claim })

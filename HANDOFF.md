@@ -53,6 +53,29 @@
   final tool-wait-clock regression, `node test-smoke.mjs` passed all 378 checks.
   `node --check` for index/test-smoke and `git diff --check` passed.
 
+## Issue #17: preserve pending tools across sibling requests
+
+- The opening-message conversation key now identifies a family. A fork while
+  tools are pending gets a separate pool/persistence key; it does not finalize
+  the original turn or remove its tool IDs. Known pending IDs and exact history
+  route continuations to their owner; parked branch history supports resume.
+  Branches remain in the normal pool, share its four-process limit, and remain
+  reachable by idle/LRU eviction. Explicitly answered or stale abandoned turns
+  retain the existing reclamation behavior.
+- Plain queued user text before or after live tool results replays the complete
+  batch and user instruction in a new session for that branch. Validate complete
+  history and claim the replay before abandoning its owner. Protocol companions
+  and notices still use live MCP continuation; malformed notices remain errors.
+- Recheck live ownership and batch validity after awaiting tool-catalog updates
+  so simultaneous continuations cannot consume the same results twice.
+- Regression coverage uses the fake ACP server and real MCP helper: concurrent
+  siblings, duplicate claims/continuations, capacity refusal/retry, branch-only
+  queued replay, renamed IDs, incomplete batches, distinct durable snapshots,
+  history reuse, restart resume and LRU eviction/resume. No timeout policy or
+  replay-rendering changes; no new real-agy/client verification for this fix.
+- Validation: `npm test` passes 85 focused tests and 380 smoke checks;
+  syntax checks for `index.mjs` / `test-smoke.mjs` and `git diff --check` pass.
+
 ## 2026-11-08：#14 复杂工具 schema 与 ToolSearch 兼容
 
 - schema 适配提取到 `tool-schema.mjs` 并加入 npm 文件列表：本地 `$ref` 先展开，

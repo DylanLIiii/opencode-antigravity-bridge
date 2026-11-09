@@ -340,7 +340,8 @@ async function prompt(params) {
     chunk("After tool search.\n")
     return finish("After tool search.\n")
   }
-  if (text.includes("ESCCALL") && !text.includes("<conversation_history>")) {
+  if ((text.includes("ESCCALL") && !text.includes("<conversation_history>")) ||
+    /^BRANCHCALL branch \d+$/.test(text.trim()) || /<current_turn>\s*BRANCHCALL branch \d+\s*<\/current_turn>/.test(text)) {
     await invoke("echo", { text: "probe" })
     chunk("After esc.\n")
     return finish("After esc.\n")
@@ -1567,23 +1568,40 @@ for (const mode of ["IDLE_SILENT", "IDLE_METADATA"]) {
 {
   const firstBody = { model, messages: [{ role: "user", content: "TOOL extra text" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
-  const invalidBody = continuation(firstBody, firstEvents, "result", { extraText: true })
-  invalidBody.messages.at(-1).content.at(-1).text += "\n<task-notification>background completed</task-notification>"
   const beforeResult = continuation(firstBody, firstEvents, "result")
   beforeResult.messages.at(-1).content.unshift({ type: "text", text: "<task-notification>too early</task-notification>" })
-  const hookAndUser = continuation(firstBody, firstEvents, "result")
-  hookAndUser.messages.at(-1).content.push({ type: "text", text: "PreToolUse:Read hook additional context: hook output\n\nThe user sent a new message while you were working:\nstop now" })
   const systemBeforeResult = continuation(firstBody, firstEvents, "result")
   systemBeforeResult.messages.at(-1).content.unshift({ type: "text", text: "<system-update>too early</system-update>" })
-  const systemAndUser = continuation(firstBody, firstEvents, "result")
-  systemAndUser.messages.at(-1).content.push({ type: "text", text: "<system-update>catalog changed</system-update>\n\nordinary user instruction" })
   const unclosedSystem = continuation(firstBody, firstEvents, "result")
   unclosedSystem.messages.at(-1).content.push({ type: "text", text: "<system-update>not a complete protocol notice" })
-  const rejected = await Promise.all([invalidBody, beforeResult, hookAndUser, systemBeforeResult, systemAndUser, unclosedSystem].map(body => callFetch(body)))
-  check("unsupported user text and malformed or pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
+  const rejected = await Promise.all([beforeResult, systemBeforeResult, unclosedSystem].map(body => callFetch(body)))
+  check("malformed or pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
   const validBody = continuation(firstBody, firstEvents, "result")
   const validEvents = (await readSSE(await callFetch(validBody))).events
   check("valid result can continue after rejected extra text", stopOf(validEvents) === "end_turn")
+}
+
+for (const [index, text] of [
+  "Please explain the result before continuing",
+  "PreToolUse:Read hook additional context: hook output\n\nThe user sent a new message while you were working:\nstop now",
+  "<system-update>catalog changed</system-update>\n\nordinary user instruction",
+  "Follow-up with notice\n<task-notification>background completed</task-notification>",
+].entries()) {
+  for (const before of index === 0 ? [false, true] : [false]) {
+    const first = { model, metadata: { user_id: `merged-followup-${index}-${before}` },
+      messages: [{ role: "user", content: "ESCCALL merged follow-up" }], tools: [echoTool] }
+    const pending = (await readSSE(await callFetch(first))).events
+    const old = inits().at(-1)
+    const body = continuation(first, pending, "real merged output")
+    body.messages.at(-1).content[before ? "unshift" : "push"]({ type: "text", text })
+    const response = await callFetch(body)
+    if (response.status === 200) await readSSE(response)
+    else await response.text()
+    check(`merged follow-up ${index}/${before} replays actual results and user text`, response.status === 200 &&
+      lastOf("user").convId !== old.convId && lastOf("user").text.includes("real merged output") && lastOf("user").text.includes(text))
+    check(`merged follow-up ${index}/${before} never injects user text into MCP`, !logs().some(event =>
+      event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes(text)))
+  }
 }
 
 for (const location of ["inline", "system", "developer", "user"]) {
@@ -2478,7 +2496,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const second = continuation(first, events, 'Launching skill: archive')
   second.messages.at(-1).content.push({ type: 'text', text: 'Stop this task and explain something else' })
   const response = await callFetch(second)
-  check('plain user instructions are not treated as a Skill prompt body', response.status === 400, `got ${response.status}`)
+  check('plain user instructions replay instead of becoming a Skill prompt body', response.status === 200, `got ${response.status}`)
   if (response.status === 400) {
     await response.text()
     await drive(first, events, 'cleanup ordinary Skill text')
@@ -2562,15 +2580,130 @@ for (const location of ["inline", "system", "developer", "user"]) {
     const response = await callFetch(nextTurn(first, base, "continue main without recap"))
     const final = response.status === 200 ? (await readSSE(response)).events : []
     if (response.status !== 200) await response.text()
-    check("lineage sibling prompt supersedes orphan instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+    check("lineage sibling prompt runs independently instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
     check("lineage replacement replays only the client's branch", inits().length === before + 1 && lastOf("user").convId !== old.convId && lastOf("user").text.includes("continue main without recap") && !lastOf("user").text.includes("PARALLEL recap branch"))
-    const forks = events.filter(event => event.action === "superseded" && event.reason === "lineage_fork")
-    check("lineage supersession emits one content-free event", forks.length === 1 && !!forks[0].superseded_turn_id && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"))
-    check("lineage supersession stops the old process and forgets its parked session", !fs.existsSync(old.cwd) && !fs.readFileSync(bridgeStateFile, "utf8").includes(old.convId))
-    check("all orphan MCP sockets receive an explicit superseded error", replies.length === 2 && replies.every(reply => reply.result?.isError === true))
-    // Keep the original call alive long enough to clean up on the negative run.
-    if (response.status !== 200) await drive(recap, orphan, "cleanup orphan")
+    const forks = events.filter(event => event.action === "isolated" && event.reason === "lineage_fork")
+    check("lineage isolation emits one content-free event", forks.length === 1 && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"))
+    check("lineage isolation keeps the old process and its MCP sockets alive", fs.existsSync(old.cwd) && replies.length === 0)
+    const resumed = await drive(recap, orphan, "original branch result")
+    check("original branch still accepts its live results after a sibling completes", stopOf(resumed.events) === "end_turn" &&
+      logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("original branch result")))
   } finally { process.stderr.write = write; Socket.prototype.end = end }
+}
+
+{
+  const timeout = process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
+  const { default: isolatedDefault } = await import("./index.mjs?issue-17-isolation")
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = timeout
+  const isolatedLoader = await (await isolatedDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const fetchBranch = body => isolatedLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
+  const first = { model, metadata: { user_id: "issue-17-concurrent-branches" }, system: "branch isolation",
+    messages: [{ role: "user", content: "opening shared by main and side requests" }], tools: [echoTool] }
+  const base = (await readSSE(await fetchBranch(first))).events
+  const requests = Array.from({ length: 5 }, (_, i) => nextTurn(first, base, `BRANCHCALL branch ${i}`))
+  const pending = [(await readSSE(await fetchBranch(requests[0]))).events]
+  const main = inits().at(-1)
+  const before = inits().length
+  const responses = await Promise.all([requests[1], requests[1], requests[2], requests[3]].map(fetchBranch))
+  check("concurrent side requests and a duplicate claim start exactly three siblings",
+    responses.filter(response => response.status === 200).length === 3 &&
+    responses.filter(response => response.status === 503).length === 1 && inits().length === before + 3,
+    `statuses=${responses.map(response => response.status)} starts=${inits().length - before}`)
+  for (let i = 0; i < responses.length; i++) {
+    if (responses[i].status === 200) pending[i < 2 ? 1 : i] = (await readSSE(responses[i])).events
+    else await responses[i].text()
+  }
+  const fullCount = inits().length
+  const blocked = await fetchBranch(requests[4])
+  const blockedText = await blocked.text()
+  check("isolated branches count against the four-process limit without evicting live calls",
+    blocked.status === 503 && inits().length === fullCount && fs.existsSync(main.cwd),
+    `status=${blocked.status} starts=${inits().length - fullCount} main=${fs.existsSync(main.cwd)} body=${blockedText.slice(0, 200)}`)
+  const missing = await fetchBranch(nextTurn(requests[3], pending[3], "continue without this branch's result"))
+  check("a sibling carrying its pending call cannot evade the missing-result conflict", missing.status === 400)
+  await missing.text()
+  const finals = []
+  const continued = []
+  const owners = []
+  for (let i = 0; i < 4; i++) {
+    continued[i] = continuation(requests[i], pending[i], `result for branch ${i}`)
+    // Replay just this isolated owner while the other two siblings still wait.
+    if (i === 1) continued[i].messages.at(-1).content.push({ type: "text", text: "queued branch instruction" })
+    if (i === 2) continued[i].tools = [echoTool, { ...echoTool, name: "extraBranchTool" }]
+    if (i === 3) {
+      continued[i].messages.at(-2).content.find(block => block.type === "tool_use").id = "toolu_renamed_isolated_branch"
+      continued[i].messages.at(-1).content[0].tool_use_id = "toolu_renamed_isolated_branch"
+    }
+    const results = await Promise.all(Array.from({ length: i === 1 || i === 2 ? 2 : 1 }, () => fetchBranch(continued[i])))
+    const response = results.find(item => item.status === 200) || results[0]
+    if (results.length === 2) {
+      check(`concurrent ${i === 1 ? "queued replay" : "catalog update continuation"} consumes branch ${i} only once`,
+        results.filter(item => item.status === 200).length === 1 && results.some(item => item.status === 503),
+        results.map(item => item.status).join(","))
+      for (const other of results) if (other !== response) await other.text()
+    }
+    finals[i] = response.status === 200 ? (await readSSE(response)).events : []
+    if (response.status !== 200) await response.text()
+    owners[i] = i === 1 ? lastOf("user").convId : logs().find(event =>
+      event.type === "mcpResult" && JSON.stringify(event.result).includes(`result for branch ${i}`))?.convId
+    check(`branch ${i} accepts its own tool result while siblings remain live`, response.status === 200 && stopOf(finals[i]) === "end_turn")
+  }
+  check("main result reached the original MCP process", logs().some(event =>
+    event.type === "mcpResult" && event.convId === main.convId && JSON.stringify(event.result).includes("result for branch 0")))
+  const saved = JSON.parse(fs.readFileSync(bridgeStateFile, "utf8")).entries
+  check("main and completed siblings persist under distinct keys", saved.filter(entry =>
+    [main.convId, ...owners.slice(1)].includes(entry.sessionId)).length === 4)
+  const followup = nextTurn(continued[1], finals[1], "MEMORY continue isolated branch")
+  const count = inits().length
+  const followed = (await readSSE(await fetchBranch(followup))).events
+  check("later prompts reuse an isolated branch by its exact history", inits().length === count &&
+    lastOf("user").convId === owners[1] && lastOf("user").text === "MEMORY continue isolated branch")
+  const { default: restartedDefault } = await import("./index.mjs?issue-17-branch-restart")
+  const restarted = await (await restartedDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const restartResponse = await restarted.fetch("agy://local/messages", { method: "POST",
+    body: JSON.stringify(nextTurn(followup, followed, "MEMORY isolated after restart")) })
+  await readSSE(restartResponse)
+  check("isolated branch resumes its durable session after bridge restart", restartResponse.status === 200 &&
+    inits().at(-1).resumed && inits().at(-1).convId === owners[1] && lastOf("user").text === "MEMORY isolated after restart")
+  const retried = await fetchBranch(requests[4])
+  const retriedEvents = retried.status === 200 ? (await readSSE(retried)).events : []
+  check("a pool-limit failure releases its prompt claim for retry", retried.status === 200 && stopOf(retriedEvents) === "tool_use",
+    `status=${retried.status} stop=${stopOf(retriedEvents)}`)
+  if (retried.status === 200) await readSSE(await fetchBranch(continuation(requests[4], retriedEvents, "cleanup capacity retry")))
+  else await retried.text()
+  const sideWorkspace = inits().find(event => event.convId === owners[3]).cwd
+  for (let i = 0; i < 4; i++) await readSSE(await fetchBranch({ model,
+    messages: [{ role: "user", content: `MEMORY force branch eviction ${i}` }] }))
+  check("idle siblings remain reachable by LRU eviction", !fs.existsSync(sideWorkspace))
+  const evicted = await fetchBranch(nextTurn(continued[3], finals[3], "MEMORY resume evicted sibling"))
+  await readSSE(evicted)
+  check("an evicted sibling resumes its own snapshot without replay", evicted.status === 200 &&
+    inits().at(-1).resumed && inits().at(-1).convId === owners[3] && lastOf("user").text === "MEMORY resume evicted sibling")
+}
+
+{
+  const first = { model, metadata: { user_id: "issue-17-partial-steering" },
+    messages: [{ role: "user", content: "PARALLEL partial results with steering" }], tools: [echoTool] }
+  const initial = (await readSSE(await callFetch(first))).events
+  // Parallel calls can arrive in separate tool_use responses. Collect the next
+  // round first if necessary, then leave at least one visible result unanswered.
+  let body = first
+  let pending = initial
+  if (toolCalls(pending).length < 2) {
+    body = continuation(first, pending, "first parallel output")
+    pending = (await readSSE(await callFetch(body))).events
+  }
+  const partial = continuation(body, pending, "partial output")
+  partial.messages.at(-1).content.push({ type: "text", text: "queued incomplete instruction" })
+  if (toolCalls(initial).length >= 2) partial.messages.at(-1).content.splice(0, 1)
+  else partial.messages.at(-2).content.push({ type: "tool_use", id: "toolu_missing_queued_result", name: "echo", input: {} })
+  const count = inits().length
+  const response = await callFetch(partial)
+  await response.text()
+  check("queued text cannot replay incomplete results or destroy the live owner", response.status === 400 && inits().length === count)
+  const done = await drive(body, pending, "remaining actual output")
+  check("a complete batch can continue after rejected partial steering", stopOf(done.events) === "end_turn" && inits().length === count)
 }
 
 {

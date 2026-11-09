@@ -9,7 +9,7 @@ impersonating the Antigravity IDE over HTTPS.
 The plugin translates Anthropic Messages to the **Agent Client Protocol (ACP)**
 that `agy acp` serves on stdio, following the approach of
 [T3 Code's Antigravity driver](https://github.com/pingdotgg/t3code/tree/main/apps/server/src/provider/acp).
-It keeps one agy session per conversation and serves the client's tools to agy
+It keeps agy sessions for conversation branches and serves the client's tools to agy
 as its IDE tools over MCP. Google sees requests made by the real CLI; ACP keeps
 the `zed / 0.0.0` compatibility identity required by agy's non-Gemini model
 allowlist. This is not a guarantee against account restrictions or changes to
@@ -374,8 +374,17 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   meaningful to this bridge (which needs nothing back: agy keeps its own
   context). The Anthropic API would reject them, so a client must not forward
   these blocks to a real Anthropic model after switching providers.
-- **Plain user instructions beside a live `tool_result`** are still rejected
-  with HTTP 400. Complete `<system-update>` elements, task/channel/teammate
+- **Requests sharing an opening message** can fork while tools are pending.
+  A sibling request gets its own pooled session and leaves the original tool
+  calls live. All branches count toward the four-process limit; when all four
+  are busy, another request receives 503. Later prompts select a branch by its
+  history, and completed branches have separate snapshots for resume after
+  eviction or restart. Ambiguous history matches are not guessed.
+- **Queued user text beside a live `tool_result`**, before or after the result
+  in the same message, replays the complete result batch and user instruction
+  in a fresh session for that branch. It is not appended to the MCP tool output.
+  Incomplete batches are rejected before closing the live owner.
+  Complete `<system-update>` elements, task/channel/teammate
   notifications, recognized Claude Code hook notices, and tool companions are
   forwarded on the live MCP turn; explicit Claude Code mid-turn
   `queued_command` envelopes and user follow-ups after a rejected/stopped tool

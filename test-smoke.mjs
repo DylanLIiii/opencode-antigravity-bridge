@@ -416,6 +416,11 @@ async function prompt(params) {
     update({ sessionUpdate: "config_option_update", configOptions: configOptions() })
     return finish("configuration updated")
   }
+  if (text.includes("COMBINED_PENDING") && !text.includes("COMBINED_RESUME")) {
+    await invoke("echo", { text: "combined pending call" })
+    chunk("Combined result delivered.")
+    return finish("Combined result delivered.")
+  }
   const prefix = text.includes("SAME") ? "You said [" + session.id + "]: " : "You said: "
   const answer = prefix + text.slice(-120).replace(/"/g, "'")
   await reply(answer)
@@ -2848,6 +2853,56 @@ for (const compacted of [true, false]) {
   const after = logs().filter(event => event.type === "user" && /Continue exactly where your previous output stopped/.test(event.text)).length
   check("continuations stop after three and report max_tokens", stopOf(events) === "max_tokens" && after - before === 3, `${stopOf(events)} ${after - before}`)
   check("all continued text stays in one response", textOf(events) === "part one,  more more more", JSON.stringify(textOf(events)))
+}
+
+// Combined regression: a timed-out replay fork cannot destroy another branch's
+// pending tool; plain queued steering must still recover with the real result.
+{
+  const previous = process.env.AGY_BRIDGE_TURN_TIMEOUT_MS
+  process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "250"
+  const { default: combinedDefault } = await import("./index.mjs?combined-issues")
+  process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = previous
+  const combinedPlugin = await combinedDefault.server({ client: null, directory: os.tmpdir() }, {})
+  const combinedLoader = await combinedPlugin.auth.loader(async () => ({ key: "agy" }))
+  const fetchCombined = body => combinedLoader.fetch("agy://local/messages", {
+    method: "POST", body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+  })
+  const main = { model, metadata: { user_id: "combined-issues" }, tools: [echoTool],
+    messages: [{ role: "user", content: "COMBINED_PENDING shared opening" }] }
+  const pending = (await readSSE(await fetchCombined(main))).events
+  const owner = inits().at(-1)
+  const fork = { ...main, messages: [
+    ...main.messages,
+    { role: "assistant", content: [{ type: "tool_use", id: "historical_combined", name: "echo", input: { text: "old" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "historical_combined", content: "historical combined fact" }] },
+    { role: "assistant", content: "Recorded." },
+    { role: "user", content: "IDLE_SILENT combined background request" },
+  ] }
+  const forkResponse = await fetchCombined(fork)
+  const forkEvents = (await readSSE(forkResponse)).events
+  const forkPrompt = lastOf("user")
+  check("combined fork replays delimited historical results", forkPrompt.convId !== owner.convId &&
+    forkPrompt.text.includes('<tool_record role="result"') && forkPrompt.text.includes("historical combined fact"))
+  check("combined fork emits lifecycle then a terminal inactivity error", forkEvents[0]?.event === "message_start" &&
+    forkEvents.at(-1)?.data.error?.code === "upstream_idle_timeout")
+  check("background timeout preserves the main branch's pending process", fs.existsSync(owner.cwd))
+  const queued = continuation(main, pending, "combined actual result")
+  queued.messages.at(-1).content.push({ type: "text", text: "COMBINED_RESUME use the result and finish" })
+  const resumedResponse = await fetchCombined(queued)
+  const resumed = (await readSSE(resumedResponse)).events
+  const replayPrompt = lastOf("user")
+  check("main results with same-message steering recover after sibling timeout", resumedResponse.status === 200 &&
+    stopOf(resumed) === "end_turn")
+  check("combined recovery retains current result and queued steering once", replayPrompt.text.split("combined actual result").length === 2 &&
+    replayPrompt.text.split("COMBINED_RESUME use the result and finish").length === 2)
+  const retry = await fetchCombined(fork)
+  check("timed-out fork remains dedup protected after main recovery", retry.status === 409 &&
+    (await retry.json()).error?.code === "prompt_outcome_unknown" &&
+    logs().filter(event => event.type === "user" && event.text.includes("IDLE_SILENT combined background request")).length === 1)
+  const followup = nextTurn(queued, resumed, "Continue after the recovered result")
+  const completed = (await readSSE(await fetchCombined(followup))).events
+  check("main follow-up reuses its recovered session after sibling failure", stopOf(completed) === "end_turn" &&
+    lastOf("user").convId === replayPrompt.convId && !lastOf("user").text.includes("<conversation_history>"))
 }
 
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))

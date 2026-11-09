@@ -1,5 +1,12 @@
 # Handoff: opencode-antigravity-bridge
 
+## Version policy and 0.1.1
+
+- Maintainer requested version updates for subsequent project changes. Follow
+  `AGENTS.md`: bump the package version and update `CHANGELOG.md` in each PR.
+- Version 0.1.1 identifies the #17–#19 fixes merged in PR #20. MCP server metadata
+  now reads `package.json` directly so future bumps cannot leave it at 0.1.0.
+
 ## 2026-11-09: combined validation for #17, #18, and #19
 
 - Integrated the three issue fixes on `fix/open-issues-17-19`. Final Node tests:

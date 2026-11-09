@@ -55,7 +55,8 @@ async function runWorker(body) {
       child.once("close", resolve)
     })
     assert.equal(code, 0, `Real CLI check failed: ${stderr || stdout || "worker exceeded 120 seconds"}`)
-    return JSON.parse(stdout)
+    return { ...JSON.parse(stdout), bridgeEvents: stderr.split("\n").filter(line => line.startsWith("[agy-bridge] "))
+      .map(line => JSON.parse(line.slice("[agy-bridge] ".length))) }
   } finally {
     clearTimeout(timer)
     stop()
@@ -67,6 +68,8 @@ if (worker) {
     let input = ""
     for await (const chunk of process.stdin) input += chunk
     let body = JSON.parse(input)
+    const steering = body.steering
+    delete body.steering
     const { AntigravityBridgePlugin } = await import("./index.mjs")
     const plugin = await AntigravityBridgePlugin()
     const loader = await plugin.auth.loader(async () => ({ key: "agy" }))
@@ -98,6 +101,7 @@ if (worker) {
       body = { ...body, messages: [...body.messages, { role: "assistant", content }, { role: "user", content: calls.map(call => ({
         type: "tool_result", tool_use_id: call.id, content: "Tool verified. Remember the code ORCHID-731.",
       })) }, { role: "system", content: "PostToolUse hook additional context: Continue with the verified tool result." }] }
+      if (steering) body.messages.push({ role: "user", content: steering })
     }
     throw new Error("Model did not finish within four tool rounds")
   } catch (error) {
@@ -114,6 +118,7 @@ const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agy-bridge-integratio
 process.env.AGY_BRIDGE_STATE_FILE = path.join(directory, "sessions.json")
 process.env.AGY_BRIDGE_START_TIMEOUT_MS = "60000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "90000"
+process.env.AGY_BRIDGE_EVENTS = "1"
 try {
   const first = await runWorker({
     model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
@@ -178,6 +183,38 @@ try {
   const replayState = JSON.parse(await fs.readFile(process.env.AGY_BRIDGE_STATE_FILE, "utf8"))
   assert.equal(new Set(replayState.entries.map(entry => entry.sessionId)).size, 2, "Historical replay must create a separate session")
   console.log("ok - historical tool replay recalls the result without emitting tool records")
+
+  const steered = await runWorker({
+    model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
+    system: "Follow the latest user instruction. Use the tool only when asked. Keep answers brief.",
+    tools: [{ name: "bridge_echo", description: "Verify the bridge.", input_schema: {
+      type: "object", properties: { token: { type: "string", enum: ["bridge-integration"] } }, required: ["token"],
+    } }],
+    messages: [{ role: "user", content: "Call bridge_echo with token bridge-integration exactly once, then explain the result." }],
+    steering: "Change of plan. Do not call any more tools. Reply with BRIDGE-STEER-904 followed by one space and the code returned by bridge_echo.",
+  })
+  assert.equal(steered.toolCalls, 1, "User steering executed another tool")
+  assert.equal(steered.content.filter(block => block.type === "text").map(block => block.text).join("").trim(), "BRIDGE-STEER-904 ORCHID-731")
+  const created = steered.bridgeEvents.filter(event => event.action === "created")
+  assert.equal(created.length, 1, "User steering created a replacement AGY session")
+  assert(steered.bridgeEvents.some(event => event.reason === "user_steering" && event.session_id === created[0].session_id))
+  console.log("ok - user steering retains the AGY session, recalls the real tool result and obeys the latest instruction")
+
+  const large = {
+    model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
+    system: "Follow the latest instruction. Do not call tools.", tools: [],
+    messages: [{ role: "user", content: "Old document. ".repeat(310_000) },
+      { role: "assistant", content: "The old work is complete." },
+      { role: "user", content: "Reply with exactly the text inside these tags, excluding the tags.\n<answer>RECOVERED-731</answer>" }],
+  }
+  await assert.rejects(runWorker(large), /prompt is too long/)
+  const recovered = await runWorker({ ...large, messages: [
+    { role: "user", content: "Client-compacted summary: The old work is complete." },
+    large.messages[1], large.messages[2],
+  ] })
+  assert.equal(recovered.toolCalls, 0)
+  assert.equal(recovered.content.filter(block => block.type === "text").map(block => block.text).join("").trim(), "RECOVERED-731")
+  console.log("ok - oversized replay fails explicitly and a client-compacted recovery preserves the latest instruction")
   if (process.env.AGY_BRIDGE_TEST_USAGE === "1") {
     const { AntigravityBridgePlugin } = await import("./index.mjs")
     const usage = await (await AntigravityBridgePlugin()).auth.usage()

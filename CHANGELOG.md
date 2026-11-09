@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.3
+
+- Keep the AGY session when user steering accompanies a complete batch of live
+  tool results. Deliver results once, cancel and settle the old ACP prompt, then
+  submit the current results and queued instruction as a new prompt in that
+  session, preserving results that AGY may otherwise mark as canceled.
+- Check submitted UTF-8 text against a configurable 128 KiB budget. Oversized
+  replay returns `context_length_exceeded` before replacing the existing session,
+  so the client can supply a compacted history with the complete current turn.
+- Trace session creation, resume, replay reasons and prompt sizes using bounded,
+  content-free events. Add real-CLI and simulated regressions for steering and
+  oversized-history recovery.
+
 ## 0.1.2
 
 - Add a display name and English/Chinese descriptions for Magpie plugin cards,

@@ -129,6 +129,23 @@ magpie plugin add ./opencode-antigravity-bridge
 - **Cancellation without loss.** A client that stops reading gets
   `session/cancel`; the session stays alive and the partial answer the client
   saw becomes part of the expected history.
+- **User steering during tools.** With compatible history, instructions and
+  working directory, a complete batch of live tool results is delivered once.
+  The bridge cancels and settles the old ACP prompt, then submits this batch's
+  real results with the queued user instruction in the same AGY session. This
+  preserves its context and internal compaction state, and keeps the result
+  available when AGY stores a cancellation for the old tool call. Each tool
+  executes once. Deferred tool delivery and changed histories use replay.
+- **Bounded recovery input.** Submitted text plus session instructions has a
+  conservative 128 KiB UTF-8 budget, configured by the positive byte count
+  `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`. Image base64 travels separately. Existing
+  session history can exceed this per-submission budget during continuation or
+  resume. Oversized replay returns HTTP 400 `context_length_exceeded` before
+  replacing the existing session. The client must compact its history and submit
+  the summary with the complete current instruction. Automatic client compaction
+  depends on the client's error handling. The bridge leaves summarization to the
+  client. Bounded, content-free events record session IDs, replay reasons and
+  prompt sizes; `AGY_BRIDGE_EVENTS=0` disables them.
 - **Upstream errors without retry amplification.** agy reports API failures as
   an in-band `⚠ Agent execution terminated due to error.` message and
   `end_turn`. The bridge withholds that marker and reads the real reason from
@@ -164,11 +181,9 @@ magpie plugin add ./opencode-antigravity-bridge
   Code's per-turn hook, environment, and deferred-tool reminders) do not
   invalidate a turn or force a session restart. Client-renamed tool IDs are
   matched only when history, tool names and arguments identify one pending
-  response. Real history edits (compaction), user-interrupted or rejected tool
-  turns (`[Request interrupted by user]`, tool-rejection prompts), and mid-turn
-  queued user commands (`<queued-command>` / Claude Code `queued_command`
-  envelopes) start a fresh session and replay the current history and real
-  results.
+  response. Real history edits (client compaction) recover through budget-checked
+  replay. User interruptions, rejected tools and queued commands can retain
+  the session when their complete live results and history remain compatible.
 - **Protocol context notices, Claude Code hooks, and tool companions** beside
   tool results: trailing user/system/developer notices reach MCP inside a
   separate `system-reminder` (OpenCode `<system-update>`, background task and
@@ -381,9 +396,11 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   history, and completed branches have separate snapshots for resume after
   eviction or restart. Ambiguous history matches are not guessed.
 - **Queued user text beside a live `tool_result`**, before or after the result
-  in the same message, replays the complete result batch and user instruction
-  in a fresh session for that branch. It is not appended to the MCP tool output.
-  Incomplete batches are rejected before closing the live owner.
+  in the same message, starts a new prompt containing the current result batch
+  and user instruction in the same session, after delivering live results and
+  cancelling and settling the old prompt. Deferred results and incompatible
+  histories recover through budget-checked replay. Incomplete batches are
+  rejected before closing the live owner.
   If a sibling was already reclaimed, its complete late results plus user
   steering can replay while the main branch still waits on its own tools.
   Unmatched results without steering retain the conservative 409 response.
@@ -391,7 +408,7 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   notifications, recognized Claude Code hook notices, and tool companions are
   forwarded on the live MCP turn; explicit Claude Code mid-turn
   `queued_command` envelopes and user follow-ups after a rejected/stopped tool
-  call cancel the live turn and replay cleanly in a new session.
+  call use the user-steering path described above.
 - **Ambiguous or unrecognized rewritten tool IDs** are not guessed. Ambiguous
   matches return 503; unrecognized results that conflict with a pending pooled
   conversation return 409. Conflicting duplicates and mixed-conversation result
@@ -466,6 +483,8 @@ time to first model token, or override a client's total request deadline.
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
+| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 131072 | positive UTF-8 text budget for each submitted prompt or tool-result batch plus session instructions; oversized input returns `context_length_exceeded` |
+| `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session/tool lifecycle diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |

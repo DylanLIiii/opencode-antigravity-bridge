@@ -44,6 +44,9 @@ const TOOL_LIST_WAIT_MS = 5_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
+// Conservative per-submission text budget, independent of the model's rolling
+// context window. Never let a giant replay silently lose its current turn.
+const DEFAULT_MAX_PROMPT_TEXT_BYTES = 128 * 1024
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = positiveTimeout(process.env.AGY_BRIDGE_PING_INTERVAL_MS, 15_000)
@@ -379,6 +382,20 @@ class UnsupportedContent extends Error {
     super(`agy bridge: ${what} is not supported`)
     this.statusCode = 400
   }
+}
+
+function validatePromptBudget(parts, instructions = "") {
+  const textBytes = Buffer.byteLength(instructions, "utf8") + parts.reduce((total, part) =>
+    total + (part.type === "text" ? Buffer.byteLength(part.text || "", "utf8") : 0), 0)
+  const limit = configuredTimeout("AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES", DEFAULT_MAX_PROMPT_TEXT_BYTES)
+  if (textBytes <= limit) return textBytes
+  throw new ConflictError(
+    `prompt is too long: agy bridge would submit ${textBytes} UTF-8 text bytes (limit ${limit}). ` +
+    "Compact the conversation in the client and retry with its summary and the complete current instruction. " +
+    "No model prompt or tool result from this request was sent. " +
+    "AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES controls this conservative bridge limit.",
+    "context_length_exceeded",
+  )
 }
 
 class PromptOutcomeUnknownError extends Error {
@@ -860,6 +877,8 @@ class Proc {
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
     this.resumeFrom = opts.resume || null
+    this.validateReplay = opts.validateReplay
+    this.replayReason = opts.replayReason || "no_matching_session"
     this.token = randomUUID()
     this.sessionId = null
     this.currentModel = null
@@ -882,6 +901,7 @@ class Proc {
     this.dead = false
     this.deadError = null
     this.retiring = false
+    this.steering = false
     this.stopping = false
     this.stopPromise = null
     this.stderrTail = ""
@@ -1008,14 +1028,18 @@ class Proc {
         this.expectedMessages = this.resumeFrom.expectedMessages.map((message) => ({ ...message }))
       } catch (error) {
         if (!isRecoverableResumeError(error)) throw error
+        this.replayReason = "resume_unavailable"
         session = null
       }
     }
+    if (this.resumeFrom && !resumable) this.replayReason = "resume_unsupported"
     if (!this.resumed) {
+      this.validateReplay?.()
       session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
     }
+    logBridgeEvent(this, null, this.resumed ? "resumed" : "created", this.replayReason)
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
@@ -1195,6 +1219,10 @@ class Proc {
     if (content.some(block => block.type === "image") && !this.supportsImages) {
       throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
     }
+    const textBytes = validatePromptBudget(mergePromptParts(this.unsentPrompt, content), this.instructionsInSession ? this.instructions : "")
+    logBridgeEvent(this, null, "prompt_prepared", this.hasSentFirstTurn ? "continuation" : "history_replay", {}, {
+      prompt_text_bytes: textBytes, prompt_parts: content.length,
+    })
     const turn = new Turn(this, messages)
     turn.promptAttempt = promptAttempt
     turn.promptGuardMatched = promptGuardMatched
@@ -1550,6 +1578,34 @@ class Proc {
     this.lastUsed = Date.now()
   }
 
+  // All pending results must be real and complete before cancellation. Wait for
+  // ACP to end the old prompt before sending the user's steering as a new one.
+  async steerTurn(turn, results, content, body, model, selection, promptAttempt, promptGuardMatched, signal) {
+    this.steering = true
+    try {
+      await this.updateTools(normalizeTools(body))
+      if (this.turn !== turn || this.dead || turn.done || turn.cancelRequested || turn.attached) {
+        throw new BusyError("agy bridge: the tool turn changed before user steering")
+      }
+      if (signal?.aborted) throw signal.reason || new Error("request aborted before user steering")
+      this.continueWith(results)
+      this.recordToolResults(turn, body.messages)
+      this.cancelTurn(turn, [])
+      await turn.settled
+      if (this.dead) throw this.deadError
+      if (signal?.aborted) {
+        // The results reached AGY, but the queued user text did not. A later
+        // request must recover it explicitly instead of assuming it was sent.
+        this.historyInvalid = true
+        throw signal.reason || new Error("request aborted before the steered prompt")
+      }
+      logBridgeEvent(this, null, "continued", "user_steering")
+      return this.startTurn(content, body.messages, model, selection, promptAttempt, promptGuardMatched)
+    } finally {
+      this.steering = false
+    }
+  }
+
   #respondMcp(call, payload) {
     if (call.mcpResponded) return
     call.mcpResponded = true
@@ -1615,7 +1671,7 @@ class Proc {
 
   canPark() {
     return !!this.sessionId && this.hasSentFirstTurn && !this.historyInvalid && !this.turn &&
-      !this.dead && Array.isArray(this.expectedMessages)
+      !this.dead && !this.steering && Array.isArray(this.expectedMessages)
   }
 
   stop() {
@@ -1957,7 +2013,7 @@ async function evictIdle() {
   const cutoff = Date.now() - IDLE_MS
   const victims = []
   for (const [key, proc] of pool) {
-    if (proc.retiring) continue
+    if (proc.retiring || proc.steering) continue
     if (proc.dead || (!proc.turn && proc.lastUsed < cutoff)) victims.push([key, proc])
   }
   for (const [key, proc] of victims) await retire(key, proc)
@@ -1966,7 +2022,7 @@ async function evictIdle() {
 async function evictLRU() {
   let oldest = null
   for (const [key, proc] of pool) {
-    if (proc.turn || proc.retiring) continue
+    if (proc.turn || proc.retiring || proc.steering) continue
     if (!oldest || proc.lastUsed < oldest.proc.lastUsed) oldest = { key, proc }
   }
   if (!oldest) return false
@@ -2032,12 +2088,15 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   await evictIdle()
   convKey = conversationSlot(convKey, opts, forceNew)
   let existing = pool.get(convKey)
+  if (existing?.steering) throw new BusyError("agy bridge: this conversation is accepting user steering")
   if (existing?.turn?.cancelRequested) {
     await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
   }
   if (existing && !existing.dead && existing.turn) {
     const lineage = lineageVerdict(existing, existing.turn, opts)
     if (lineage === "fork") {
+      opts.validateReplay?.()
+      opts.replayReason = "lineage_fork"
       const orphan = existing.turn
       if (!staleTurnVerdict(existing, orphan).stale && !pendingCallsAnsweredIn(orphan, opts.history)) {
         logBridgeEvent(existing, orphan, "isolated", "lineage_fork", opts)
@@ -2071,6 +2130,11 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       await existing.updateTools(opts.tools)
       return { proc: existing, history: matchedHistory }
     }
+    opts.validateReplay?.()
+    opts.replayReason ||= existing.dead ? "process_dead"
+      : existing.workDir !== opts.workDir ? "work_dir_changed"
+      : !sameInstructions(existing.instructions, opts.instructions) ? "instructions_changed" : "history_changed"
+    logBridgeEvent(existing, existing.turn, "replay", opts.replayReason)
     existing.retiring = true
     dropFromPool(existing)
     await existing.stop().catch(() => {})
@@ -2096,20 +2160,22 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
 
 // Bounded, content-free events: never log prompts, arguments, results or tool IDs.
 const HOST_EPOCH = randomBytes(4).toString("hex")
-let eventWindowStart = 0
-let eventWindowCount = 0
+const eventWindows = new Map()
 function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
   if (process.env.AGY_BRIDGE_EVENTS === "0") return
   const now = Date.now()
-  if (now - eventWindowStart >= 60_000) { eventWindowStart = now; eventWindowCount = 0 }
-  if (eventWindowCount++ >= 30) return
+  const event = turn ? "agy_bridge_tool_state" : "agy_bridge_session_state"
+  const window = eventWindows.get(event) || { start: now, count: 0 }
+  if (now - window.start >= 60_000) { window.start = now; window.count = 0 }
+  eventWindows.set(event, window)
+  if (window.count++ >= 30) return
   const row = {
-    event: "agy_bridge_tool_state", host_epoch: HOST_EPOCH, ts: now,
-    conv: digest(proc.convKey).slice(0, 12), turn_id: turn.turnId,
-    action, reason, attached: turn.attached, done: turn.done, dead: proc.dead,
-    pending: turn.calls.filter((call) => !call.result).length,
-    client_idle_ms: Math.max(0, now - (turn.clientProgressAt ?? turn.lastProgressAt)),
-    self_poll_repeats: turn.calls.reduce((max, call) => Math.max(max, call.stillRunning || 0), 0),
+    event, host_epoch: HOST_EPOCH, ts: now,
+    conv: digest(proc.convKey).slice(0, 12), session_id: proc.sessionId, turn_id: turn?.turnId,
+    action, reason, attached: turn?.attached, done: turn?.done, dead: proc.dead,
+    pending: turn?.calls.filter((call) => !call.result).length,
+    client_idle_ms: turn ? Math.max(0, now - (turn.clientProgressAt ?? turn.lastProgressAt)) : undefined,
+    self_poll_repeats: turn?.calls.reduce((max, call) => Math.max(max, call.stillRunning || 0), 0),
     ...(meta.layout ? { layout: meta.layout, nonstream: meta.nonstream } : {}), ...extra,
   }
   try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
@@ -3997,7 +4063,9 @@ export const AntigravityBridgePlugin = async () => {
                 }
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
-                messages: body.messages, layout, nonstream: body.stream === false }
+                messages: body.messages, layout, nonstream: body.stream === false,
+                validateReplay: () => validatePromptBudget(mergePromptParts(
+                  renderInitialPromptParts(body, callerWorkDir, true), outputFormatReminder(body)), instructions) }
               const claim = () => {
                 if (!promptAttempt) {
                   const key = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)
@@ -4025,6 +4093,7 @@ export const AntigravityBridgePlugin = async () => {
                   }
                   const proc = found[0].match.proc
                   const turn = found[0].match.turn
+                  if (proc.steering) throw new BusyError("agy bridge: this conversation is accepting user steering")
                   if (found.some((item) => item.match.proc !== proc || item.match.turn !== turn)) {
                     return jsonError(409, "agy bridge: tool results from different conversations cannot be combined")
                   }
@@ -4060,21 +4129,41 @@ export const AntigravityBridgePlugin = async () => {
                     }
                   }
                   if (!interrupted) proc.validateResults(results)
+                  const sameSession = historyMatches && proc.workDir === workDir && sameInstructions(proc.instructions, instructions)
+                  const canSteer = interrupted && sameSession && !turn.done && !turn.cancelRequested &&
+                    turn.calls.every(call => !call.deferred && (call.result || rawResults.some(item => item.call === call)))
+                  if (canSteer) {
+                    // AGY may store a cancellation in place of the MCP result.
+                    // Repeat this batch's real results with the new instruction
+                    // so they survive cancellation, without replaying history.
+                    const content = mergePromptParts(renderContinuedTurnParts(trailing.messages), outputFormatReminder(body))
+                    if (promptHasImage(content) && !proc.supportsImages) throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
+                    validatePromptBudget(content, instructions)
+                    validatePromptBudget(rawResults.flatMap(item => item.result.content), instructions)
+                    const next = await proc.steerTurn(turn, rawResults, content, body, model, selection, claim(), promptGuardMatched, init.signal)
+                    return streamResponse(proc, next, body, init.signal)
+                  }
                   if (interrupted || !historyMatches ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
                     if (replayHistoryProblem(body, resultBlocks)) {
                       throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
                     }
+                    acquireOpts.validateReplay()
+                    acquireOpts.replayReason = interrupted ? "interrupted_tool_turn"
+                      : !historyMatches ? "history_changed"
+                      : proc.workDir !== workDir ? "work_dir_changed" : "instructions_changed"
+                    logBridgeEvent(proc, turn, "replay", acquireOpts.replayReason)
                     claim()
-                    // A changed context or user-interrupted tool turn needs a new
-                    // session. Replay the real results without resolving the old
-                    // process's calls.
+                    // Incompatible context or deferred interrupted tools need
+                    // replay. Keep the results for the new session and close the
+                    // old process's calls.
                     acquireOpts.ownerKey = proc.convKey.split(":fork:")[0] === convKey ? proc.convKey : convKey
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()
                   } else {
                     if (!proc.dead && !turn.done) {
+                      validatePromptBudget(results.flatMap(item => item.result.content), instructions)
                       // A changed tool catalog applies to the rest of this turn;
                       // a model change applies from the next prompt.
                       await proc.updateTools(tools)

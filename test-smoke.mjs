@@ -343,6 +343,7 @@ async function prompt(params) {
   if ((text.includes("ESCCALL") && !text.includes("<conversation_history>")) ||
     /^BRANCHCALL branch \d+$/.test(text.trim()) || /<current_turn>\s*BRANCHCALL branch \d+\s*<\/current_turn>/.test(text)) {
     await invoke("echo", { text: "probe" })
+    if (text.includes("STEER_CANCEL_DELAY")) await new Promise(resolve => setTimeout(resolve, 300))
     chunk("After esc.\n")
     return finish("After esc.\n")
   }
@@ -1597,8 +1598,11 @@ for (const [index, text] of [
     const response = await callFetch(body)
     if (response.status === 200) await readSSE(response)
     else await response.text()
-    check(`merged follow-up ${index}/${before} replays actual results and user text`, response.status === 200 &&
-      lastOf("user").convId !== old.convId && lastOf("user").text.includes("real merged output") && lastOf("user").text.includes(text))
+    check(`merged follow-up ${index}/${before} retains the session and sends user text as a new prompt`, response.status === 200 &&
+      lastOf("user").convId === old.convId && lastOf("user").text.includes(text) &&
+      lastOf("user").text.includes("real merged output") && !lastOf("user").text.includes("<conversation_history>"))
+    check(`merged follow-up ${index}/${before} delivers the actual result once`, logs().filter(event =>
+      event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("real merged output")).length === 1)
     check(`merged follow-up ${index}/${before} never injects user text into MCP`, !logs().some(event =>
       event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes(text)))
   }
@@ -2179,14 +2183,114 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const response = await callFetch(second)
   const final = (await readSSE(response)).events
   const replay = lastOf("user")
-  check("user-interrupted tool turn abandons old process and starts new turn cleanly",
-    response.status === 200 && stopOf(final) === "end_turn" && replay.convId !== old.convId &&
-    replay.text.includes("New instruction after Esc") && !fs.existsSync(old.cwd), `got ${response.status}`)
+  check("user-interrupted tool turn cancels the old prompt and retains the session",
+    response.status === 200 && stopOf(final) === "end_turn" && replay.convId === old.convId &&
+    replay.text.includes("New instruction after Esc") && !replay.text.includes("<conversation_history>") &&
+    logs().some(event => event.type === "cancel" && event.convId === old.convId), `got ${response.status}`)
   const third = nextTurn(second, final, "MEMORY after interrupted tool turn")
   const thirdRes = await callFetch(third)
   await readSSE(thirdRes)
   check("turn after user-interrupted replay reuses the new session",
     thirdRes.status === 200 && lastOf("user").convId === replay.convId)
+}
+
+{
+  const first = { model, messages: [{ role: "user", content: "ESCCALL STEER_CANCEL_DELAY" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const session = inits().at(-1)
+  const steered = continuation(first, pending, "actual result before cancellation")
+  steered.messages.at(-1).content.push({ type: "text", text: "ABORTED-STEERING-731" })
+  const controller = new AbortController()
+  const request = callFetch(steered, {}, controller.signal)
+  for (let attempt = 0; attempt < 60 && !logs().some(event =>
+    event.type === "mcpResult" && event.convId === session.convId); attempt++) await new Promise(resolve => setTimeout(resolve, 5))
+  controller.abort()
+  const aborted = await request
+  await aborted.text()
+  check("abort while settling the old prompt sends no late steering prompt", !logs().some(event =>
+    event.type === "user" && event.convId === session.convId && event.text.includes("ABORTED-STEERING-731")))
+  const recovered = (await readSSE(await callFetch(steered))).events
+  check("an aborted steering instruction can be explicitly recovered", stopOf(recovered) === "end_turn" &&
+    lastOf("user").text.includes("ABORTED-STEERING-731"))
+}
+
+{
+  const before = inits().length
+  const oversized = { model, system: "Keep the complete latest instruction.", tools: [echoTool], messages: [
+    { role: "user", content: "old history " + "x".repeat(4_000_000) },
+    { role: "assistant", content: "An old answer" },
+    { role: "user", content: "不要调用任何工具，直接输出 CURRENT-731" },
+  ] }
+  for (let retry = 0; retry < 2; retry++) {
+    const response = await callFetch(oversized)
+    const payload = await response.json()
+    check(`oversized replay ${retry} fails before session creation`, response.status === 400 &&
+      payload.error?.code === "context_length_exceeded" && response.headers.get("x-should-retry") === "false" &&
+      inits().length === before, JSON.stringify(payload))
+  }
+  const compacted = { ...oversized, messages: [
+    { role: "user", content: "Compacted summary: The previous task is complete. Follow the latest instruction." },
+    oversized.messages.at(-1),
+  ] }
+  const compactedEvents = (await readSSE(await callFetch(compacted))).events
+  check("a client-compacted retry preserves the complete current instruction", stopOf(compactedEvents) === "end_turn" &&
+    lastOf("user").text.endsWith("CURRENT-731") && !assistantBlocks(compactedEvents).some(block => block.type === "tool_use"))
+}
+
+{
+  let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(100_000) }], tools: [echoTool] }
+  let events = (await readSSE(await callFetch(body))).events
+  const session = inits().at(-1)
+  for (let round = 0; round < 3; round++) {
+    body = nextTurn(body, events, "MEMORY " + "h".repeat(100_000))
+    events = (await readSSE(await callFetch(body))).events
+  }
+  body = nextTurn(body, events, "ESCCALL large accumulated history")
+  events = (await readSSE(await callFetch(body))).events
+  const steered = continuation(body, events, "The tool finished successfully")
+  steered.messages.at(-1).content.push({ type: "text", text: "不要调用任何工具，直接输出 LATEST-942" })
+  const responses = await Promise.all([callFetch(steered), callFetch(steered)])
+  const accepted = responses.find(response => response.status === 200)
+  const rejected = responses.find(response => response.status === 503)
+  const final = accepted ? (await readSSE(accepted)).events : []
+  if (rejected) await rejected.text()
+  check("concurrent steering has exactly one owner", !!accepted && !!rejected, responses.map(response => response.status).join(","))
+  check("large accumulated history does not replay on user steering", stopOf(final) === "end_turn" &&
+    lastOf("user").convId === session.convId && lastOf("user").text.includes("LATEST-942") && lastOf("user").text.length < 1000 &&
+    !assistantBlocks(final).some(block => block.type === "tool_use"))
+
+  // An incompatible replay must be rejected before discarding the live session.
+  const next = nextTurn(steered, final, "MEMORY after rejected replay")
+  const incompatible = { ...next, system: "Different session instructions" }
+  const response = await callFetch(incompatible)
+  check("oversized incompatible replay preserves the existing process", response.status === 400 &&
+    (await response.json()).error?.code === "context_length_exceeded" && fs.existsSync(session.cwd))
+  const resumed = (await readSSE(await callFetch(next))).events
+  check("the preserved session still accepts compatible follow-ups", stopOf(resumed) === "end_turn" && lastOf("user").convId === session.convId)
+  const resumeBody = nextTurn(next, resumed, "MEMORY after large history eviction")
+  for (let round = 0; round < 4; round++) await readSSE(await callFetch({ model,
+    messages: [{ role: "user", content: `MEMORY evict large history ${round}` }],
+  }))
+  const afterEviction = (await readSSE(await callFetch(resumeBody))).events
+  check("large stored histories resume with only the new input", stopOf(afterEviction) === "end_turn" &&
+    lastOf("user").convId === session.convId && inits().at(-1).resumed === true &&
+    lastOf("user").text === "MEMORY after large history eviction")
+}
+
+for (const steering of [false, true]) {
+  const first = { model, messages: [{ role: "user", content: `TOOL result budget ${steering}` }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const session = inits().at(-1)
+  const oversized = continuation(first, pending, "z".repeat(200_000))
+  if (steering) oversized.messages.at(-1).content.push({ type: "text", text: "Please explain this result." })
+  const response = await callFetch(oversized)
+  check(`oversized tool result ${steering} preserves its pending owner`, response.status === 400 &&
+    (await response.json()).error?.code === "context_length_exceeded" &&
+    !logs().some(event => event.type === "mcpResult" && event.convId === session.convId))
+  const corrected = continuation(first, pending, "The client reduced its tool output.")
+  const final = (await readSSE(await callFetch(corrected))).events
+  check(`a corrected tool result ${steering} completes in its original session`, stopOf(final) === "end_turn" &&
+    inits().at(-1).convId === session.convId)
 }
 
 {
@@ -2341,8 +2445,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const secondRes = await callFetch(second)
   const secondFinal = (await readSSE(secondRes)).events
   const steeredUser = lastOf("user")
-  check("Claude Code mid-turn queued_command and tool_addition replay as clean user prompt",
-    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && steeredUser.convId !== old.convId &&
+  check("Claude Code mid-turn queued_command and tool_addition continue as clean user prompt",
+    secondRes.status === 200 && stopOf(secondFinal) === "end_turn" && steeredUser.convId === old.convId &&
     steeredUser.text.includes("Remove invalid freejev accounts now") &&
     !steeredUser.text.includes("This is how Claude Code surfaces"),
     JSON.stringify(steeredUser))
@@ -2355,8 +2459,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
   wedged.messages.push({ role: "user", content: "Standalone follow-up user instruction" })
   const wRes = await callFetch(wedged)
   const wFinal = (await readSSE(wRes)).events
-  check("standalone follow-up user message after aborted tool turn replays instead of wedging with 400",
-    wRes.status === 200 && stopOf(wFinal) === "end_turn" && lastOf("user").convId !== wOld.convId &&
+  check("standalone follow-up user message continues the pending session",
+    wRes.status === 200 && stopOf(wFinal) === "end_turn" && lastOf("user").convId === wOld.convId &&
     lastOf("user").text.includes("Standalone follow-up user instruction"),
     `status=${wRes.status}`)
 }
@@ -2414,8 +2518,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
   rSecond.messages.at(-1).content.push({ type: "text", text: "Write to /tmp/safe instead" })
   const rRes = await callFetch(rSecond)
   const rFinal = (await readSSE(rRes)).events
-  check("rejected tool_result merged with follow-up user prompt replays cleanly without 400",
-    rRes.status === 200 && stopOf(rFinal) === "end_turn" && lastOf("user").convId !== rOld.convId &&
+  check("rejected tool_result merged with follow-up user prompt continues cleanly",
+    rRes.status === 200 && stopOf(rFinal) === "end_turn" && lastOf("user").convId === rOld.convId &&
     lastOf("user").text.includes("Write to /tmp/safe instead"),
     `status=${rRes.status}`)
 
@@ -2514,7 +2618,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     check(`queued prompt suffix ${suffix.length} is accepted beside a tool result`, response.status === 200, `got ${response.status}`)
     if (response.status === 200) {
       await readSSE(response)
-      check(`queued prompt suffix ${suffix.length} replays as user context in a new session`, lastOf('user').convId !== oldId && lastOf('user').text.includes('QUEUED_STEERING_MARKER'))
+      check(`queued prompt suffix ${suffix.length} continues as user context in the same session`, lastOf('user').convId === oldId && lastOf('user').text.includes('QUEUED_STEERING_MARKER'))
     } else {
       await response.text()
       await drive(first, events, 'cleanup queued envelope')
@@ -2530,7 +2634,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const response = await callFetch(second)
   if (response.status === 200) await readSSE(response)
   else await response.text()
-  check('fresh replay retains image bytes inside a tool_result', response.status === 200 && lastOf('user').content.some(part => part.type === 'image' && part.data === 'cmVwbGF5aW1hZ2U='))
+  check('native steering retains image bytes inside the real MCP result', response.status === 200 && logs().some(event =>
+    event.type === 'mcpResult' && event.convId === lastOf('user').convId &&
+    event.result?.content?.some(part => part.type === 'image' && part.data === 'cmVwbGF5aW1hZ2U=')))
+  check('steered prompt preserves the returned image across AGY cancellation', lastOf('user').content.some(part =>
+    part.type === 'image' && part.data === 'cmVwbGF5aW1hZ2U='))
   if (response.status !== 200) await drive(first, events, 'cleanup replay image')
 }
 
@@ -3029,7 +3137,9 @@ for (const compacted of [true, false]) {
   const replayPrompt = lastOf("user")
   check("main results with same-message steering recover after sibling timeout", resumedResponse.status === 200 &&
     stopOf(resumed) === "end_turn")
-  check("combined recovery retains current result and queued steering once", replayPrompt.text.split("combined actual result").length === 2 &&
+  check("combined recovery delivers the result once and preserves queued steering", replayPrompt.convId === owner.convId &&
+    logs().filter(event => event.type === "mcpResult" && event.convId === owner.convId &&
+      JSON.stringify(event.result).includes("combined actual result")).length === 1 &&
     replayPrompt.text.split("COMBINED_RESUME use the result and finish").length === 2)
   const retry = await fetchCombined(fork)
   check("timed-out fork remains dedup protected after main recovery", retry.status === 409 &&

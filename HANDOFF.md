@@ -1,5 +1,23 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-11-08：#14 复杂工具 schema 与 ToolSearch 兼容
+
+- schema 适配提取到 `tool-schema.mjs` 并加入 npm 文件列表：本地 `$ref` 先展开，
+  再移除定义；每个工具最多 32 层 / 2048 次访问，递归和未解析引用保留明确提示。
+- 可空类型输出单一 type；anyOf/oneOf 合并对象属性、仅保留共同必填项，allOf
+  合并必填项与数值边界，全部组合完成后再过滤不存在的 required。元组降为单一
+  items schema；不支持的约束转为 description 提示，客户端仍负责真实参数校验。
+- `normalizeTools` 原本不会丢弃无 schema 或 `defer_loading` 工具。本次仅给客户端
+  已声明但缺 schema 的 `ToolSearch` 补齐 query/max_results，不凭空注入搜索执行器。
+  客户端没有发送的工具定义仍无法恢复。
+- smoke 现在覆盖搜索返回 tool_reference 后更新目录、在原回合调用新增工具、
+  返回真实结果并继续下一轮；保留现有先确认目录、再释放搜索结果的顺序。
+- 真实 macOS agy **1.5.2** 集成通过：包含引用、可空类型与组合类型的工具实际
+  调用成功，图片、usage、跨 bridge 进程 resume 与等级变更也通过。Windows CCD /
+  agy 1.5.3 尚未实测；未发布或替换已安装插件。
+- 验证：Node 默认测试 **80 focused tests + 333 smoke checks** 全部通过；
+  `npm pack --dry-run --json` 确认包含新模块，`git diff --check` 通过。
+
 ## 2026-11-07：Prompt 过滤经验、异常幂等与 P1 会话治理
 
 - 参考 Antigravity-Manager / CLIProxyAPI 的公开 A/B 经验，新增结构化

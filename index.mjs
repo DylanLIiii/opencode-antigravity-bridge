@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
+import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 
 const PROVIDER_ID = "antigravity-bridge"
 const AGENT_NAME = "magpie-bridge"
@@ -2406,121 +2407,6 @@ function claimPromptAttempt(key) {
   return attempt
 }
 
-function appendSchemaHint(node, hint) {
-  if (!hint) return
-  if (typeof node.description === "string" && node.description.trim()) {
-    if (!node.description.includes(hint)) node.description = `${node.description} (${hint})`
-  } else {
-    node.description = hint
-  }
-}
-
-// Sanitize JSON Schema constructs that agy's ACP -> Google Code Assist translator
-// converts into invalid Schema protos (e.g. union types leaving stale array/object
-// keywords, or non-string/empty enum entries producing `enum[0]: cannot be empty`).
-function sanitizeInputSchema(schema) {
-  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema
-  const out = { ...schema }
-
-  if (Array.isArray(out.type)) {
-    const types = out.type.filter((item) => typeof item === "string")
-    const nullable = types.includes("null")
-    const nonNull = types.filter((item) => item !== "null")
-    if (nonNull.length > 1) {
-      let chosen = nonNull[0]
-      if (nonNull.includes("array") && out.items !== undefined) chosen = "array"
-      else if (nonNull.includes("object") && (out.properties !== undefined || out.additionalProperties !== undefined)) {
-        chosen = "object"
-      }
-      out.type = nullable ? [chosen, "null"] : chosen
-      appendSchemaHint(out, `Accepts types: ${types.join(" | ")}`)
-    } else if (nonNull.length === 1) {
-      out.type = nullable ? [nonNull[0], "null"] : nonNull[0]
-    }
-  }
-
-  const resolvedType = typeof out.type === "string"
-    ? out.type
-    : Array.isArray(out.type)
-      ? out.type.find((item) => item !== "null") || null
-      : null
-
-  if (resolvedType && resolvedType !== "array") {
-    delete out.items
-    delete out.prefixItems
-    delete out.minItems
-    delete out.maxItems
-    delete out.uniqueItems
-    delete out.contains
-  }
-  if (resolvedType && resolvedType !== "object") {
-    delete out.properties
-    delete out.patternProperties
-    delete out.required
-    delete out.minProperties
-    delete out.maxProperties
-    delete out.dependentRequired
-  }
-
-  if (Array.isArray(out.enum)) {
-    const invalidEnum = out.enum.length === 0 ||
-      (resolvedType && resolvedType !== "string") ||
-      out.enum.some((item) => typeof item !== "string" || item.length === 0)
-    if (invalidEnum) {
-      if (out.enum.length) {
-        appendSchemaHint(out, `Allowed values: ${out.enum.map((item) => JSON.stringify(item)).join(", ")}`)
-      }
-      delete out.enum
-    }
-  }
-
-  if (out.const !== undefined && (typeof out.const !== "string" || out.const.length === 0 || (resolvedType && resolvedType !== "string"))) {
-    appendSchemaHint(out, `Must equal: ${JSON.stringify(out.const)}`)
-    delete out.const
-  }
-
-  if (out.properties && typeof out.properties === "object" && !Array.isArray(out.properties)) {
-    out.properties = Object.fromEntries(
-      Object.entries(out.properties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
-    )
-    if (Array.isArray(out.required)) {
-      const filtered = out.required.filter((key) => typeof key === "string" && Object.hasOwn(out.properties, key))
-      if (filtered.length) out.required = filtered
-      else delete out.required
-    }
-  }
-  if (out.patternProperties && typeof out.patternProperties === "object" && !Array.isArray(out.patternProperties)) {
-    out.patternProperties = Object.fromEntries(
-      Object.entries(out.patternProperties).map(([key, value]) => [key, sanitizeInputSchema(value)]),
-    )
-  }
-  if (out.additionalProperties && typeof out.additionalProperties === "object" && !Array.isArray(out.additionalProperties)) {
-    out.additionalProperties = sanitizeInputSchema(out.additionalProperties)
-  }
-  if (Array.isArray(out.items)) {
-    out.items = out.items.map((item) => sanitizeInputSchema(item))
-  } else if (out.items && typeof out.items === "object") {
-    out.items = sanitizeInputSchema(out.items)
-  }
-  if (Array.isArray(out.prefixItems)) {
-    out.prefixItems = out.prefixItems.map((item) => sanitizeInputSchema(item))
-  }
-  for (const key of ["anyOf", "oneOf", "allOf"]) {
-    if (Array.isArray(out[key])) out[key] = out[key].map((item) => sanitizeInputSchema(item))
-  }
-  if (out.not && typeof out.not === "object" && !Array.isArray(out.not)) {
-    out.not = sanitizeInputSchema(out.not)
-  }
-  for (const defsKey of ["$defs", "definitions"]) {
-    if (out[defsKey] && typeof out[defsKey] === "object" && !Array.isArray(out[defsKey])) {
-      out[defsKey] = Object.fromEntries(
-        Object.entries(out[defsKey]).map(([key, value]) => [key, sanitizeInputSchema(value)]),
-      )
-    }
-  }
-  return out
-}
-
 function normalizeTools(body) {
   if (!Array.isArray(body.tools) || !body.tools.length) return []
   const choice = body.tool_choice
@@ -2535,7 +2421,8 @@ function normalizeTools(body) {
     if (seen.has(tool.name)) throw new UnsupportedContent(`duplicate tool ${tool.name}`)
     seen.add(tool.name)
     if (selected && tool.name !== selected) continue
-    const rawSchema = tool.input_schema ?? { type: "object", properties: {} }
+    const rawSchema = tool.input_schema ?? (tool.name === "ToolSearch"
+      ? TOOL_SEARCH_INPUT_SCHEMA : { type: "object", properties: {} })
     if (!rawSchema || typeof rawSchema !== "object" || Array.isArray(rawSchema)) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }

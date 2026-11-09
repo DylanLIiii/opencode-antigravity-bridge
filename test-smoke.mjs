@@ -274,6 +274,10 @@ async function prompt(params) {
   }
   if (text.includes("TOOLSEARCHCALL")) {
     await invoke("ToolSearch", { query: "select:WebFetch" })
+    if (text.includes("use loaded tool")) {
+      if (!tools.some(tool => tool.name === "WebFetch")) throw new Error("Loaded WebFetch missing from catalog")
+      await invoke("WebFetch", { url: "https://example.com" })
+    }
     chunk("After tool search.\n")
     return finish("After tool search.\n")
   }
@@ -1901,23 +1905,36 @@ for (const location of ["inline", "system", "developer", "user"]) {
     texts.includes("worker-1") &&
     texts.includes("prior /loop wakeups"), JSON.stringify(content))
 
-  const searchTool = { name: "ToolSearch", description: "Search deferred tools", input_schema: { type: "object" } }
-  const searchFirst = { model, messages: [{ role: "user", content: "TOOLSEARCHCALL load WebFetch" }], tools: [searchTool] }
+  const searchTool = { name: "ToolSearch", description: "Search deferred tools" }
+  const searchFirst = { model, messages: [{ role: "user", content: "TOOLSEARCHCALL load WebFetch and use loaded tool" }], tools: [searchTool] }
   const searchEvents = (await readSSE(await callFetch(searchFirst))).events
   const searchConv = inits().at(-1).convId
   const beforeSearch = inits().length
   const searchSecond = continuation(searchFirst, searchEvents, [
     { type: "tool_reference", tool_name: "WebFetch" },
   ])
+  searchSecond.tools = [searchTool, { name: "WebFetch", defer_loading: true, input_schema: {
+    type: "object", properties: { url: { anyOf: [{ type: "string" }, { type: "null" }] } }, required: ["url"],
+  } }]
   searchSecond.messages.at(-1).content.push({ type: "text", text: "Tool loaded." })
   const searchRes = await callFetch(searchSecond)
   const searchFinal = (await readSSE(searchRes)).events
   const searchDelivered = logs().filter(event => event.type === "mcpResult" && event.convId === searchConv).at(-1)
   const searchText = searchDelivered?.result?.content?.map(part => part.text).join("\n") || ""
   check("ToolSearch tool_reference and Tool loaded. companion continue live turn",
-    searchRes.status === 200 && stopOf(searchFinal) === "end_turn" && inits().length === beforeSearch &&
+    searchRes.status === 200 && stopOf(searchFinal) === "tool_use" && inits().length === beforeSearch &&
     searchText.includes("Loaded tool: WebFetch") && searchText.includes("Tool loaded."), searchText)
-  const afterSearch = nextTurn(searchSecond, searchFinal, "MEMORY after tool search")
+  check("schema-less ToolSearch exposes usable search parameters",
+    inits().at(-1)?.tools?.find(tool => tool.name === "ToolSearch")?.inputSchema?.properties?.query?.type === "string")
+  check("loaded deferred tool is callable after catalog refresh in the same turn",
+    toolCall(searchFinal)?.name === "WebFetch" && toolCall(searchFinal)?.input?.url === "https://example.com" &&
+    logs().some(event => event.type === "toolsList" && event.reason === "list_changed" && event.convId === searchConv && event.tools.includes("WebFetch")))
+  const searchThird = continuation(searchSecond, searchFinal, "Fetched example successfully")
+  const loadedEvents = (await readSSE(await callFetch(searchThird))).events
+  check("loaded tool result completes the original search turn",
+    stopOf(loadedEvents) === "end_turn" && inits().length === beforeSearch &&
+    logs().some(event => event.type === "mcpResult" && event.convId === searchConv && event.name === "WebFetch" && event.result?.content?.some(part => part.text?.includes("Fetched example successfully"))))
+  const afterSearch = nextTurn(searchThird, loadedEvents, "MEMORY after tool search")
   const afterSearchRes = await callFetch(afterSearch)
   await readSSE(afterSearchRes)
   check("turn after ToolSearch tool_reference reuses the live session",

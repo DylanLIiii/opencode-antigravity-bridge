@@ -183,11 +183,19 @@ magpie plugin add ./opencode-antigravity-bridge
   streaming starts.
 
 The MCP transport sanitizes `input_schema` keywords for agy's Gemini/Vertex
-translator. Mixed unions are narrowed to a representable type, incompatible
-keywords are removed, and unsupported enum/const values become description
+translator. Local references are expanded with depth and node limits; nullable
+types, compositions and tuples are reduced to a conservative schema subset.
+Object alternatives retain their properties and common required fields; `allOf`
+combines required fields. Mixed types and unsupported constraints become description
 hints. This does not execute full JSON Schema validation. The bridge validates tool
 names and argument shapes; the client that executes a tool must still validate
 its arguments and authorize the operation.
+
+A client-declared `ToolSearch` without an `input_schema` receives `query` and
+`max_results` parameters. Deferred definitions present in the client's tool list
+are exposed to agy; definitions added after a search are announced and re-listed
+before the search result is released. The bridge cannot discover tools whose
+definitions the client never sends.
 
 `output_config.effort` and `thinking.budget_tokens` select a level when
 Anthropic `thinking.type` is `enabled` or `adaptive`. Generic

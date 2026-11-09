@@ -119,7 +119,21 @@ try {
     model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
     thinking: { type: "adaptive" }, output_config: { effort: "low" },
     system: "Follow the user's test instructions. Only use the provided tool when asked. Keep answers brief.",
-    tools: [{ name: "bridge_echo", description: "Verify the bridge and obtain a code to remember.", input_schema: { type: "object", properties: { token: { type: "string" } }, required: ["token"] } }],
+    tools: [{ name: "bridge_echo", description: "Verify the bridge and obtain a code to remember.", input_schema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      $defs: { Token: { type: "string", const: "bridge-integration" } },
+      properties: {
+        token: { $ref: "#/$defs/Token" },
+        options: { anyOf: [
+          { type: "object", properties: { path: { type: ["string", "null"] } }, additionalProperties: false },
+          { type: "null" },
+        ] },
+        limit: { oneOf: [{ type: "integer", enum: [1, 2] }, { type: "string" }] },
+      },
+      required: ["token"],
+      additionalProperties: false,
+    } }],
     messages: [{ role: "user", content: [
       { type: "text", text: "Call bridge_echo with token bridge-integration exactly once. Then identify the dominant color in the attached image with one English color word. Remember the code returned by the tool for the next turn." },
       { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=" } },
@@ -129,7 +143,7 @@ try {
   assert.match(first.content.filter(block => block.type === "text").map(block => block.text).join(""), /\bred\b/i, "Model did not recognize the red image")
   const before = JSON.parse(await fs.readFile(process.env.AGY_BRIDGE_STATE_FILE, "utf8"))
   assert.equal(before.entries.length, 1, "Expected one persisted session")
-  console.log("ok - real image comprehension, native MCP round trip with trailing system hooks, final text and token usage")
+  console.log("ok - real image comprehension, complex-schema MCP round trip with trailing system hooks, final text and token usage")
   console.log(`info - thinking summary ${first.thinking ? "observed" : "not emitted by this model"}`)
 
   const second = await runWorker({ ...first.body, output_config: { effort: "high" }, messages: [

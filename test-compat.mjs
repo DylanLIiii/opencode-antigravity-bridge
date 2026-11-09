@@ -16,8 +16,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -27,6 +27,24 @@ const result = (id, name, text) => ({
   result: { content: [{ type: "text", text }], isError: false },
 })
 const bodyFor = content => ({ messages: [{ role: "assistant", content: [] }, { role: "user", content }] })
+
+test("prompt budget counts UTF-8 text and installed instructions, preserving complete parts", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "12"
+  try {
+    const parts = [{ type: "text", text: "中文" }, { type: "image", data: "a".repeat(100), mimeType: "image/png" },
+      { type: "text", text: "stop" }]
+    const original = structuredClone(parts)
+    assert.equal(validatePromptBudget(parts, "OK"), 12)
+    assert.throws(() => validatePromptBudget(parts, "系统"), error =>
+      error.statusCode === 400 && error.code === "context_length_exceeded" && error.noRetry &&
+      /Compact the conversation/.test(error.message))
+    assert.deepEqual(parts, original)
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
 
 test("declared schema-less ToolSearch receives query and max_results parameters", () => {
   const [tool] = normalizeTools({ tools: [{ name: "ToolSearch", description: "Find tools" }] })

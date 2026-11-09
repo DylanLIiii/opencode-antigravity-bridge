@@ -2992,9 +2992,12 @@ for (const compacted of [true, false]) {
 // pending tool; plain queued steering must still recover with the real result.
 {
   const previous = process.env.AGY_BRIDGE_TURN_TIMEOUT_MS
+  const previousToolTimeout = process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS
   process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "250"
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "5000"
   const { default: combinedDefault } = await import("./index.mjs?combined-issues")
   process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = previous
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = previousToolTimeout
   const combinedPlugin = await combinedDefault.server({ client: null, directory: os.tmpdir() }, {})
   const combinedLoader = await combinedPlugin.auth.loader(async () => ({ key: "agy" }))
   const fetchCombined = body => combinedLoader.fetch("agy://local/messages", {

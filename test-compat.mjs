@@ -203,6 +203,47 @@ test("strict replay omits historical bodies but preserves live results, images, 
   ])
 }))
 
+test("strict fresh replay recovery preserves current results beside queued user text", () => {
+  const resultBlock = { type: "tool_result", tool_use_id: "recovered", content: [
+    { type: "text", text: "RECOVERED_RESULT <raw>&\nfull body" }, image,
+    { type: "tool_reference", tool_name: "recovered_tool" },
+  ] }
+  const queued = { type: "text", text: "<system-reminder>\nThe user sent a new message while you were working:\nUse the recovered result to finish.\n\nPlease address this message and continue with your tasks.\n</system-reminder>" }
+  for (const layout of ["inline", "system", "developer"]) {
+    const current = layout === "inline"
+      ? [{ role: "user", content: [resultBlock, queued] }]
+      : [{ role: "user", content: [resultBlock] }, { role: layout, content: [queued] }]
+    const body = { messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "old", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "old", content: "OLD_BODY_TO_OMIT" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "recovered", name: "Read", input: {} }] },
+      ...current,
+    ] }
+    for (const instructionsInSession of [false, true]) {
+      const render = setting => withStripToolRecords(setting, () => renderInitialPromptParts(body, null, instructionsInSession))
+      const complete = render(undefined)
+      const strict = render("1")
+      // Compare the entire current-turn text and image sequence after the replay
+      // boundary, as sent to a fresh ACP session when recovery cannot resume.
+      const currentParts = parts => {
+        const index = parts.findIndex(part => part.type === "text" && part.text.includes("<current_turn>\n"))
+        assert.ok(index >= 0)
+        return [{ type: "text", text: parts[index].text.split("<current_turn>\n")[1] }, ...parts.slice(index + 1)]
+      }
+      assert.deepEqual(currentParts(strict), currentParts(complete), layout)
+      assert.ok(!promptText(strict).includes("OLD_BODY_TO_OMIT"))
+      const recovered = currentParts(strict)
+      assert.ok(promptText(recovered).includes("RECOVERED_RESULT <raw>&\nfull body"))
+      assert.ok(promptText(recovered).includes("Loaded tool: recovered_tool"))
+      assert.ok(promptText(recovered).includes("Use the recovered result to finish."))
+      assert.ok(!promptText(recovered).includes("The user sent a new message"))
+      assert.deepEqual(recovered.filter(part => part.type === "image"), [
+        { type: "image", data: image.source.data, mimeType: "image/png" },
+      ])
+    }
+  }
+})
+
 test("server and MCP historical records use the same boundaries and optional omission", () => {
   const body = { messages: [
     { role: "assistant", content: [

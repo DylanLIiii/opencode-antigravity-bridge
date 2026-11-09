@@ -3,9 +3,11 @@
 ## 2026-11-09: combined validation for #17, #18, and #19
 
 - Integrated the three issue fixes on `fix/open-issues-17-19`. Final Node tests:
-  **91 focused tests + 413 smoke checks**, all passing. The combined regression
+  **91 focused tests + 425 smoke checks**, all passing. The combined regression
   failed before #17 because a background fork destroyed the main pending tool;
   it now passes fork timeout, queued-result replay, dedupe, and subsequent reuse.
+  The final 12 checks also verify reclaimed-fork result recovery with interruption
+  markers or plain user steering while the independent root remains pending.
 - Real macOS agy **1.5.2** integration passes image input, complex-schema MCP
   round trip, cross-process resume, effort change, and historical-result recall.
   The reported agy 1.5.3 Argon upstream stall and 68k-token echo were not tested
@@ -81,6 +83,11 @@
   and notices still use live MCP continuation; malformed notices remain errors.
 - Recheck live ownership and batch validity after awaiting tool-catalog updates
   so simultaneous continuations cannot consume the same results twice.
+- Final review also found that a reclaimed fork's late results were blocked by
+  an unrelated pending root. Complete fork history with user steering now reaches
+  isolated acquisition; results without steering retain the conservative 409.
+  Regressions cover interruption markers and ordinary queued text, followed by
+  successful completion of the root's tool in its original process.
 - Regression coverage uses the fake ACP server and real MCP helper: concurrent
   siblings, duplicate claims/continuations, capacity refusal/retry, branch-only
   queued replay, renamed IDs, incomplete batches, distinct durable snapshots,

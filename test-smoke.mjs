@@ -3039,6 +3039,72 @@ for (const compacted of [true, false]) {
   const completed = (await readSSE(await fetchCombined(followup))).events
   check("main follow-up reuses its recovered session after sibling failure", stopOf(completed) === "end_turn" &&
     lastOf("user").convId === replayPrompt.convId && !lastOf("user").text.includes("<conversation_history>"))
+
+  for (const [label, steering] of [
+    ["interruption marker", "[Request interrupted by user]"],
+    ["ordinary queued text", "Use the completed fork result and finish this side request."],
+  ]) {
+    const opening = { model, metadata: { user_id: `reclaimed-fork-${label}` }, tools: [echoTool],
+      messages: [{ role: "user", content: `shared opening for reclaimed fork ${label}` }] }
+    const base = (await readSSE(await fetchCombined(opening))).events
+    const root = nextTurn(opening, base, "BRANCHCALL branch 0")
+    const rootPending = (await readSSE(await fetchCombined(root))).events
+    const rootOwner = inits().at(-1)
+    const side = nextTurn(opening, base, "LONGTOOL reclaimed side request")
+    let sidePending
+    let sideOwner
+    const previousDeadline = process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+    process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "25"
+    try {
+      sidePending = (await readSSE(await fetchCombined(side))).events
+      sideOwner = inits().at(-1)
+      for (let attempt = 0; attempt < 100 && fs.existsSync(sideOwner.cwd); attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+    } finally {
+      if (previousDeadline === undefined) delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+      else process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = previousDeadline
+    }
+    const polls = logs().filter(event => event.type === "mcpResult" && event.convId === sideOwner.convId &&
+      /still running/.test(event.result?.content?.[0]?.text || ""))
+    check(`${label}: self-poll reclamation removes only the fork`, toolCalls(rootPending).length === 1 &&
+      toolCalls(sidePending).length === 1 && sideOwner.convId !== rootOwner.convId && polls.length === 8 &&
+      !fs.existsSync(sideOwner.cwd) && fs.existsSync(rootOwner.cwd))
+
+    const actualResult = `actual reclaimed fork result for ${label}`
+    const late = continuation(side, sidePending, actualResult)
+    const beforeReplay = inits().length
+    const unsteered = await fetchCombined(late)
+    check(`${label}: unmatched fork results without steering remain 409`, unsteered.status === 409 &&
+      inits().length === beforeReplay && fs.existsSync(rootOwner.cwd))
+    await unsteered.text()
+    late.messages.at(-1).content.push({ type: "text", text: steering })
+    const recovered = await fetchCombined(late)
+    let recoveredEvents = recovered.status === 200 ? (await readSSE(recovered)).events : []
+    if (recovered.status !== 200) await recovered.text()
+    const recoveredPrompt = lastOf("user")
+    check(`${label}: steered fork results replay while the root still waits`, recovered.status === 200 &&
+      inits().length === beforeReplay + 1 && recoveredPrompt.convId !== rootOwner.convId &&
+      recoveredPrompt.convId !== sideOwner.convId && fs.existsSync(rootOwner.cwd) &&
+      !logs().some(event => event.type === "mcpResult" && event.convId === rootOwner.convId))
+    check(`${label}: fork replay preserves the real result and steering once`, recovered.status === 200 &&
+      recoveredPrompt.text.split(actualResult).length === 2 && recoveredPrompt.text.split(steering).length === 2)
+    // The LONGTOOL fake asks for a new tool even when its trigger is in replayed
+    // history. Complete that round before checking the independent root owner.
+    let recoveredBody = late
+    for (let round = 0; round < 3 && stopOf(recoveredEvents) === "tool_use"; round++) {
+      recoveredBody = continuation(recoveredBody, recoveredEvents, "finish recovered side request")
+      recoveredEvents = (await readSSE(await fetchCombined(recoveredBody))).events
+    }
+    check(`${label}: recovered fork finishes normally`, stopOf(recoveredEvents) === "end_turn")
+
+    const beforeRootResult = inits().length
+    const rootResult = `original root result for ${label}`
+    const rootDone = (await readSSE(await fetchCombined(continuation(root, rootPending, rootResult)))).events
+    check(`${label}: root subsequently completes in its original process`, stopOf(rootDone) === "end_turn" &&
+      inits().length === beforeRootResult && logs().some(event => event.type === "mcpResult" &&
+        event.convId === rootOwner.convId && event.result?.content?.[0]?.text === rootResult))
+  }
 }
 
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))

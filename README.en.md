@@ -384,6 +384,9 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   in the same message, replays the complete result batch and user instruction
   in a fresh session for that branch. It is not appended to the MCP tool output.
   Incomplete batches are rejected before closing the live owner.
+  If a sibling was already reclaimed, its complete late results plus user
+  steering can replay while the main branch still waits on its own tools.
+  Unmatched results without steering retain the conservative 409 response.
   Complete `<system-update>` elements, task/channel/teammate
   notifications, recognized Claude Code hook notices, and tool companions are
   forwarded on the live MCP turn; explicit Claude Code mid-turn

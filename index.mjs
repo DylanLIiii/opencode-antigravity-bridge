@@ -2195,6 +2195,23 @@ function replayHistoryProblem(body, resultBlocks) {
   return answered.size === ids.size ? null : "missing_tool_result"
 }
 
+function canReplayUnmatchedFork(proc, body, resultBlocks, opts) {
+  if (lineageVerdict(proc, proc.turn, opts) !== "fork" || replayHistoryProblem(body, resultBlocks)) return false
+  // A reclaimed sibling no longer has live tool IDs. Explicit user steering
+  // makes its complete transcript a new prompt; an unrelated root must not
+  // block that prompt or be reclaimed to make room for it. Results alone still
+  // use the conservative unmatched-result path.
+  if (isInterruptedToolTurn(body)) return true
+  const calls = new Map(lastAssistantCalls(trailingMessages(body).history).map(call => [call.id, call]))
+  const results = resultBlocks.map(block => ({ block, call: calls.get(block.tool_use_id), result: toolResult(block) }))
+  try {
+    return inspectToolTurn(results, body).userSteered
+  } catch (error) {
+    if (!(error instanceof UnsupportedContent)) throw error
+    return canReplayFollowUpAfterResults(body, results)
+  }
+}
+
 async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn closed") {
   turn.closeNote = note
   proc.retiring = true
@@ -4077,10 +4094,12 @@ export const AntigravityBridgePlugin = async () => {
                 }
                 if (!acquireOpts.ownerKey && pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
                   const proc = pool.get(convKey)
-                  const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,
-                    body, resultBlocks, acquireOpts, isFresh, begin, claim })
-                  if (recovered) return streamResponse(recovered.proc, recovered.turn, body, init.signal)
-                  return jsonError(409, "agy bridge: no active MCP call matches these tool results")
+                  if (!canReplayUnmatchedFork(proc, body, resultBlocks, acquireOpts)) {
+                    const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,
+                      body, resultBlocks, acquireOpts, isFresh, begin, claim })
+                    if (recovered) return streamResponse(recovered.proc, recovered.turn, body, init.signal)
+                    return jsonError(409, "agy bridge: no active MCP call matches these tool results")
+                  }
                 }
                 if (replayHistoryProblem(body, resultBlocks)) {
                   throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")

@@ -139,7 +139,8 @@ magpie quota refresh antigravity-bridge --json
   `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整。
 - **用量**：ACP 一轮只给一次累计值、agy 不推 `usage_update`；插件从 agy 本地会话库
   （`~/.gemini/antigravity-cli/conversations/<sessionId>.db`）读每次模型调用的真实用量，
-  每个响应报自己覆盖的调用（含缓存读）。运行时没有 SQLite（Node < 22.5）或读不到库时回落估算。
+  每个响应报自己覆盖的调用（含缓存读）。运行时没有 SQLite（Node < 22.5，Node 22/23 需
+  `--experimental-sqlite`）或读不到库时回落估算；`AGY_BRIDGE_STEP_USAGE=0` 可完全关闭会话库读取。
 - **长输出续写**：撞 `max_tokens` 时在同一会话、同一响应里自动续写，最多 3 次
   （`AGY_BRIDGE_MAX_CONTINUATIONS`，`0` 关闭）；agy 自己插入的"输出被截断"提示不会出现在正文里。
 

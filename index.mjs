@@ -49,7 +49,9 @@ const PING_INTERVAL_MS = 15_000
 // A prompt that stops on max_tokens is continued in the same session, inside
 // the same response, at most this many times (0 turns it off).
 const MAX_CONTINUATIONS = (() => {
-  const value = Number(process.env.AGY_BRIDGE_MAX_CONTINUATIONS)
+  const raw = process.env.AGY_BRIDGE_MAX_CONTINUATIONS
+  // An unset (or empty) value keeps the default; only an explicit number applies.
+  const value = raw == null || String(raw).trim() === "" ? NaN : Number(raw)
   return Number.isSafeInteger(value) && value >= 0 ? value : 3
 })()
 const CONTINUE_PROMPT = "Continue exactly where your previous output stopped. Do not repeat any earlier text."
@@ -1231,7 +1233,8 @@ class Proc {
     try {
       turn.arm()
       if (model) await this.#setModel(model, selection)
-      turn.stepsFile = sessionDbPath(this.sessionId)
+      const stepUsageEnabled = !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
+      turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId) : null
       turn.stepCursor = turn.stepsFile ? lastModelStep(turn.stepsFile) : null
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
@@ -3283,12 +3286,13 @@ async function measuredUsage(turn, step, result) {
   if (step.settled || !turn.stepsFile || turn.stepCursor == null) return null
   const final = result !== undefined
   const acp = final && result?.usage ? promptUsage(result.usage) : null
-  const measured = turn.measured || { prompt: 0, output: 0 }
+  const measured = turn.measured || { prompt: 0 }
+  const expected = acp ? acp.promptInput + acp.write : null
+  const promptOf = (steps) => steps.reduce((sum, item) => sum + item.input + item.read + item.write, measured.prompt)
   const complete = (steps) => {
     if (!steps?.length) return false
-    if (!acp) return true
-    const prompt = steps.reduce((sum, item) => sum + item.input + item.read + item.write, measured.prompt)
-    return prompt >= acp.promptInput + acp.write
+    if (expected === null) return true
+    return promptOf(steps) >= expected
   }
   const deadline = Date.now() + STEP_USAGE_WAIT_MS
   // agy has written the store by its first tool call; none means none kept here.
@@ -3300,14 +3304,16 @@ async function measuredUsage(turn, step, result) {
     steps = modelStepsAfter(turn.stepsFile, turn.stepCursor)
   }
   if (!complete(steps)) return null
+  // agy's per-call prompts sum to ACP's total exactly. A large over-count means
+  // the store's layout or contents no longer match what ACP reported, so don't
+  // hand the client numbers we cannot reconcile.
+  const prompt = promptOf(steps)
+  if (expected !== null && prompt > expected + Math.max(16, Math.ceil(expected * 0.01))) return null
   const last = steps.at(-1)
   const output = steps.reduce((sum, item) => sum + item.output + item.thinking, 0)
   const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
   turn.stepCursor = last.idx
-  turn.measured = {
-    prompt: steps.reduce((sum, item) => sum + item.input + item.read + item.write, measured.prompt),
-    output: measured.output + output,
-  }
+  turn.measured = { prompt }
   step.usageKind = "agy_model_call"
   step.modelCalls = steps.length
   return {
@@ -3485,8 +3491,19 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
             const usage = await settleUsage(proc, turn, step, responseContent)
             if (finished) return
-            // Parallel calls that arrived while the usage was read belong here too.
-            while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
+            // The store read can take up to a second, and agy may keep streaming
+            // meanwhile. Those chunks (text, thoughts, parallel calls) belong to
+            // this response, so forward them before closing instead of leaving
+            // them queued for the next HTTP response.
+            for (;;) {
+              const queued = turn.events[0]
+              if (!queued || !["tool", "text", "thinking"].includes(queued.type)) break
+              turn.events.shift()
+              if (queued.type === "tool") emitToolUse(queued.call)
+              else if (queued.type === "text") emitDelta("text", queued.text)
+              else if (forwardThinking) emitDelta("thinking", queued.text)
+            }
+            closeBlock()
             stopMessage("tool_use", usage, false, step.usageKind === "agy_model_call")
             proc.recordAssistantResponse(turn, responseContent)
             detach()

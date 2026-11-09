@@ -51,3 +51,16 @@ test("keeps model text that only resembles the notice", () => {
     "x\n⚠ Agent execution terminated due to error.\n",
   ]) assert.equal(run([text]).text, text)
 })
+
+test("flush() ends a notice sequence so a later look-alike line is kept", () => {
+  // A partial TAIL-prefix line held at a session/prompt boundary used to leave
+  // inNotice set, dropping a legitimate notice-shaped line in the next step.
+  const filter = new OutputLimitFilter()
+  let text = filter.push("\n⚠ Your previous response was cut off because it exceeded the output token limit\n")
+  text += filter.push("Please continue")
+  text += filter.flush()
+  text += filter.push("\nRetries remaining: 2\n")
+  text += filter.flush()
+  assert.equal(text, "Please continue\nRetries remaining: 2\n")
+  assert.equal(filter.dropped, 1)
+})

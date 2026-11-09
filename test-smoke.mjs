@@ -333,6 +333,15 @@ async function prompt(params) {
     chunk("part one, ")
     return { stopReason: "max_tokens", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } }
   }
+  if (text.includes("MEASURED_INFLATED")) {
+    // One call whose recorded prompt wildly exceeds ACP's total for the turn.
+    chunk("Inflated one.\n")
+    recordModelCall({ input: 99999, output: 40, thinking: 4 })
+    await invoke("echo", { text: "inflated" })
+    chunk("Inflated two.\n")
+    recordModelCall({ input: 500, read: 3000, output: 20 })
+    return finish("Inflated one.\nInflated two.\n", { input: 3500, cached: 3000, exclusive: true })
+  }
   if (text.includes("MEASURED")) {
     const lag = text.includes("MEASURED_LAG")
     chunk("Measured one.\n")
@@ -2653,6 +2662,39 @@ for (const compacted of [true, false]) {
       stopOf(lastEvents) === "end_turn" && final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20,
       JSON.stringify(final))
   }
+}
+
+{
+  // AGY_BRIDGE_STEP_USAGE=0 must skip the conversation store and keep the
+  // estimate, even when the store has real per-call numbers.
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  try {
+    const first = { model, metadata: { user_id: "measured-disabled" }, messages: [{ role: "user", content: "MEASURED disabled" }], tools: [echoTool] }
+    const firstEvents = (await readSSE(await callFetch(first))).events
+    const lastEvents = (await readSSE(await callFetch(continuation(first, firstEvents, "disabled-result")))).events
+    const usageOf = events => events.find(event => event.event === "message_delta")?.data?.usage || {}
+    const step = usageOf(firstEvents)
+    check("AGY_BRIDGE_STEP_USAGE=0 skips the store and keeps the estimate",
+      stopOf(lastEvents) === "end_turn" && step.input_tokens > 0 &&
+        !(step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44),
+      JSON.stringify(step))
+  } finally {
+    delete process.env.AGY_BRIDGE_STEP_USAGE
+  }
+}
+
+{
+  // A store whose per-call prompts cannot be reconciled with ACP's total must
+  // not be reported as measured usage.
+  const first = { model, metadata: { user_id: "measured-inflated" }, messages: [{ role: "user", content: "MEASURED_INFLATED usage" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const lastEvents = (await readSSE(await callFetch(continuation(first, firstEvents, "inflated-result")))).events
+  const usageOf = events => events.find(event => event.event === "message_delta")?.data?.usage || {}
+  const final = usageOf(lastEvents)
+  check("an over-counted store falls back instead of reporting unreconciled numbers",
+    stopOf(lastEvents) === "end_turn" &&
+      !(final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20),
+    JSON.stringify(final))
 }
 
 {

@@ -135,8 +135,9 @@ magpie plugin add ./opencode-antigravity-bridge
   reports the calls it covered from there: the latest call's uncached input,
   `cache_read_input_tokens` and cache writes, and the calls' output with
   thought tokens itemized in `output_tokens_details.thinking_tokens`. Without
-  SQLite (Node < 22.5) or a readable store, responses fall back to an estimate
-  calibrated on ACP's totals.
+  SQLite support (Node < 22.5, or Node 22/23 without `--experimental-sqlite`)
+  or a readable store, responses fall back to an estimate calibrated on ACP's
+  totals. Set `AGY_BRIDGE_STEP_USAGE=0` to disable store reads entirely.
 - **Long answers continue.** A prompt that stops on `max_tokens` is continued in
   the same session and response, up to 3 times (`AGY_BRIDGE_MAX_CONTINUATIONS`).
   agy's own output-cap notice ("Your previous response was cut off…") is not
@@ -400,6 +401,7 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 | `AGY_BRIDGE_MCP_TRACE` | unset | file that receives the MCP helper's traffic (diagnostics) |
 | `AGY_BRIDGE_MAX_CONTINUATIONS` | 3 | automatic continuations of an answer cut at the output cap (`0` disables) |
 | `AGY_BRIDGE_CONVERSATIONS_DIR` | `~/.gemini/antigravity-cli/conversations` | agy's conversation store, read for per-call usage |
+| `AGY_BRIDGE_STEP_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips per-call usage from agy's conversation store entirely |
 
 ## Development
 

@@ -90,6 +90,9 @@ export class OutputLimitFilter {
       this.inNotice = false
       return ""
     }
+    // Held text was not a notice; end the notice sequence too, or a look-alike
+    // line in the next step would still be dropped (push() resets this as well).
+    this.inNotice = false
     this.midLine = !rest.endsWith("\n")
     return rest
   }

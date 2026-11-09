@@ -1,5 +1,15 @@
 # Handoff: opencode-antigravity-bridge
 
+## Magpie UI description and 0.1.2
+
+- Added `magpie.name` and `magpie.summary.en/zh` to `package.json`, matching the
+  upstream Magpie plugin-card metadata format. The UI selects the current language
+  with English fallback; each summary must be a single line of at most 300 characters.
+- Copy highlights the official agy CLI approach to account risk and reduced
+  redundant token usage through lean prompts/session reuse. Risk reduction is a
+  design goal, not a measured ban-rate claim or a guarantee against restrictions.
+- Package description matches the English summary; changelog and version updated.
+
 ## Version policy and 0.1.1
 
 - Maintainer requested version updates for subsequent project changes. Follow

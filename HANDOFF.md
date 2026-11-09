@@ -1,5 +1,19 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-11-09: GitHub issue #19 replay boundaries
+
+- Historical tool calls/results now use escaped `<tool_record>` boundaries and
+  nearby reminders. Full result text, images, and tool references remain in order
+  by default; server-tool error status also survives optional body omission.
+- `AGY_BRIDGE_STRIP_TOOL_RECORDS=1` omits historical result bodies only during
+  replay. Current results, including queued-message recovery, remain complete.
+  This reduces historical recall and does not erase active/resumed session data.
+- Validation: Node **91 focused tests + 352 smoke checks** passed. Real macOS
+  agy **1.5.2** integration passed image input, tool round trip, cross-process
+  resume/effort change, and a new historical-result recall fixture returning only
+  its code. The reported 68k-token Gemini echo case was not reproduced; delimiters
+  mitigate copying but cannot guarantee model behavior.
+
 ## 2026-11-08：#14 复杂工具 schema 与 ToolSearch 兼容
 
 - schema 适配提取到 `tool-schema.mjs` 并加入 npm 文件列表：本地 `$ref` 先展开，

@@ -16,8 +16,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, execOnce };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, execOnce } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, execOnce, normalizeTools };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, withStateLock, execOnce, normalizeTools } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -27,6 +27,25 @@ const result = (id, name, text) => ({
   result: { content: [{ type: "text", text }], isError: false },
 })
 const bodyFor = content => ({ messages: [{ role: "assistant", content: [] }, { role: "user", content }] })
+
+test("declared schema-less ToolSearch receives query and max_results parameters", () => {
+  const [tool] = normalizeTools({ tools: [{ name: "ToolSearch", description: "Find tools" }] })
+  assert.equal(tool.inputSchema.properties.query.type, "string")
+  assert.equal(tool.inputSchema.properties.max_results.type, "integer")
+  assert.deepEqual(tool.inputSchema.required, ["query"])
+  const explicit = { type: "object", properties: { custom: { type: "boolean" } } }
+  assert.deepEqual(normalizeTools({ tools: [{ name: "ToolSearch", input_schema: explicit }] })[0].inputSchema, explicit)
+  assert.deepEqual(normalizeTools({ tools: [] }), [])
+})
+
+test("deferred definitions survive normalization while tool_choice still limits exposure", () => {
+  const tools = [{ name: "ToolSearch" }, { name: "mcp__terminal__run_in_terminal", defer_loading: true,
+    input_schema: { type: "object", properties: { command: { anyOf: [{ type: "string" }, { type: "null" }] } } } }]
+  assert.deepEqual(normalizeTools({ tools }).map(tool => tool.name), tools.map(tool => tool.name))
+  assert.equal(normalizeTools({ tools })[1].inputSchema.properties.command.type, "string")
+  assert.deepEqual(normalizeTools({ tools, tool_choice: { type: "none" } }), [])
+  assert.deepEqual(normalizeTools({ tools, tool_choice: { type: "tool", name: tools[1].name } }).map(tool => tool.name), [tools[1].name])
+})
 
 test("images and dimension notes belong to their preceding result in a batch", () => {
   const a = result("call_a", "Read", "first")

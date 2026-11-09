@@ -14,6 +14,45 @@
   its code. The reported 68k-token Gemini echo case was not reproduced; delimiters
   mitigate copying but cannot guarantee model behavior.
 
+## Issue #18: bounded ACP inactivity and observable streaming
+
+- Existing Anthropic `message_start` / `ping` already start when the response
+  attaches to a turn. Fake-ACP tests now verify receipt before upstream output;
+  heartbeat interval is configurable (`AGY_BRIDGE_PING_INTERVAL_MS`, 15000 ms),
+  and streaming responses request `X-Accel-Buffering: no`. No Responses API
+  events or synthetic answer text are emitted. Catalog/startup/resume/initial
+  configuration still precede the stream. Cancellation during acquisition is
+  checked before beginTurn so a late handshake cannot submit a cancelled prompt.
+- `AGY_BRIDGE_TURN_TIMEOUT_MS` now defaults to 120000 ms. Nonempty text/thought
+  chunks renew progress; metadata, empty chunks, stderr retries and downstream
+  pings do not. Thoughts count even when hidden. Client tools retain their own
+  deadline, beginning when the first outstanding call arrives, with no renewal
+  from upstream metadata or detached self-polling.
+- Inactivity emits `upstream_idle_timeout` with selected model/effort and recovery
+  guidance; non-streaming gets HTTP 504. Submitted failures are non-retryable and
+  retain the existing bounded `prompt_outcome_unknown` dedupe record. Unsubmitted
+  failures release their claim. No automatic upstream retry was added.
+- Bare Argon families prefer medium when advertised; explicit effort/legacy
+  suffixes and other families' defaults are preserved.
+- Timeout stops ACP/MCP resources, timers and deferred waiters. POSIX ACP children
+  now own a private process group, allowing cleanup of helpers and descendants
+  even after the parent exits; Windows retains taskkill /T /F. Failed tool IDs
+  remain bounded error records until consumed/idle cleanup, preserving late-result
+  behavior. Descendants escaping the private group remain outside the guarantee.
+- Regressions cover silent and repeating-metadata upstreams, streaming lifecycle,
+  heartbeat/error ordering, uncertain-outcome dedupe, HTTP 504, selected effort,
+  real hidden-thought progress, startup cancellation/safe retry, tool wait clocks,
+  workspace/helper cleanup, and a descendant ignoring SIGTERM. Both READMEs
+  describe config and the limits: this does not fix Google/agy stalls, deliver
+  early bytes during startup, or override a client's total request timeout.
+- Real agy integration was not rerun for this change; the coordinating session
+  reported a passing agy 1.5.2 baseline. Windows process-tree cleanup is untested
+  on a real Windows host. Tool-result collision and replay formatting are out of
+  scope for this worktree.
+- Validation: `npm test` passed 85 focused tests and 377 smoke checks; after the
+  final tool-wait-clock regression, `node test-smoke.mjs` passed all 378 checks.
+  `node --check` for index/test-smoke and `git diff --check` passed.
+
 ## 2026-11-08：#14 复杂工具 schema 与 ToolSearch 兼容
 
 - schema 适配提取到 `tool-schema.mjs` 并加入 npm 文件列表：本地 `$ref` 先展开，

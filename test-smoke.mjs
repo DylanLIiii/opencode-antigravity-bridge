@@ -16,6 +16,7 @@ const bridgeStateFile = path.join(stateDir, "bridge-sessions.json")
 process.env.AGY_BRIDGE_STATE_FILE = bridgeStateFile
 process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "5000"
+process.env.AGY_BRIDGE_PING_INTERVAL_MS = "100"
 process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
@@ -45,6 +46,7 @@ if (argv.includes("/usage")) {
 if (argv.includes("models")) {
   log({ type: "models", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE })
   process.stdout.write("gemini-test-medium\tGemini Test (Medium)\ngemini-test-high\tGemini Test (High)\ngemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
+  process.stdout.write("gemini-4-argon-low\tGemini 4 Argon (Low)\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-argon-high\tGemini 4 Argon (High)\n")
   process.exit(0)
 }
 if (argv[0] !== "acp") {
@@ -203,6 +205,31 @@ async function prompt(params) {
   session.prompts++
   saveState()
   log({ type: "user", convId: session.id, prompt: session.prompts, text, images, content: params.prompt, model })
+  if (text.includes("DELAY_BEFORE_TOOL")) await new Promise(resolve => setTimeout(resolve, 1500))
+  if (text.includes("IDLE_SILENT") || text.includes("IDLE_METADATA")) {
+    if (text.includes("IDLE_METADATA")) {
+      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" })
+      log({ type: "idleChild", convId: session.id, pid: child.pid })
+    }
+    if (text.includes("IDLE_METADATA")) setInterval(() => {
+      update({ sessionUpdate: "session_info_update", title: "upstream retrying" })
+      update({ sessionUpdate: "usage_update", used: 0, size: 1000 })
+      update({ sessionUpdate: "tool_call_update", toolCallId: "metadata-only", status: "in_progress" })
+      chunk("")
+      thought("")
+      fs.appendFileSync(agentLog, "Run: stream idle timeout, retrying upstream\n")
+      log({ type: "idleMetadata", convId: session.id })
+    }, 100)
+    await new Promise(() => {})
+  }
+  if (text.includes("IDLE_PROGRESS")) {
+    for (let n = 0; n < 4; n++) {
+      await new Promise(resolve => setTimeout(resolve, 1500))
+      thought("still reasoning " + n)
+    }
+    chunk("progress completed")
+    return finish("progress completed")
+  }
   if (text.includes("REFUSAL_CLEAN")) {
     return { stopReason: "refusal" }
   }
@@ -400,9 +427,9 @@ const pendingClient = new Map()
 function configOptions() {
   if (process.env.FAKE_AGY_CONFIG === "omit" || process.env.FAKE_AGY_IMAGES === "omit") return []
   const family = model.replace(/-(low|medium|high|xhigh|max)$/, "")
-  const configurable = family === "gemini-test" || family === "gemini-config-only"
+  const configurable = family === "gemini-test" || family === "gemini-config-only" || family === "gemini-4-argon"
   const grouped = process.env.FAKE_AGY_CONFIG === "grouped"
-  const models = ["gemini-test", "gemini-config-only", "claude-test-medium"].map(value => ({ value, name: value }))
+  const models = ["gemini-test", "gemini-config-only", "gemini-4-argon", "claude-test-medium"].map(value => ({ value, name: value }))
   return [
     { id: grouped ? "model-picker" : "model", name: "Model", category: "model", type: "select", currentValue: configurable ? family : model,
       options: grouped ? [{ group: "Test models", options: models }] : models },
@@ -449,7 +476,7 @@ async function handle(message) {
       log({
         type: "init", pid: process.pid, convId: session.id, resumed: message.method === "session/resume", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
         cwd: process.cwd(), addDir, agentConfig, clientInfo, systemAppend: params._meta?.antigravity?.systemPrompt?.append ?? null,
-        tools, idePort,
+        tools, idePort, mcpPid: mcp?.pid,
       })
       return { sessionId: session.id, models: { currentModelId: model, availableModels: [] }, configOptions: configOptions() }
     }
@@ -697,6 +724,9 @@ async function launchedModel(body) {
 
 {
   check("grouped model defaults to high", await launchedModel({ model, messages: [{ role: "user", content: "MODEL default effort" }] }) === "gemini-test-high")
+  check("Argon alone defaults to medium", await launchedModel({ model: "gemini-4-argon", messages: [{ role: "user", content: "MODEL Argon default" }] }) === "gemini-4-argon-medium")
+  check("Argon explicit high remains available", await launchedModel({ model: "gemini-4-argon", reasoning_effort: "high", messages: [{ role: "user", content: "MODEL Argon explicit" }] }) === "gemini-4-argon-high")
+  check("Argon legacy low remains available", await launchedModel({ model: "gemini-4-argon-low", messages: [{ role: "user", content: "MODEL Argon legacy" }] }) === "gemini-4-argon-low")
   check("thinking budget selects the matching agy model", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL low effort" }] }) === "gemini-test-low")
   check("output effort selects the matching agy model", await launchedModel({ model, thinking: { type: "adaptive" }, output_config: { effort: "medium" }, messages: [{ role: "user", content: "MODEL medium effort" }] }) === "gemini-test-medium")
   check("high thinking budget selects high", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 24000 }, messages: [{ role: "user", content: "MODEL high effort" }] }) === "gemini-test-high")
@@ -1381,6 +1411,103 @@ for (const change of ["tools", "model"]) {
 }
 
 {
+  process.env.FAKE_AGY_INIT_MODE = "slow"
+  process.env.FAKE_AGY_SET_MODEL_DELAY = "150"
+  const body = { model, messages: [{ role: "user", content: "cancel during startup before prompt" }] }
+  const aborter = new AbortController()
+  const timer = setTimeout(() => aborter.abort(new Error("client left during startup")), 50)
+  await callFetch(body, {}, aborter.signal)
+  clearTimeout(timer)
+  delete process.env.FAKE_AGY_INIT_MODE
+  delete process.env.FAKE_AGY_SET_MODEL_DELAY
+  const init = inits().at(-1)
+  check("startup cancellation never submits a late prompt and removes its workspace",
+    !logs().some(event => event.type === "user" && event.text === body.messages[0].content) && !fs.existsSync(init.cwd))
+  const { events } = await readSSE(await callFetch(body))
+  check("startup cancellation releases the unsubmitted claim for safe retry", stopOf(events) === "end_turn" &&
+    logs().filter(event => event.type === "user" && event.text === body.messages[0].content).length === 1)
+}
+
+// A hung upstream must remain observable without letting its title/status
+// updates (or our downstream heartbeats) keep it alive indefinitely.
+for (const mode of ["IDLE_SILENT", "IDLE_METADATA"]) {
+  const body = { model: "gemini-4-argon", messages: [{ role: "user", content: mode }], stream: true }
+  const aborter = new AbortController()
+  const watchdog = setTimeout(() => aborter.abort(new Error("timeout regression watchdog")), 8000)
+  const started = Date.now()
+  const response = await callFetch(body, {}, aborter.signal)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let raw = ""
+  try {
+    const first = await reader.read()
+    raw += decoder.decode(first.value)
+    const firstEvents = (await readSSE(new Response(raw))).events
+    check(`${mode}: lifecycle arrives before any upstream content`, Date.now() - started < 1500 &&
+      firstEvents[0]?.event === "message_start" && firstEvents[0].data.message.content.length === 0)
+    const second = await reader.read()
+    raw += decoder.decode(second.value)
+    check(`${mode}: a valid Anthropic heartbeat arrives during silence`, Date.now() - started < 1500 &&
+      (await readSSE(new Response(raw))).events.some(event => event.event === "ping" && event.data.type === "ping"))
+    const duplicate = await callFetch(body)
+    check(`${mode}: concurrent duplicate is held while upstream runs`, duplicate.status === 503)
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      raw += decoder.decode(value, { stream: true })
+    }
+  } catch (error) {
+    check(`${mode}: stream finishes without the regression watchdog`, false, error.message)
+  } finally {
+    clearTimeout(watchdog)
+    reader.releaseLock()
+  }
+  const elapsed = Date.now() - started
+  const { events } = await readSSE(new Response(raw))
+  const failure = events.find(event => event.event === "error")?.data.error
+  check(`${mode}: inactivity is bounded despite heartbeat/metadata`, elapsed >= 4500 && elapsed < 7500 &&
+    failure?.code === "upstream_idle_timeout", `${elapsed}ms ${JSON.stringify(failure)}`)
+  check(`${mode}: error identifies chosen effort and safe recovery`, failure?.retryable === false &&
+    failure.message.includes("effort=medium") && failure.message.includes("AGY_BRIDGE_TURN_TIMEOUT_MS") &&
+    failure.message.includes("outcome is unknown"))
+  check(`${mode}: error is terminal, with no invented answer`, events.at(-1)?.event === "error" &&
+    !events.some(event => ["content_block_start", "message_stop"].includes(event.event)))
+  const user = logs().find(event => event.type === "user" && event.text === mode)
+  const init = inits().find(event => event.convId === user?.convId)
+  const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+  check(`${mode}: ACP, helper and workspace are cleaned`, init && !fs.existsSync(init.cwd) &&
+    !alive(init.pid) && !alive(init.mcpPid))
+  if (mode === "IDLE_METADATA") {
+    const child = logs().find(event => event.type === "idleChild" && event.convId === user?.convId)
+    check("timeout also reaps an owned descendant that ignores SIGTERM", child?.pid && !alive(child.pid))
+  }
+  if (mode === "IDLE_METADATA") check("fake ACP repeatedly emitted metadata throughout the wait",
+    logs().filter(event => event.type === "idleMetadata" && event.convId === user?.convId).length >= 20)
+  const retry = await callFetch(body)
+  const retryError = await retry.json()
+  check(`${mode}: completed timeout leaves an uncertain-outcome guard, not a busy claim`, retry.status === 409 &&
+    retryError.error?.code === "prompt_outcome_unknown" && retry.headers.get("x-should-retry") === "false" &&
+    logs().filter(event => event.type === "user" && event.text === mode).length === 1)
+}
+
+{
+  const body = { model: "gemini-4-argon-high", messages: [{ role: "user", content: "IDLE_SILENT nonstream" }], stream: false }
+  const response = await callFetch(body, {}, AbortSignal.timeout(8000))
+  const payload = await response.json()
+  check("nonstream timeout returns HTTP 504 and non-retryable diagnostics", response.status === 504 &&
+    response.headers.get("x-should-retry") === "false" && payload.error?.code === "upstream_idle_timeout" &&
+    payload.error.retryable === false && payload.error.message.includes("effort=high"))
+}
+
+{
+  const started = Date.now()
+  const body = { model: "gemini-4-argon", messages: [{ role: "user", content: "IDLE_PROGRESS" }], thinking: { type: "disabled" } }
+  const { events } = await readSSE(await callFetch(body, {}, AbortSignal.timeout(9000)))
+  check("real thought progress renews inactivity even when thought forwarding is disabled", Date.now() - started > 5000 &&
+    stopOf(events) === "end_turn" && textOf(events) === "progress completed" && !events.some(event => event.event === "error"))
+}
+
+{
   const firstBody = { model, messages: [{ role: "user", content: "TOOL timeout" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
   const init = inits().at(-1)
@@ -1390,6 +1517,14 @@ for (const change of ["tools", "model"]) {
   const error = events.find(event => event.event === "error")?.data?.error?.message || ""
   check("missing client result times out explicitly", error.includes("timed out waiting for a client tool result"), error)
   check("timed-out process workspace is removed", !fs.existsSync(init.cwd), init.cwd)
+}
+
+{
+  const body = { model, messages: [{ role: "user", content: "DELAY_BEFORE_TOOL" }], tools: [echoTool] }
+  const { events } = await readSSE(await callFetch(body))
+  const final = (await readSSE(await callFetch(continuation(body, events, "delayed-tool-result")))).events
+  check("a new client tool wait gets its own budget after slow model output", toolCalls(events).length === 1 &&
+    stopOf(final) === "end_turn" && lastOf("mcpResult")?.result?.content?.[0]?.text === "delayed-tool-result")
 }
 
 {

@@ -24,7 +24,8 @@ const MAX_PROCS = 4
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
-const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
+// Bound silence before agy's own five-minute stream timeout/retry loop.
+const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 2 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
 const RESUME_TTL_MS = positiveTimeout(process.env.AGY_BRIDGE_RESUME_TTL_MS, 6 * 60 * 60 * 1000)
 // agy fails an ide-tools MCP call after a fixed three minutes. Answer before
@@ -45,7 +46,7 @@ const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
-const PING_INTERVAL_MS = 15_000
+const PING_INTERVAL_MS = positiveTimeout(process.env.AGY_BRIDGE_PING_INTERVAL_MS, 15_000)
 // A prompt that stops on max_tokens is continued in the same session, inside
 // the same response, at most this many times (0 turns it off).
 const MAX_CONTINUATIONS = (() => {
@@ -207,7 +208,8 @@ function buildModelCatalog(list) {
     const sorted = [...family].sort((a, b) => EFFORT_ORDER.indexOf(a.effort) - EFFORT_ORDER.indexOf(b.effort))
     const efforts = sorted.map(variant => variant.effort)
     const byEffort = new Map(sorted.map(variant => [variant.effort, variant.id]))
-    const defaultEffort = byEffort.has("high") ? "high" : efforts[efforts.length - 1]
+    const defaultEffort = /^gemini-[0-9.]+-argon$/i.test(id) && byEffort.has("medium")
+      ? "medium" : byEffort.has("high") ? "high" : efforts[efforts.length - 1]
     const defaultModel = sorted.find(variant => variant.effort === defaultEffort)
     const baseName = defaultModel.name.replace(/\s+\((?:minimal|low|medium|high|xhigh|max)\)$/i, "").trim()
     models.push({
@@ -800,7 +802,8 @@ class Turn {
     for (const waiter of this.lateWaiters.splice(0)) waiter.resolve()
   }
 
-  // Inactivity timeout: agy output, or the client's tool result while one is pending.
+  // Only substantive model output or an actual MCP/result transition renews this
+  // clock. Session titles, plans, usage/status updates and transport pings do not.
   arm() {
     this.lastProgressAt = Date.now()
     this.rearm()
@@ -813,12 +816,26 @@ class Turn {
     const waitingForTools = this.hasPendingMcp()
     const timeout = waitingForTools ? TOOL_RESULT_TIMEOUT_MS : TURN_TIMEOUT_MS
     const now = Date.now()
-    this.deadlineAt = (waitingForTools && !this.attached ? this.clientProgressAt : now) + timeout
+    this.deadlineAt = (waitingForTools ? this.clientProgressAt : this.lastProgressAt) + timeout
     this.timer = setTimeout(() => {
       const what = waitingForTools ? "waiting for a client tool result" : "reading agy output"
-      this.proc.timeoutTurn(this, new Error(
-        `agy bridge: timed out ${what} after ${timeout}ms; stderr tail: ${this.proc.stderrTail.trim() || "(empty)"}`,
-      ))
+      const model = this.proc.currentModel || this.proc.model
+      const effort = this.proc.currentEffort || "upstream default"
+      const error = new Error(
+        `agy bridge: timed out ${what} after ${timeout}ms without meaningful progress ` +
+        `(model=${model}, effort=${effort}). ` +
+        (waitingForTools
+          ? "Check the client tool execution; AGY_BRIDGE_TOOL_TIMEOUT_MS controls this limit. "
+          : "agy/ACP may be stalled or retrying upstream. Check agy connectivity/model availability, choose another route, " +
+            "or increase AGY_BRIDGE_TURN_TIMEOUT_MS for intentionally slow models. ") +
+        (this.promptSubmitted
+          ? "The prompt was submitted and its outcome is unknown; automatic retry is unsafe."
+          : "No prompt was submitted; retry is safe."),
+      )
+      error.code = waitingForTools ? "client_tool_timeout" : "upstream_idle_timeout"
+      error.retryable = !this.promptSubmitted
+      error.noRetry = !error.retryable
+      this.proc.timeoutTurn(this, error)
     }, Math.max(0, this.deadlineAt - now))
     this.timer.unref?.()
   }
@@ -907,6 +924,7 @@ class Proc {
       this.child = spawnAgy(this.agyPath, args, {
         cwd: this.workspace,
         stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
         windowsHide: true,
         env: {
           ...childEnv,
@@ -1018,6 +1036,7 @@ class Proc {
   async #setModel(model, selection, force = false) {
     const selectionKey = stableJSON({ model, selection })
     if (!force && this.currentSelectionKey === selectionKey) return
+    let effectiveEffort = /-(minimal|low|medium|high|xhigh|max)$/.exec(model)?.[1] || ""
     try {
       let configured = false
       const target = this.configMethodUnsupported ? null : configModelSelection(this.configOptions, model, selection)
@@ -1030,6 +1049,7 @@ class Proc {
           if (target.effort && levels.length) {
             const level = closestEffort(target.effort, levels)
             if (force || thought.currentValue !== level) await this.#setConfig(thought, level)
+            effectiveEffort = level
             configured = true
           } else {
             // A standalone model is fully selected by its advertised value.
@@ -1050,6 +1070,7 @@ class Proc {
       throw wrapped
     }
     this.currentModel = model
+    this.currentEffort = effectiveEffort
     this.currentSelectionKey = selectionKey
   }
 
@@ -1151,14 +1172,19 @@ class Proc {
     const turn = this.turn
     if (!turn || turn.done || turn.finalized) return
     const update = params.update ?? {}
-    turn.arm()
     if (turn.cancelRequested) return
     if (update.sessionUpdate === "agent_message_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
-      if (text) turn.pushText(text)
+      if (typeof text === "string" && text.length) {
+        turn.arm()
+        turn.pushText(text)
+      }
     } else if (update.sessionUpdate === "agent_thought_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
-      if (text) turn.push({ type: "thinking", text })
+      if (typeof text === "string" && text.length) {
+        turn.arm()
+        turn.push({ type: "thinking", text })
+      }
     }
   }
 
@@ -1363,6 +1389,15 @@ class Proc {
     turn.fail(error)
     dropFromPool(this)
     this.stop().catch(() => {})
+    // Stop active tool resources even without an HTTP reader. Keep failed tool
+    // IDs until the client consumes the error (or fail's bounded cleanup runs),
+    // so a late result finds this failure instead of replaying an uncertain turn.
+    for (const call of turn.calls) clearTimeout(call.deadline)
+    for (const waiter of turn.awaitCalls.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.reply({ content: [{ type: "text", text: error.message }], isError: true })
+    }
+    if (!turn.calls.length) this.finalizeTurn(turn)
   }
 
   acceptMcpCall(message, socket) {
@@ -1396,6 +1431,9 @@ class Proc {
       mcpMeta: message.meta,
     }
     turn.flushText()
+    // The first outstanding call starts a new client wait, even if generation
+    // before that call lasted longer than the client's tool-result budget.
+    if (!turn.hasPendingMcp()) turn.touchClient()
     turn.calls.push(call)
     toolCalls.set(call.id, { proc: this, turn, call })
     socket.once("close", () => {
@@ -1609,13 +1647,18 @@ class Proc {
         if (process.platform === "win32" && child.pid) {
           await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3_000 })
         } else {
-          try { child.kill("SIGTERM") } catch {}
+          try { process.kill(-child.pid, "SIGTERM") } catch { try { child.kill("SIGTERM") } catch {} }
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
         }
         if (alive()) {
           try { child.kill("SIGKILL") } catch {}
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 1_000))])
         }
+      }
+      // The ACP parent may exit before its MCP helper; kill remaining members
+      // of our private process group as well. Never target a user's agy group.
+      if (process.platform !== "win32" && child.pid) {
+        try { process.kill(-child.pid, "SIGKILL") } catch {}
       }
     }
     this.child = null
@@ -3569,6 +3612,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           }
           if (event.type === "error") {
             closeBlock()
+            clearInterval(pingTimer)
+            pingTimer = null
             send("error", {
               type: "error",
               error: {
@@ -3734,7 +3779,8 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.type === "rate_limit_error" ? 429
+    const status = streamError.code === "upstream_idle_timeout" ? 504
+      : streamError.type === "rate_limit_error" ? 429
       : streamError.type === "permission_error" ? 403 : 502
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
@@ -3766,6 +3812,7 @@ function streamResponse(proc, turn, body, signal) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   })
 }
@@ -3903,7 +3950,17 @@ export const AntigravityBridgePlugin = async () => {
                 }
                 return promptAttempt
               }
-              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched)
+              const begin = async (proc, history) => {
+                // Acquisition includes discovery/startup/configuration before an
+                // SSE response exists. A caller that left during those awaits
+                // must never submit a prompt when the handshake finally returns.
+                if (init.signal?.aborted) {
+                  dropFromPool(proc)
+                  await proc.stop().catch(() => {})
+                  throw init.signal.reason || new Error("request aborted before prompt submission")
+                }
+                return beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched)
+              }
               if (resultBlocks.length) {
                 const matches = matchToolResults(body, resultBlocks)
                 const found = matches.filter((item) => item.match)

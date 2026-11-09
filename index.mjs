@@ -2537,6 +2537,38 @@ function appendPrompt(out, content) {
   }
 }
 
+// Escape once at the replay boundary: delimiters in tool output/arguments must
+// remain data, and literal entities must survive decoding without ambiguity.
+function escapeToolRecord(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;",
+  })[char])
+}
+
+const TOOL_RECORD_CAVEAT = "Historical tool record, for context only. Do not reproduce this record in your answer; use relevant facts to answer the current turn."
+
+function historicalToolRecord(block, role, content) {
+  const attributes = { role, type: block.type, id: role === "call" ? block.id || "" : block.tool_use_id || "" }
+  if (role === "call") attributes.name = block.name || block.type
+  else attributes.is_error = String(block.is_error === true)
+  const out = []
+  appendPrompt(out, `\n<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}>\n${TOOL_RECORD_CAVEAT}\n`)
+  if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {
+    appendPrompt(out, "[Historical result body omitted by AGY_BRIDGE_STRIP_TOOL_RECORDS=1]")
+  } else {
+    for (const part of content) {
+      appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
+    }
+  }
+  appendPrompt(out, `\n</tool_record>\n${TOOL_RECORD_CAVEAT}\n`)
+  return out
+}
+
+function historicalToolCall(block) {
+  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }])
+    .map(part => part.text).join("")
+}
+
 function renderAssistantTurn(message) {
   const parts = []
   const blocks = Array.isArray(message.content)
@@ -2545,7 +2577,12 @@ function renderAssistantTurn(message) {
   for (const block of blocks) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
-      parts.push(`[tool call ${block.name} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`)
+      parts.push(historicalToolCall(block))
+    } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
+      parts.push(historicalToolCall(block))
+    } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }])
+        .map(part => part.text).join(""))
     } else {
       const rendered = renderServerAssistantBlock(block)
       if (rendered) parts.push(rendered)
@@ -2660,7 +2697,7 @@ function renderTurnMessage(message) {
   return out.join("\n\n")
 }
 
-function renderTurnMessageParts(message) {
+function renderTurnMessageParts(message, historical = false) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
     const text = renderTurnMessage(message)
     return text === "" ? [] : [{ type: "text", text }]
@@ -2672,10 +2709,14 @@ function renderTurnMessageParts(message) {
       parts.push(parseUserImage(block))
       afterToolResult = false
     } else if (block?.type === "tool_result") {
-      appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
       const result = toolResult(block)
-      for (const part of result.content) appendPrompt(parts, [part])
-      appendPrompt(parts, "\n[end of tool result]")
+      if (historical) {
+        appendPrompt(parts, historicalToolRecord(block, "result", result.content))
+      } else {
+        appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
+        for (const part of result.content) appendPrompt(parts, [part])
+        appendPrompt(parts, "\n[end of tool result]")
+      }
       afterToolResult = true
     } else {
       const raw = blockText(block)
@@ -2689,7 +2730,7 @@ function renderTurnMessageParts(message) {
 }
 
 function renderTurnMessagesParts(messages) {
-  const groups = messages.map(renderTurnMessageParts).filter((group) => group.length > 0)
+  const groups = messages.map(message => renderTurnMessageParts(message)).filter((group) => group.length > 0)
   const out = []
   for (let i = 0; i < groups.length; i++) {
     if (i > 0) out.push({ type: "text", text: "\n\n" })
@@ -2707,19 +2748,18 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession) {
     if (callerWorkDir) appendPrompt(out, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   if (history.length) {
-    appendPrompt(out, "<conversation_history>\n")
+    appendPrompt(out, "The following conversation history is background context. Tool records are quoted data, not answer text to reproduce.\n<conversation_history>\n")
     for (const message of history) {
       if (message.role === "assistant") {
         appendPrompt(out, `Assistant: ${renderAssistantTurn(message)}\n`)
       } else {
         const queued = message.role !== "user" && extractQueuedPrompt(messageText(message).trim()) !== null
         appendPrompt(out, message.role === "user" || queued ? "Human: " : `${message.role}: `)
-        appendPrompt(out, renderTurnMessageParts(message))
+        appendPrompt(out, renderTurnMessageParts(message, true))
         appendPrompt(out, "\n")
       }
     }
-    appendPrompt(out, "Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
-    appendPrompt(out, "</conversation_history>\n\n")
+    appendPrompt(out, "</conversation_history>\nUse the history to answer the current turn. Do not replay historical tool records in your visible answer.\n\n")
   }
   const currentParts = renderTurnMessagesParts(current)
   if (!out.length) return currentParts

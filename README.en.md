@@ -112,6 +112,20 @@ magpie plugin add ./opencode-antigravity-bridge
   discarding it; only a missing/unsupported conversation falls back to
   `session/new`. Concurrent bridge processes merge the file instead of
   overwriting it.
+- **Historical tool replay.** When a conversation must be replayed into a new
+  session, prior tool calls and results use `<tool_record>` boundaries with
+  nearby reminders to use the records as context without copying them into the
+  visible answer. Text and attributes are XML-escaped; full arguments and result
+  bodies are retained by default, including tool references and inline images
+  in their original order. There is no automatic payload truncation.
+  If a model still echoes old results, set `AGY_BRIDGE_STRIP_TOOL_RECORDS=1` in
+  the bridge process environment. This omits historical result bodies (including
+  their images and tool references), keeping call arguments, IDs, error status,
+  and surrounding conversation text. It trades historical recall for smaller
+  replay prompts. Current-turn results and live MCP delivery remain complete.
+  This setting applies only when history is replayed; it does not erase records
+  already held by an active or resumed agy session. The delimiters guide the
+  model; they cannot guarantee that a model never quotes historical content.
 - **Cancellation without loss.** A client that stops reading gets
   `session/cancel`; the session stays alive and the partial answer the client
   saw becomes part of the expected history.
@@ -390,6 +404,7 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 | `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
+| `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |

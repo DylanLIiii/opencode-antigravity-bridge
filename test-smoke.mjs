@@ -2299,7 +2299,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     promptHookUser.text.includes("Structured output requirement") &&
     promptHookUser.text.includes('"required":["ok"]') &&
     promptHookUser.text.includes("RAG_POLICY_MARKER") &&
-    promptHookUser.text.includes("[server tool call web_search"),
+    promptHookUser.text.includes('<tool_record role="call" type="server_tool_use" id="srvtoolu_1" name="web_search">'),
     JSON.stringify({ status: promptHookRes.status, user: promptHookUser }))
 }
 

@@ -158,6 +158,26 @@ try {
   const after = JSON.parse(await fs.readFile(process.env.AGY_BRIDGE_STATE_FILE, "utf8"))
   assert.equal(after.entries[0].sessionId, before.entries[0].sessionId, "Session was replayed instead of resumed")
   console.log("ok - cross-process resume preserves image/tool context and accepts a thinking-level change")
+
+  // A different opening has no saved session: recall must come from replayed
+  // tool records, rather than the live MCP result or session/resume above.
+  const replay = await runWorker({
+    model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
+    system: "Answer the current user request using the supplied conversation history. Do not call tools. Keep the answer exact and brief.",
+    tools: [], tool_choice: { type: "none" },
+    messages: [
+      { role: "user", content: "Obtain a code from bridge_echo and remember it for a later question." },
+      { role: "assistant", content: [{ type: "tool_use", id: "historical_echo_1", name: "bridge_echo", input: { token: "bridge-integration" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "historical_echo_1", content: "Tool verified. Remember the code IRIS-942." }] },
+      { role: "assistant", content: "I have remembered the code." },
+      { role: "user", content: "Without calling tools, reply with only the code returned by the historical bridge_echo call." },
+    ],
+  })
+  assert.equal(replay.toolCalls, 0, "Historical tool calls must not execute again")
+  assert.equal(replay.content.filter(block => block.type === "text").map(block => block.text).join("").trim(), "IRIS-942", "Replay must preserve the result without copying tool records into the answer")
+  const replayState = JSON.parse(await fs.readFile(process.env.AGY_BRIDGE_STATE_FILE, "utf8"))
+  assert.equal(new Set(replayState.entries.map(entry => entry.sessionId)).size, 2, "Historical replay must create a separate session")
+  console.log("ok - historical tool replay recalls the result without emitting tool records")
   if (process.env.AGY_BRIDGE_TEST_USAGE === "1") {
     const { AntigravityBridgePlugin } = await import("./index.mjs")
     const usage = await (await AntigravityBridgePlugin()).auth.usage()

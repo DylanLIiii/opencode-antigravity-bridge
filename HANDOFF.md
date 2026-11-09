@@ -1,5 +1,101 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-11-09: combined validation for #17, #18, and #19
+
+- Integrated the three issue fixes on `fix/open-issues-17-19`. Final Node tests:
+  **91 focused tests + 425 smoke checks**, all passing. The combined regression
+  failed before #17 because a background fork destroyed the main pending tool;
+  it now passes fork timeout, queued-result replay, dedupe, and subsequent reuse.
+  The final 12 checks also verify reclaimed-fork result recovery with interruption
+  markers or plain user steering while the independent root remains pending.
+- Real macOS agy **1.5.2** integration passes image input, complex-schema MCP
+  round trip, cross-process resume, effort change, and historical-result recall.
+  The reported agy 1.5.3 Argon upstream stall and 68k-token echo were not tested
+  directly. Windows and Bun were not available for live validation.
+- Syntax checks, `git diff --check`, and `npm pack --dry-run --json` pass.
+  Changes are local commits; no push, release, installation, or GitHub issue update.
+
+## 2026-11-09: GitHub issue #19 replay boundaries
+
+- Historical tool calls/results now use escaped `<tool_record>` boundaries and
+  nearby reminders. Full result text, images, and tool references remain in order
+  by default; server-tool error status also survives optional body omission.
+- `AGY_BRIDGE_STRIP_TOOL_RECORDS=1` omits historical result bodies only during
+  replay. Current results, including queued-message recovery, remain complete.
+  This reduces historical recall and does not erase active/resumed session data.
+- Validation: Node **91 focused tests + 352 smoke checks** passed. Real macOS
+  agy **1.5.2** integration passed image input, tool round trip, cross-process
+  resume/effort change, and a new historical-result recall fixture returning only
+  its code. The reported 68k-token Gemini echo case was not reproduced; delimiters
+  mitigate copying but cannot guarantee model behavior.
+
+## Issue #18: bounded ACP inactivity and observable streaming
+
+- Existing Anthropic `message_start` / `ping` already start when the response
+  attaches to a turn. Fake-ACP tests now verify receipt before upstream output;
+  heartbeat interval is configurable (`AGY_BRIDGE_PING_INTERVAL_MS`, 15000 ms),
+  and streaming responses request `X-Accel-Buffering: no`. No Responses API
+  events or synthetic answer text are emitted. Catalog/startup/resume/initial
+  configuration still precede the stream. Cancellation during acquisition is
+  checked before beginTurn so a late handshake cannot submit a cancelled prompt.
+- `AGY_BRIDGE_TURN_TIMEOUT_MS` now defaults to 120000 ms. Nonempty text/thought
+  chunks renew progress; metadata, empty chunks, stderr retries and downstream
+  pings do not. Thoughts count even when hidden. Client tools retain their own
+  deadline, beginning when the first outstanding call arrives, with no renewal
+  from upstream metadata or detached self-polling.
+- Inactivity emits `upstream_idle_timeout` with selected model/effort and recovery
+  guidance; non-streaming gets HTTP 504. Submitted failures are non-retryable and
+  retain the existing bounded `prompt_outcome_unknown` dedupe record. Unsubmitted
+  failures release their claim. No automatic upstream retry was added.
+- Bare Argon families prefer medium when advertised; explicit effort/legacy
+  suffixes and other families' defaults are preserved.
+- Timeout stops ACP/MCP resources, timers and deferred waiters. POSIX ACP children
+  now own a private process group, allowing cleanup of helpers and descendants
+  even after the parent exits; Windows retains taskkill /T /F. Failed tool IDs
+  remain bounded error records until consumed/idle cleanup, preserving late-result
+  behavior. Descendants escaping the private group remain outside the guarantee.
+- Regressions cover silent and repeating-metadata upstreams, streaming lifecycle,
+  heartbeat/error ordering, uncertain-outcome dedupe, HTTP 504, selected effort,
+  real hidden-thought progress, startup cancellation/safe retry, tool wait clocks,
+  workspace/helper cleanup, and a descendant ignoring SIGTERM. Both READMEs
+  describe config and the limits: this does not fix Google/agy stalls, deliver
+  early bytes during startup, or override a client's total request timeout.
+- Real agy integration was not rerun for this change; the coordinating session
+  reported a passing agy 1.5.2 baseline. Windows process-tree cleanup is untested
+  on a real Windows host. Tool-result collision and replay formatting are out of
+  scope for this worktree.
+- Validation: `npm test` passed 85 focused tests and 377 smoke checks; after the
+  final tool-wait-clock regression, `node test-smoke.mjs` passed all 378 checks.
+  `node --check` for index/test-smoke and `git diff --check` passed.
+
+## Issue #17: preserve pending tools across sibling requests
+
+- The opening-message conversation key now identifies a family. A fork while
+  tools are pending gets a separate pool/persistence key; it does not finalize
+  the original turn or remove its tool IDs. Known pending IDs and exact history
+  route continuations to their owner; parked branch history supports resume.
+  Branches remain in the normal pool, share its four-process limit, and remain
+  reachable by idle/LRU eviction. Explicitly answered or stale abandoned turns
+  retain the existing reclamation behavior.
+- Plain queued user text before or after live tool results replays the complete
+  batch and user instruction in a new session for that branch. Validate complete
+  history and claim the replay before abandoning its owner. Protocol companions
+  and notices still use live MCP continuation; malformed notices remain errors.
+- Recheck live ownership and batch validity after awaiting tool-catalog updates
+  so simultaneous continuations cannot consume the same results twice.
+- Final review also found that a reclaimed fork's late results were blocked by
+  an unrelated pending root. Complete fork history with user steering now reaches
+  isolated acquisition; results without steering retain the conservative 409.
+  Regressions cover interruption markers and ordinary queued text, followed by
+  successful completion of the root's tool in its original process.
+- Regression coverage uses the fake ACP server and real MCP helper: concurrent
+  siblings, duplicate claims/continuations, capacity refusal/retry, branch-only
+  queued replay, renamed IDs, incomplete batches, distinct durable snapshots,
+  history reuse, restart resume and LRU eviction/resume. No timeout policy or
+  replay-rendering changes; no new real-agy/client verification for this fix.
+- Validation: `npm test` passes 85 focused tests and 380 smoke checks;
+  syntax checks for `index.mjs` / `test-smoke.mjs` and `git diff --check` pass.
+
 ## 2026-11-08：#14 复杂工具 schema 与 ToolSearch 兼容
 
 - schema 适配提取到 `tool-schema.mjs` 并加入 npm 文件列表：本地 `$ref` 先展开，

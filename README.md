@@ -114,6 +114,15 @@ magpie quota refresh antigravity-bridge --json
 回传 `tool_result`，同一个 agy 回合继续。运行超过 150 秒的工具会先收到
 "still running" 响应，结果最终送达，客户端每个调用只执行一次。
 
+相同开场的后台请求在工具等待期间会使用独立的池内会话，保留原分支的工具调用。
+各分支共用 4 个进程的上限，全部忙碌时新请求返回 503；后续消息按历史选择分支，
+完成的分支分别保存快照，支持淘汰或重启后 resume，不猜测有歧义的历史匹配。
+用户排队文本与 `tool_result` 合并到同一消息时（结果前后均可），会在该分支的新会话
+重放完整工具结果和用户指令，不把用户指令混入 MCP 工具输出；结果不完整时保留原
+工具回合并拒绝请求。完整的系统通知和已识别的工具附加内容仍可直接续接。
+分支已被回收后，完整的迟到结果与新的用户指令也可独立重放，不会被仍在等待工具的
+主分支阻塞；没有用户指令的未匹配结果仍保守返回 409。
+
 工具 schema 会先展开本地 `$ref`，再将可空类型、组合类型和元组转换为 agy
 可接受的保守格式；无法直接表达的约束保留在描述中，执行参数仍由客户端校验。
 客户端声明的 `ToolSearch` 若缺少 schema，会补齐 `query` / `max_results`；搜索后
@@ -134,15 +143,35 @@ magpie quota refresh antigravity-bridge --json
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
   （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。system instructions 只在
   `session/new` 安装，resume 不重复 append；恢复失败保留旧快照。
-- **超时**：启动 60s、agy 空闲 5min、等客户端工具结果 30min，可用
+- **超时**：启动 60s、agy 无实质输出 120s、等客户端工具结果 30min，可用
   `AGY_BRIDGE_START_TIMEOUT_MS` / `AGY_BRIDGE_TURN_TIMEOUT_MS` /
-  `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整。
+  `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整（正毫秒数）。只有非空正文/思考和真实工具调用/结果
+  会更新模型进展；标题、状态、空 chunk、日志重试和 SSE 心跳不会续期。
+  工具结果等待使用独立期限。超时停止自有进程/工具资源并删除临时目录。
+- **Argon 慢响应**：裸 `gemini-4-argon` 默认选 medium（目录存在该等级时），显式
+  high/low 仍有效；其他 family 仍优先 high。此默认值不能修复 agy/Google 上游阻塞。
+  流式响应附着回合后立即发送已有的 Anthropic `message_start`，等待输出时每 15s 发
+  `ping`（`AGY_BRIDGE_PING_INTERVAL_MS` 可调），不是 Responses API 的 `response.created`。
+  模型目录、启动/resume、初始模型配置和工具目录确认发生在流建立前，仍受各自超时约束；
+  acquisition 期间取消会在取得进程后检查并清理，禁止随后提交 Prompt。非流式请求仍需等待结果。
+  无实质进展超时返回 `upstream_idle_timeout`（流内 error；非流式 HTTP 504），包含模型、
+  实际选择的 effort 和超时配置建议。已提交的请求标记 `retryable: false`，相同重试返回
+  409 `prompt_outcome_unknown`；进程内有界去重保留默认至多 6 小时，不跨重启。
+  心跳不能绕过客户端总时限。详细行为及清理边界见英文说明。
 - **用量**：ACP 一轮只给一次累计值、agy 不推 `usage_update`；插件从 agy 本地会话库
   （`~/.gemini/antigravity-cli/conversations/<sessionId>.db`）读每次模型调用的真实用量，
   每个响应报自己覆盖的调用（含缓存读）。运行时没有 SQLite（Node < 22.5，Node 22/23 需
   `--experimental-sqlite`）或读不到库时回落估算；`AGY_BRIDGE_STEP_USAGE=0` 可完全关闭会话库读取。
 - **长输出续写**：撞 `max_tokens` 时在同一会话、同一响应里自动续写，最多 3 次
   （`AGY_BRIDGE_MAX_CONTINUATIONS`，`0` 关闭）；agy 自己插入的"输出被截断"提示不会出现在正文里。
+
+历史重放中的工具调用和结果使用 `<tool_record>` 标签，并在每条记录附近提示模型
+只参考内容、不要把记录复制到回答中。文本和属性经过 XML 转义；默认保留完整参数、
+结果正文、工具引用和原位置的图片，不自动截断。若模型仍复述历史结果，可在桥接进程
+环境中设置 `AGY_BRIDGE_STRIP_TOOL_RECORDS=1`：重放时省略历史结果正文（包括其中的
+图片和工具引用），保留调用参数、ID、错误状态及周围对话。这会降低历史信息召回能力。
+当前轮结果和实时 MCP 传递仍保持完整；该选项不会删除活跃或恢复会话中已有的记录。
+标签是给模型的提示，不能保证模型绝不引用历史内容。
 
 完整环境变量表、限制条件和开发/测试说明见
 [README.en.md](README.en.md#environment-variables)。

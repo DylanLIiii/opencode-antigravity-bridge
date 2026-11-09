@@ -9,7 +9,7 @@ impersonating the Antigravity IDE over HTTPS.
 The plugin translates Anthropic Messages to the **Agent Client Protocol (ACP)**
 that `agy acp` serves on stdio, following the approach of
 [T3 Code's Antigravity driver](https://github.com/pingdotgg/t3code/tree/main/apps/server/src/provider/acp).
-It keeps one agy session per conversation and serves the client's tools to agy
+It keeps agy sessions for conversation branches and serves the client's tools to agy
 as its IDE tools over MCP. Google sees requests made by the real CLI; ACP keeps
 the `zed / 0.0.0` compatibility identity required by agy's non-Gemini model
 allowlist. This is not a guarantee against account restrictions or changes to
@@ -112,6 +112,20 @@ magpie plugin add ./opencode-antigravity-bridge
   discarding it; only a missing/unsupported conversation falls back to
   `session/new`. Concurrent bridge processes merge the file instead of
   overwriting it.
+- **Historical tool replay.** When a conversation must be replayed into a new
+  session, prior tool calls and results use `<tool_record>` boundaries with
+  nearby reminders to use the records as context without copying them into the
+  visible answer. Text and attributes are XML-escaped; full arguments and result
+  bodies are retained by default, including tool references and inline images
+  in their original order. There is no automatic payload truncation.
+  If a model still echoes old results, set `AGY_BRIDGE_STRIP_TOOL_RECORDS=1` in
+  the bridge process environment. This omits historical result bodies (including
+  their images and tool references), keeping call arguments, IDs, error status,
+  and surrounding conversation text. It trades historical recall for smaller
+  replay prompts. Current-turn results and live MCP delivery remain complete.
+  This setting applies only when history is replayed; it does not erase records
+  already held by an active or resumed agy session. The delimiters guide the
+  model; they cannot guarantee that a model never quotes historical content.
 - **Cancellation without loss.** A client that stops reading gets
   `session/cancel`; the session stays alive and the partial answer the client
   saw becomes part of the expected history.
@@ -213,6 +227,10 @@ Anthropic `thinking.type` is `enabled` or `adaptive`. Generic
 `reasoning_effort`, `reasoningEffort`, `reasoning.effort` and
 `generationConfig.thinkingConfig.thinkingLevel` do not require that envelope;
 `thinking.type: "disabled"` suppresses these request-level overrides.
+Bare Argon families such as `gemini-4-argon` default to **medium** when that
+variant is advertised. Other grouped families still prefer high. Explicit
+effort overrides and legacy IDs such as `gemini-4-argon-high` retain their
+selection. Medium is a conservative default, not a fix for upstream latency.
 `count_tokens` estimates text at roughly four ASCII bytes or three non-ASCII
 UTF-8 bytes per token and uses a fixed 1,600 tokens per image. It should not be
 used as an exact quota or context-limit measurement.
@@ -356,8 +374,20 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   meaningful to this bridge (which needs nothing back: agy keeps its own
   context). The Anthropic API would reject them, so a client must not forward
   these blocks to a real Anthropic model after switching providers.
-- **Plain user instructions beside a live `tool_result`** are still rejected
-  with HTTP 400. Complete `<system-update>` elements, task/channel/teammate
+- **Requests sharing an opening message** can fork while tools are pending.
+  A sibling request gets its own pooled session and leaves the original tool
+  calls live. All branches count toward the four-process limit; when all four
+  are busy, another request receives 503. Later prompts select a branch by its
+  history, and completed branches have separate snapshots for resume after
+  eviction or restart. Ambiguous history matches are not guessed.
+- **Queued user text beside a live `tool_result`**, before or after the result
+  in the same message, replays the complete result batch and user instruction
+  in a fresh session for that branch. It is not appended to the MCP tool output.
+  Incomplete batches are rejected before closing the live owner.
+  If a sibling was already reclaimed, its complete late results plus user
+  steering can replay while the main branch still waits on its own tools.
+  Unmatched results without steering retain the conservative 409 response.
+  Complete `<system-update>` elements, task/channel/teammate
   notifications, recognized Claude Code hook notices, and tool companions are
   forwarded on the live MCP turn; explicit Claude Code mid-turn
   `queued_command` envelopes and user follow-ups after a rejected/stopped tool
@@ -377,9 +407,54 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   changes. The MCP helper answers as a `2025-11-25` server, because agy's
   `2026-07-28` mode expects notifications through `subscriptions/listen`.
 - **Timeouts**: process startup defaults to 60 seconds, model/output inactivity
-  to 5 minutes, and waiting for a client tool result to 30 minutes. Set
+  to 120 seconds, and waiting for a client tool result to 30 minutes. Set
   `AGY_BRIDGE_START_TIMEOUT_MS`, `AGY_BRIDGE_TURN_TIMEOUT_MS`, or
   `AGY_BRIDGE_TOOL_TIMEOUT_MS` to override them.
+
+### Slow or stalled ACP turns
+
+Streaming responses use **Anthropic Messages SSE**. Once acquisition completes
+and the response attaches to its turn, the bridge immediately sends the existing
+`message_start` lifecycle frame, followed by `ping` frames every 15 seconds
+while waiting. No model text is invented. `X-Accel-Buffering: no` requests that
+compatible proxies avoid buffering. These frames cover the wait for model output;
+model catalog discovery, process startup/resume, initial model configuration and
+tool catalog confirmation happen **before** the streaming response exists and
+retain their own deadlines. A cancellation during acquisition is checked before
+starting the turn: acquisition may finish within its existing deadline, but the
+process is then stopped without submitting a prompt. Non-streaming requests
+buffer the result and cannot expose SSE heartbeats to the caller.
+
+`AGY_BRIDGE_TURN_TIMEOUT_MS` bounds inactivity, not total generation time. Only
+nonempty model text/thought chunks or actual MCP call/result transitions renew
+model progress. Thoughts count even when forwarding them is disabled. Session
+titles, plans, usage/status updates, empty chunks, stderr/log retry messages and
+downstream pings cannot extend this window. Waiting for a client tool result
+uses the separate tool deadline; agy's status traffic and repeated polls cannot
+extend a detached client's wait. Slow generation with substantive output can
+continue beyond 120 seconds. A model that emits no output may need a larger explicit
+timeout; raising it also allows agy's internal retries to run longer.
+
+An upstream inactivity timeout produces an SSE `error` with code
+`upstream_idle_timeout`, or HTTP **504** with the same error for non-streaming
+requests. Diagnostics include the selected model and effort, the elapsed idle
+budget, and the relevant configuration variable. Check agy connectivity and
+model availability, try another route, or intentionally increase the timeout.
+The bridge stops the owned ACP process and MCP resources, removes its workspace,
+and releases its pool slot. POSIX cleanup targets the bridge's private process
+group (descendants that deliberately leave that group are outside this guarantee);
+Windows uses `taskkill /T /F`. Failed tool IDs can remain as bounded error records
+until the client consumes the failure or idle cleanup runs, so late results do
+not immediately replay an uncertain turn.
+
+After `session/prompt` submission, timeout means the outcome is unknown:
+`retryable: false`, no automatic resubmission, and an identical logical request
+gets HTTP 409 `prompt_outcome_unknown` instead of staying busy. The existing
+bounded in-memory dedupe lasts up to six hours by default (128 entries), does
+not survive bridge restarts, and does not establish whether upstream work
+completed. A failure before submission releases the claim for safe retry.
+Heartbeats and medium effort do not repair Google/agy upstream stalls, guarantee
+time to first model token, or override a client's total request deadline.
 
 ### Environment variables
 
@@ -390,12 +465,14 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 | `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
+| `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume and submitted-prompt dedupe retention |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
-| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60 s / 5 min / 30 min | startup, agy inactivity, client tool result |
+| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60000 / 120000 / 1800000 | startup, meaningful agy inactivity, client tool result; positive milliseconds |
+| `AGY_BRIDGE_PING_INTERVAL_MS` | 15000 | Anthropic SSE heartbeat interval in positive milliseconds; never renews upstream inactivity |
 | `AGY_BRIDGE_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips automatic quota probes entirely |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | quota subprocess budget, capped at 18000 ms |
 | `AGY_BRIDGE_MCP_TRACE` | unset | file that receives the MCP helper's traffic (diagnostics) |

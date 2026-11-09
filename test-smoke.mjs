@@ -16,6 +16,7 @@ const bridgeStateFile = path.join(stateDir, "bridge-sessions.json")
 process.env.AGY_BRIDGE_STATE_FILE = bridgeStateFile
 process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "5000"
+process.env.AGY_BRIDGE_PING_INTERVAL_MS = "100"
 process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
@@ -45,6 +46,7 @@ if (argv.includes("/usage")) {
 if (argv.includes("models")) {
   log({ type: "models", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE })
   process.stdout.write("gemini-test-medium\tGemini Test (Medium)\ngemini-test-high\tGemini Test (High)\ngemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
+  process.stdout.write("gemini-4-argon-low\tGemini 4 Argon (Low)\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-argon-high\tGemini 4 Argon (High)\n")
   process.exit(0)
 }
 if (argv[0] !== "acp") {
@@ -203,6 +205,31 @@ async function prompt(params) {
   session.prompts++
   saveState()
   log({ type: "user", convId: session.id, prompt: session.prompts, text, images, content: params.prompt, model })
+  if (text.includes("DELAY_BEFORE_TOOL")) await new Promise(resolve => setTimeout(resolve, 1500))
+  if (text.includes("IDLE_SILENT") || text.includes("IDLE_METADATA")) {
+    if (text.includes("IDLE_METADATA")) {
+      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" })
+      log({ type: "idleChild", convId: session.id, pid: child.pid })
+    }
+    if (text.includes("IDLE_METADATA")) setInterval(() => {
+      update({ sessionUpdate: "session_info_update", title: "upstream retrying" })
+      update({ sessionUpdate: "usage_update", used: 0, size: 1000 })
+      update({ sessionUpdate: "tool_call_update", toolCallId: "metadata-only", status: "in_progress" })
+      chunk("")
+      thought("")
+      fs.appendFileSync(agentLog, "Run: stream idle timeout, retrying upstream\n")
+      log({ type: "idleMetadata", convId: session.id })
+    }, 100)
+    await new Promise(() => {})
+  }
+  if (text.includes("IDLE_PROGRESS")) {
+    for (let n = 0; n < 4; n++) {
+      await new Promise(resolve => setTimeout(resolve, 1500))
+      thought("still reasoning " + n)
+    }
+    chunk("progress completed")
+    return finish("progress completed")
+  }
   if (text.includes("REFUSAL_CLEAN")) {
     return { stopReason: "refusal" }
   }
@@ -313,7 +340,8 @@ async function prompt(params) {
     chunk("After tool search.\n")
     return finish("After tool search.\n")
   }
-  if (text.includes("ESCCALL") && !text.includes("<conversation_history>")) {
+  if ((text.includes("ESCCALL") && !text.includes("<conversation_history>")) ||
+    /^BRANCHCALL branch \d+$/.test(text.trim()) || /<current_turn>\s*BRANCHCALL branch \d+\s*<\/current_turn>/.test(text)) {
     await invoke("echo", { text: "probe" })
     chunk("After esc.\n")
     return finish("After esc.\n")
@@ -389,6 +417,11 @@ async function prompt(params) {
     update({ sessionUpdate: "config_option_update", configOptions: configOptions() })
     return finish("configuration updated")
   }
+  if (text.includes("COMBINED_PENDING") && !text.includes("COMBINED_RESUME")) {
+    await invoke("echo", { text: "combined pending call" })
+    chunk("Combined result delivered.")
+    return finish("Combined result delivered.")
+  }
   const prefix = text.includes("SAME") ? "You said [" + session.id + "]: " : "You said: "
   const answer = prefix + text.slice(-120).replace(/"/g, "'")
   await reply(answer)
@@ -400,9 +433,9 @@ const pendingClient = new Map()
 function configOptions() {
   if (process.env.FAKE_AGY_CONFIG === "omit" || process.env.FAKE_AGY_IMAGES === "omit") return []
   const family = model.replace(/-(low|medium|high|xhigh|max)$/, "")
-  const configurable = family === "gemini-test" || family === "gemini-config-only"
+  const configurable = family === "gemini-test" || family === "gemini-config-only" || family === "gemini-4-argon"
   const grouped = process.env.FAKE_AGY_CONFIG === "grouped"
-  const models = ["gemini-test", "gemini-config-only", "claude-test-medium"].map(value => ({ value, name: value }))
+  const models = ["gemini-test", "gemini-config-only", "gemini-4-argon", "claude-test-medium"].map(value => ({ value, name: value }))
   return [
     { id: grouped ? "model-picker" : "model", name: "Model", category: "model", type: "select", currentValue: configurable ? family : model,
       options: grouped ? [{ group: "Test models", options: models }] : models },
@@ -449,7 +482,7 @@ async function handle(message) {
       log({
         type: "init", pid: process.pid, convId: session.id, resumed: message.method === "session/resume", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
         cwd: process.cwd(), addDir, agentConfig, clientInfo, systemAppend: params._meta?.antigravity?.systemPrompt?.append ?? null,
-        tools, idePort,
+        tools, idePort, mcpPid: mcp?.pid,
       })
       return { sessionId: session.id, models: { currentModelId: model, availableModels: [] }, configOptions: configOptions() }
     }
@@ -697,6 +730,9 @@ async function launchedModel(body) {
 
 {
   check("grouped model defaults to high", await launchedModel({ model, messages: [{ role: "user", content: "MODEL default effort" }] }) === "gemini-test-high")
+  check("Argon alone defaults to medium", await launchedModel({ model: "gemini-4-argon", messages: [{ role: "user", content: "MODEL Argon default" }] }) === "gemini-4-argon-medium")
+  check("Argon explicit high remains available", await launchedModel({ model: "gemini-4-argon", reasoning_effort: "high", messages: [{ role: "user", content: "MODEL Argon explicit" }] }) === "gemini-4-argon-high")
+  check("Argon legacy low remains available", await launchedModel({ model: "gemini-4-argon-low", messages: [{ role: "user", content: "MODEL Argon legacy" }] }) === "gemini-4-argon-low")
   check("thinking budget selects the matching agy model", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 4096 }, messages: [{ role: "user", content: "MODEL low effort" }] }) === "gemini-test-low")
   check("output effort selects the matching agy model", await launchedModel({ model, thinking: { type: "adaptive" }, output_config: { effort: "medium" }, messages: [{ role: "user", content: "MODEL medium effort" }] }) === "gemini-test-medium")
   check("high thinking budget selects high", await launchedModel({ model, thinking: { type: "enabled", budget_tokens: 24000 }, messages: [{ role: "user", content: "MODEL high effort" }] }) === "gemini-test-high")
@@ -1381,6 +1417,103 @@ for (const change of ["tools", "model"]) {
 }
 
 {
+  process.env.FAKE_AGY_INIT_MODE = "slow"
+  process.env.FAKE_AGY_SET_MODEL_DELAY = "150"
+  const body = { model, messages: [{ role: "user", content: "cancel during startup before prompt" }] }
+  const aborter = new AbortController()
+  const timer = setTimeout(() => aborter.abort(new Error("client left during startup")), 50)
+  await callFetch(body, {}, aborter.signal)
+  clearTimeout(timer)
+  delete process.env.FAKE_AGY_INIT_MODE
+  delete process.env.FAKE_AGY_SET_MODEL_DELAY
+  const init = inits().at(-1)
+  check("startup cancellation never submits a late prompt and removes its workspace",
+    !logs().some(event => event.type === "user" && event.text === body.messages[0].content) && !fs.existsSync(init.cwd))
+  const { events } = await readSSE(await callFetch(body))
+  check("startup cancellation releases the unsubmitted claim for safe retry", stopOf(events) === "end_turn" &&
+    logs().filter(event => event.type === "user" && event.text === body.messages[0].content).length === 1)
+}
+
+// A hung upstream must remain observable without letting its title/status
+// updates (or our downstream heartbeats) keep it alive indefinitely.
+for (const mode of ["IDLE_SILENT", "IDLE_METADATA"]) {
+  const body = { model: "gemini-4-argon", messages: [{ role: "user", content: mode }], stream: true }
+  const aborter = new AbortController()
+  const watchdog = setTimeout(() => aborter.abort(new Error("timeout regression watchdog")), 8000)
+  const started = Date.now()
+  const response = await callFetch(body, {}, aborter.signal)
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let raw = ""
+  try {
+    const first = await reader.read()
+    raw += decoder.decode(first.value)
+    const firstEvents = (await readSSE(new Response(raw))).events
+    check(`${mode}: lifecycle arrives before any upstream content`, Date.now() - started < 1500 &&
+      firstEvents[0]?.event === "message_start" && firstEvents[0].data.message.content.length === 0)
+    const second = await reader.read()
+    raw += decoder.decode(second.value)
+    check(`${mode}: a valid Anthropic heartbeat arrives during silence`, Date.now() - started < 1500 &&
+      (await readSSE(new Response(raw))).events.some(event => event.event === "ping" && event.data.type === "ping"))
+    const duplicate = await callFetch(body)
+    check(`${mode}: concurrent duplicate is held while upstream runs`, duplicate.status === 503)
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      raw += decoder.decode(value, { stream: true })
+    }
+  } catch (error) {
+    check(`${mode}: stream finishes without the regression watchdog`, false, error.message)
+  } finally {
+    clearTimeout(watchdog)
+    reader.releaseLock()
+  }
+  const elapsed = Date.now() - started
+  const { events } = await readSSE(new Response(raw))
+  const failure = events.find(event => event.event === "error")?.data.error
+  check(`${mode}: inactivity is bounded despite heartbeat/metadata`, elapsed >= 4500 && elapsed < 7500 &&
+    failure?.code === "upstream_idle_timeout", `${elapsed}ms ${JSON.stringify(failure)}`)
+  check(`${mode}: error identifies chosen effort and safe recovery`, failure?.retryable === false &&
+    failure.message.includes("effort=medium") && failure.message.includes("AGY_BRIDGE_TURN_TIMEOUT_MS") &&
+    failure.message.includes("outcome is unknown"))
+  check(`${mode}: error is terminal, with no invented answer`, events.at(-1)?.event === "error" &&
+    !events.some(event => ["content_block_start", "message_stop"].includes(event.event)))
+  const user = logs().find(event => event.type === "user" && event.text === mode)
+  const init = inits().find(event => event.convId === user?.convId)
+  const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+  check(`${mode}: ACP, helper and workspace are cleaned`, init && !fs.existsSync(init.cwd) &&
+    !alive(init.pid) && !alive(init.mcpPid))
+  if (mode === "IDLE_METADATA") {
+    const child = logs().find(event => event.type === "idleChild" && event.convId === user?.convId)
+    check("timeout also reaps an owned descendant that ignores SIGTERM", child?.pid && !alive(child.pid))
+  }
+  if (mode === "IDLE_METADATA") check("fake ACP repeatedly emitted metadata throughout the wait",
+    logs().filter(event => event.type === "idleMetadata" && event.convId === user?.convId).length >= 20)
+  const retry = await callFetch(body)
+  const retryError = await retry.json()
+  check(`${mode}: completed timeout leaves an uncertain-outcome guard, not a busy claim`, retry.status === 409 &&
+    retryError.error?.code === "prompt_outcome_unknown" && retry.headers.get("x-should-retry") === "false" &&
+    logs().filter(event => event.type === "user" && event.text === mode).length === 1)
+}
+
+{
+  const body = { model: "gemini-4-argon-high", messages: [{ role: "user", content: "IDLE_SILENT nonstream" }], stream: false }
+  const response = await callFetch(body, {}, AbortSignal.timeout(8000))
+  const payload = await response.json()
+  check("nonstream timeout returns HTTP 504 and non-retryable diagnostics", response.status === 504 &&
+    response.headers.get("x-should-retry") === "false" && payload.error?.code === "upstream_idle_timeout" &&
+    payload.error.retryable === false && payload.error.message.includes("effort=high"))
+}
+
+{
+  const started = Date.now()
+  const body = { model: "gemini-4-argon", messages: [{ role: "user", content: "IDLE_PROGRESS" }], thinking: { type: "disabled" } }
+  const { events } = await readSSE(await callFetch(body, {}, AbortSignal.timeout(9000)))
+  check("real thought progress renews inactivity even when thought forwarding is disabled", Date.now() - started > 5000 &&
+    stopOf(events) === "end_turn" && textOf(events) === "progress completed" && !events.some(event => event.event === "error"))
+}
+
+{
   const firstBody = { model, messages: [{ role: "user", content: "TOOL timeout" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
   const init = inits().at(-1)
@@ -1390,6 +1523,14 @@ for (const change of ["tools", "model"]) {
   const error = events.find(event => event.event === "error")?.data?.error?.message || ""
   check("missing client result times out explicitly", error.includes("timed out waiting for a client tool result"), error)
   check("timed-out process workspace is removed", !fs.existsSync(init.cwd), init.cwd)
+}
+
+{
+  const body = { model, messages: [{ role: "user", content: "DELAY_BEFORE_TOOL" }], tools: [echoTool] }
+  const { events } = await readSSE(await callFetch(body))
+  const final = (await readSSE(await callFetch(continuation(body, events, "delayed-tool-result")))).events
+  check("a new client tool wait gets its own budget after slow model output", toolCalls(events).length === 1 &&
+    stopOf(final) === "end_turn" && lastOf("mcpResult")?.result?.content?.[0]?.text === "delayed-tool-result")
 }
 
 {
@@ -1427,23 +1568,40 @@ for (const change of ["tools", "model"]) {
 {
   const firstBody = { model, messages: [{ role: "user", content: "TOOL extra text" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
-  const invalidBody = continuation(firstBody, firstEvents, "result", { extraText: true })
-  invalidBody.messages.at(-1).content.at(-1).text += "\n<task-notification>background completed</task-notification>"
   const beforeResult = continuation(firstBody, firstEvents, "result")
   beforeResult.messages.at(-1).content.unshift({ type: "text", text: "<task-notification>too early</task-notification>" })
-  const hookAndUser = continuation(firstBody, firstEvents, "result")
-  hookAndUser.messages.at(-1).content.push({ type: "text", text: "PreToolUse:Read hook additional context: hook output\n\nThe user sent a new message while you were working:\nstop now" })
   const systemBeforeResult = continuation(firstBody, firstEvents, "result")
   systemBeforeResult.messages.at(-1).content.unshift({ type: "text", text: "<system-update>too early</system-update>" })
-  const systemAndUser = continuation(firstBody, firstEvents, "result")
-  systemAndUser.messages.at(-1).content.push({ type: "text", text: "<system-update>catalog changed</system-update>\n\nordinary user instruction" })
   const unclosedSystem = continuation(firstBody, firstEvents, "result")
   unclosedSystem.messages.at(-1).content.push({ type: "text", text: "<system-update>not a complete protocol notice" })
-  const rejected = await Promise.all([invalidBody, beforeResult, hookAndUser, systemBeforeResult, systemAndUser, unclosedSystem].map(body => callFetch(body)))
-  check("unsupported user text and malformed or pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
+  const rejected = await Promise.all([beforeResult, systemBeforeResult, unclosedSystem].map(body => callFetch(body)))
+  check("malformed or pre-result notices return 400", rejected.every(response => response.status === 400), rejected.map(response => response.status).join(","))
   const validBody = continuation(firstBody, firstEvents, "result")
   const validEvents = (await readSSE(await callFetch(validBody))).events
   check("valid result can continue after rejected extra text", stopOf(validEvents) === "end_turn")
+}
+
+for (const [index, text] of [
+  "Please explain the result before continuing",
+  "PreToolUse:Read hook additional context: hook output\n\nThe user sent a new message while you were working:\nstop now",
+  "<system-update>catalog changed</system-update>\n\nordinary user instruction",
+  "Follow-up with notice\n<task-notification>background completed</task-notification>",
+].entries()) {
+  for (const before of index === 0 ? [false, true] : [false]) {
+    const first = { model, metadata: { user_id: `merged-followup-${index}-${before}` },
+      messages: [{ role: "user", content: "ESCCALL merged follow-up" }], tools: [echoTool] }
+    const pending = (await readSSE(await callFetch(first))).events
+    const old = inits().at(-1)
+    const body = continuation(first, pending, "real merged output")
+    body.messages.at(-1).content[before ? "unshift" : "push"]({ type: "text", text })
+    const response = await callFetch(body)
+    if (response.status === 200) await readSSE(response)
+    else await response.text()
+    check(`merged follow-up ${index}/${before} replays actual results and user text`, response.status === 200 &&
+      lastOf("user").convId !== old.convId && lastOf("user").text.includes("real merged output") && lastOf("user").text.includes(text))
+    check(`merged follow-up ${index}/${before} never injects user text into MCP`, !logs().some(event =>
+      event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes(text)))
+  }
 }
 
 for (const location of ["inline", "system", "developer", "user"]) {
@@ -2299,7 +2457,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
     promptHookUser.text.includes("Structured output requirement") &&
     promptHookUser.text.includes('"required":["ok"]') &&
     promptHookUser.text.includes("RAG_POLICY_MARKER") &&
-    promptHookUser.text.includes("[server tool call web_search"),
+    promptHookUser.text.includes('<tool_record role="call" type="server_tool_use" id="srvtoolu_1" name="web_search">'),
     JSON.stringify({ status: promptHookRes.status, user: promptHookUser }))
 }
 
@@ -2338,7 +2496,7 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const second = continuation(first, events, 'Launching skill: archive')
   second.messages.at(-1).content.push({ type: 'text', text: 'Stop this task and explain something else' })
   const response = await callFetch(second)
-  check('plain user instructions are not treated as a Skill prompt body', response.status === 400, `got ${response.status}`)
+  check('plain user instructions replay instead of becoming a Skill prompt body', response.status === 200, `got ${response.status}`)
   if (response.status === 400) {
     await response.text()
     await drive(first, events, 'cleanup ordinary Skill text')
@@ -2422,15 +2580,130 @@ for (const location of ["inline", "system", "developer", "user"]) {
     const response = await callFetch(nextTurn(first, base, "continue main without recap"))
     const final = response.status === 200 ? (await readSSE(response)).events : []
     if (response.status !== 200) await response.text()
-    check("lineage sibling prompt supersedes orphan instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
+    check("lineage sibling prompt runs independently instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
     check("lineage replacement replays only the client's branch", inits().length === before + 1 && lastOf("user").convId !== old.convId && lastOf("user").text.includes("continue main without recap") && !lastOf("user").text.includes("PARALLEL recap branch"))
-    const forks = events.filter(event => event.action === "superseded" && event.reason === "lineage_fork")
-    check("lineage supersession emits one content-free event", forks.length === 1 && !!forks[0].superseded_turn_id && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"))
-    check("lineage supersession stops the old process and forgets its parked session", !fs.existsSync(old.cwd) && !fs.readFileSync(bridgeStateFile, "utf8").includes(old.convId))
-    check("all orphan MCP sockets receive an explicit superseded error", replies.length === 2 && replies.every(reply => reply.result?.isError === true))
-    // Keep the original call alive long enough to clean up on the negative run.
-    if (response.status !== 200) await drive(recap, orphan, "cleanup orphan")
+    const forks = events.filter(event => event.action === "isolated" && event.reason === "lineage_fork")
+    check("lineage isolation emits one content-free event", forks.length === 1 && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"))
+    check("lineage isolation keeps the old process and its MCP sockets alive", fs.existsSync(old.cwd) && replies.length === 0)
+    const resumed = await drive(recap, orphan, "original branch result")
+    check("original branch still accepts its live results after a sibling completes", stopOf(resumed.events) === "end_turn" &&
+      logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("original branch result")))
   } finally { process.stderr.write = write; Socket.prototype.end = end }
+}
+
+{
+  const timeout = process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
+  const { default: isolatedDefault } = await import("./index.mjs?issue-17-isolation")
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = timeout
+  const isolatedLoader = await (await isolatedDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const fetchBranch = body => isolatedLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
+  const first = { model, metadata: { user_id: "issue-17-concurrent-branches" }, system: "branch isolation",
+    messages: [{ role: "user", content: "opening shared by main and side requests" }], tools: [echoTool] }
+  const base = (await readSSE(await fetchBranch(first))).events
+  const requests = Array.from({ length: 5 }, (_, i) => nextTurn(first, base, `BRANCHCALL branch ${i}`))
+  const pending = [(await readSSE(await fetchBranch(requests[0]))).events]
+  const main = inits().at(-1)
+  const before = inits().length
+  const responses = await Promise.all([requests[1], requests[1], requests[2], requests[3]].map(fetchBranch))
+  check("concurrent side requests and a duplicate claim start exactly three siblings",
+    responses.filter(response => response.status === 200).length === 3 &&
+    responses.filter(response => response.status === 503).length === 1 && inits().length === before + 3,
+    `statuses=${responses.map(response => response.status)} starts=${inits().length - before}`)
+  for (let i = 0; i < responses.length; i++) {
+    if (responses[i].status === 200) pending[i < 2 ? 1 : i] = (await readSSE(responses[i])).events
+    else await responses[i].text()
+  }
+  const fullCount = inits().length
+  const blocked = await fetchBranch(requests[4])
+  const blockedText = await blocked.text()
+  check("isolated branches count against the four-process limit without evicting live calls",
+    blocked.status === 503 && inits().length === fullCount && fs.existsSync(main.cwd),
+    `status=${blocked.status} starts=${inits().length - fullCount} main=${fs.existsSync(main.cwd)} body=${blockedText.slice(0, 200)}`)
+  const missing = await fetchBranch(nextTurn(requests[3], pending[3], "continue without this branch's result"))
+  check("a sibling carrying its pending call cannot evade the missing-result conflict", missing.status === 400)
+  await missing.text()
+  const finals = []
+  const continued = []
+  const owners = []
+  for (let i = 0; i < 4; i++) {
+    continued[i] = continuation(requests[i], pending[i], `result for branch ${i}`)
+    // Replay just this isolated owner while the other two siblings still wait.
+    if (i === 1) continued[i].messages.at(-1).content.push({ type: "text", text: "queued branch instruction" })
+    if (i === 2) continued[i].tools = [echoTool, { ...echoTool, name: "extraBranchTool" }]
+    if (i === 3) {
+      continued[i].messages.at(-2).content.find(block => block.type === "tool_use").id = "toolu_renamed_isolated_branch"
+      continued[i].messages.at(-1).content[0].tool_use_id = "toolu_renamed_isolated_branch"
+    }
+    const results = await Promise.all(Array.from({ length: i === 1 || i === 2 ? 2 : 1 }, () => fetchBranch(continued[i])))
+    const response = results.find(item => item.status === 200) || results[0]
+    if (results.length === 2) {
+      check(`concurrent ${i === 1 ? "queued replay" : "catalog update continuation"} consumes branch ${i} only once`,
+        results.filter(item => item.status === 200).length === 1 && results.some(item => item.status === 503),
+        results.map(item => item.status).join(","))
+      for (const other of results) if (other !== response) await other.text()
+    }
+    finals[i] = response.status === 200 ? (await readSSE(response)).events : []
+    if (response.status !== 200) await response.text()
+    owners[i] = i === 1 ? lastOf("user").convId : logs().find(event =>
+      event.type === "mcpResult" && JSON.stringify(event.result).includes(`result for branch ${i}`))?.convId
+    check(`branch ${i} accepts its own tool result while siblings remain live`, response.status === 200 && stopOf(finals[i]) === "end_turn")
+  }
+  check("main result reached the original MCP process", logs().some(event =>
+    event.type === "mcpResult" && event.convId === main.convId && JSON.stringify(event.result).includes("result for branch 0")))
+  const saved = JSON.parse(fs.readFileSync(bridgeStateFile, "utf8")).entries
+  check("main and completed siblings persist under distinct keys", saved.filter(entry =>
+    [main.convId, ...owners.slice(1)].includes(entry.sessionId)).length === 4)
+  const followup = nextTurn(continued[1], finals[1], "MEMORY continue isolated branch")
+  const count = inits().length
+  const followed = (await readSSE(await fetchBranch(followup))).events
+  check("later prompts reuse an isolated branch by its exact history", inits().length === count &&
+    lastOf("user").convId === owners[1] && lastOf("user").text === "MEMORY continue isolated branch")
+  const { default: restartedDefault } = await import("./index.mjs?issue-17-branch-restart")
+  const restarted = await (await restartedDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const restartResponse = await restarted.fetch("agy://local/messages", { method: "POST",
+    body: JSON.stringify(nextTurn(followup, followed, "MEMORY isolated after restart")) })
+  await readSSE(restartResponse)
+  check("isolated branch resumes its durable session after bridge restart", restartResponse.status === 200 &&
+    inits().at(-1).resumed && inits().at(-1).convId === owners[1] && lastOf("user").text === "MEMORY isolated after restart")
+  const retried = await fetchBranch(requests[4])
+  const retriedEvents = retried.status === 200 ? (await readSSE(retried)).events : []
+  check("a pool-limit failure releases its prompt claim for retry", retried.status === 200 && stopOf(retriedEvents) === "tool_use",
+    `status=${retried.status} stop=${stopOf(retriedEvents)}`)
+  if (retried.status === 200) await readSSE(await fetchBranch(continuation(requests[4], retriedEvents, "cleanup capacity retry")))
+  else await retried.text()
+  const sideWorkspace = inits().find(event => event.convId === owners[3]).cwd
+  for (let i = 0; i < 4; i++) await readSSE(await fetchBranch({ model,
+    messages: [{ role: "user", content: `MEMORY force branch eviction ${i}` }] }))
+  check("idle siblings remain reachable by LRU eviction", !fs.existsSync(sideWorkspace))
+  const evicted = await fetchBranch(nextTurn(continued[3], finals[3], "MEMORY resume evicted sibling"))
+  await readSSE(evicted)
+  check("an evicted sibling resumes its own snapshot without replay", evicted.status === 200 &&
+    inits().at(-1).resumed && inits().at(-1).convId === owners[3] && lastOf("user").text === "MEMORY resume evicted sibling")
+}
+
+{
+  const first = { model, metadata: { user_id: "issue-17-partial-steering" },
+    messages: [{ role: "user", content: "PARALLEL partial results with steering" }], tools: [echoTool] }
+  const initial = (await readSSE(await callFetch(first))).events
+  // Parallel calls can arrive in separate tool_use responses. Collect the next
+  // round first if necessary, then leave at least one visible result unanswered.
+  let body = first
+  let pending = initial
+  if (toolCalls(pending).length < 2) {
+    body = continuation(first, pending, "first parallel output")
+    pending = (await readSSE(await callFetch(body))).events
+  }
+  const partial = continuation(body, pending, "partial output")
+  partial.messages.at(-1).content.push({ type: "text", text: "queued incomplete instruction" })
+  if (toolCalls(initial).length >= 2) partial.messages.at(-1).content.splice(0, 1)
+  else partial.messages.at(-2).content.push({ type: "tool_use", id: "toolu_missing_queued_result", name: "echo", input: {} })
+  const count = inits().length
+  const response = await callFetch(partial)
+  await response.text()
+  check("queued text cannot replay incomplete results or destroy the live owner", response.status === 400 && inits().length === count)
+  const done = await drive(body, pending, "remaining actual output")
+  check("a complete batch can continue after rejected partial steering", stopOf(done.events) === "end_turn" && inits().length === count)
 }
 
 {
@@ -2713,6 +2986,125 @@ for (const compacted of [true, false]) {
   const after = logs().filter(event => event.type === "user" && /Continue exactly where your previous output stopped/.test(event.text)).length
   check("continuations stop after three and report max_tokens", stopOf(events) === "max_tokens" && after - before === 3, `${stopOf(events)} ${after - before}`)
   check("all continued text stays in one response", textOf(events) === "part one,  more more more", JSON.stringify(textOf(events)))
+}
+
+// Combined regression: a timed-out replay fork cannot destroy another branch's
+// pending tool; plain queued steering must still recover with the real result.
+{
+  const previous = process.env.AGY_BRIDGE_TURN_TIMEOUT_MS
+  const previousToolTimeout = process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS
+  process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "250"
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "5000"
+  const { default: combinedDefault } = await import("./index.mjs?combined-issues")
+  process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = previous
+  process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = previousToolTimeout
+  const combinedPlugin = await combinedDefault.server({ client: null, directory: os.tmpdir() }, {})
+  const combinedLoader = await combinedPlugin.auth.loader(async () => ({ key: "agy" }))
+  const fetchCombined = body => combinedLoader.fetch("agy://local/messages", {
+    method: "POST", body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+  })
+  const main = { model, metadata: { user_id: "combined-issues" }, tools: [echoTool],
+    messages: [{ role: "user", content: "COMBINED_PENDING shared opening" }] }
+  const pending = (await readSSE(await fetchCombined(main))).events
+  const owner = inits().at(-1)
+  const fork = { ...main, messages: [
+    ...main.messages,
+    { role: "assistant", content: [{ type: "tool_use", id: "historical_combined", name: "echo", input: { text: "old" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "historical_combined", content: "historical combined fact" }] },
+    { role: "assistant", content: "Recorded." },
+    { role: "user", content: "IDLE_SILENT combined background request" },
+  ] }
+  const forkResponse = await fetchCombined(fork)
+  const forkEvents = (await readSSE(forkResponse)).events
+  const forkPrompt = lastOf("user")
+  check("combined fork replays delimited historical results", forkPrompt.convId !== owner.convId &&
+    forkPrompt.text.includes('<tool_record role="result"') && forkPrompt.text.includes("historical combined fact"))
+  check("combined fork emits lifecycle then a terminal inactivity error", forkEvents[0]?.event === "message_start" &&
+    forkEvents.at(-1)?.data.error?.code === "upstream_idle_timeout")
+  check("background timeout preserves the main branch's pending process", fs.existsSync(owner.cwd))
+  const queued = continuation(main, pending, "combined actual result")
+  queued.messages.at(-1).content.push({ type: "text", text: "COMBINED_RESUME use the result and finish" })
+  const resumedResponse = await fetchCombined(queued)
+  const resumed = (await readSSE(resumedResponse)).events
+  const replayPrompt = lastOf("user")
+  check("main results with same-message steering recover after sibling timeout", resumedResponse.status === 200 &&
+    stopOf(resumed) === "end_turn")
+  check("combined recovery retains current result and queued steering once", replayPrompt.text.split("combined actual result").length === 2 &&
+    replayPrompt.text.split("COMBINED_RESUME use the result and finish").length === 2)
+  const retry = await fetchCombined(fork)
+  check("timed-out fork remains dedup protected after main recovery", retry.status === 409 &&
+    (await retry.json()).error?.code === "prompt_outcome_unknown" &&
+    logs().filter(event => event.type === "user" && event.text.includes("IDLE_SILENT combined background request")).length === 1)
+  const followup = nextTurn(queued, resumed, "Continue after the recovered result")
+  const completed = (await readSSE(await fetchCombined(followup))).events
+  check("main follow-up reuses its recovered session after sibling failure", stopOf(completed) === "end_turn" &&
+    lastOf("user").convId === replayPrompt.convId && !lastOf("user").text.includes("<conversation_history>"))
+
+  for (const [label, steering] of [
+    ["interruption marker", "[Request interrupted by user]"],
+    ["ordinary queued text", "Use the completed fork result and finish this side request."],
+  ]) {
+    const opening = { model, metadata: { user_id: `reclaimed-fork-${label}` }, tools: [echoTool],
+      messages: [{ role: "user", content: `shared opening for reclaimed fork ${label}` }] }
+    const base = (await readSSE(await fetchCombined(opening))).events
+    const root = nextTurn(opening, base, "BRANCHCALL branch 0")
+    const rootPending = (await readSSE(await fetchCombined(root))).events
+    const rootOwner = inits().at(-1)
+    const side = nextTurn(opening, base, "LONGTOOL reclaimed side request")
+    let sidePending
+    let sideOwner
+    const previousDeadline = process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+    process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "25"
+    try {
+      sidePending = (await readSSE(await fetchCombined(side))).events
+      sideOwner = inits().at(-1)
+      for (let attempt = 0; attempt < 100 && fs.existsSync(sideOwner.cwd); attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+    } finally {
+      if (previousDeadline === undefined) delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+      else process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = previousDeadline
+    }
+    const polls = logs().filter(event => event.type === "mcpResult" && event.convId === sideOwner.convId &&
+      /still running/.test(event.result?.content?.[0]?.text || ""))
+    check(`${label}: self-poll reclamation removes only the fork`, toolCalls(rootPending).length === 1 &&
+      toolCalls(sidePending).length === 1 && sideOwner.convId !== rootOwner.convId && polls.length === 8 &&
+      !fs.existsSync(sideOwner.cwd) && fs.existsSync(rootOwner.cwd))
+
+    const actualResult = `actual reclaimed fork result for ${label}`
+    const late = continuation(side, sidePending, actualResult)
+    const beforeReplay = inits().length
+    const unsteered = await fetchCombined(late)
+    check(`${label}: unmatched fork results without steering remain 409`, unsteered.status === 409 &&
+      inits().length === beforeReplay && fs.existsSync(rootOwner.cwd))
+    await unsteered.text()
+    late.messages.at(-1).content.push({ type: "text", text: steering })
+    const recovered = await fetchCombined(late)
+    let recoveredEvents = recovered.status === 200 ? (await readSSE(recovered)).events : []
+    if (recovered.status !== 200) await recovered.text()
+    const recoveredPrompt = lastOf("user")
+    check(`${label}: steered fork results replay while the root still waits`, recovered.status === 200 &&
+      inits().length === beforeReplay + 1 && recoveredPrompt.convId !== rootOwner.convId &&
+      recoveredPrompt.convId !== sideOwner.convId && fs.existsSync(rootOwner.cwd) &&
+      !logs().some(event => event.type === "mcpResult" && event.convId === rootOwner.convId))
+    check(`${label}: fork replay preserves the real result and steering once`, recovered.status === 200 &&
+      recoveredPrompt.text.split(actualResult).length === 2 && recoveredPrompt.text.split(steering).length === 2)
+    // The LONGTOOL fake asks for a new tool even when its trigger is in replayed
+    // history. Complete that round before checking the independent root owner.
+    let recoveredBody = late
+    for (let round = 0; round < 3 && stopOf(recoveredEvents) === "tool_use"; round++) {
+      recoveredBody = continuation(recoveredBody, recoveredEvents, "finish recovered side request")
+      recoveredEvents = (await readSSE(await fetchCombined(recoveredBody))).events
+    }
+    check(`${label}: recovered fork finishes normally`, stopOf(recoveredEvents) === "end_turn")
+
+    const beforeRootResult = inits().length
+    const rootResult = `original root result for ${label}`
+    const rootDone = (await readSSE(await fetchCombined(continuation(root, rootPending, rootResult)))).events
+    check(`${label}: root subsequently completes in its original process`, stopOf(rootDone) === "end_turn" &&
+      inits().length === beforeRootResult && logs().some(event => event.type === "mcpResult" &&
+        event.convId === rootOwner.convId && event.result?.content?.[0]?.text === rootResult))
+  }
 }
 
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))

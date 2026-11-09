@@ -24,7 +24,8 @@ const MAX_PROCS = 4
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
-const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
+// Bound silence before agy's own five-minute stream timeout/retry loop.
+const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 2 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
 const RESUME_TTL_MS = positiveTimeout(process.env.AGY_BRIDGE_RESUME_TTL_MS, 6 * 60 * 60 * 1000)
 // agy fails an ide-tools MCP call after a fixed three minutes. Answer before
@@ -45,7 +46,7 @@ const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
-const PING_INTERVAL_MS = 15_000
+const PING_INTERVAL_MS = positiveTimeout(process.env.AGY_BRIDGE_PING_INTERVAL_MS, 15_000)
 // A prompt that stops on max_tokens is continued in the same session, inside
 // the same response, at most this many times (0 turns it off).
 const MAX_CONTINUATIONS = (() => {
@@ -207,7 +208,8 @@ function buildModelCatalog(list) {
     const sorted = [...family].sort((a, b) => EFFORT_ORDER.indexOf(a.effort) - EFFORT_ORDER.indexOf(b.effort))
     const efforts = sorted.map(variant => variant.effort)
     const byEffort = new Map(sorted.map(variant => [variant.effort, variant.id]))
-    const defaultEffort = byEffort.has("high") ? "high" : efforts[efforts.length - 1]
+    const defaultEffort = /^gemini-[0-9.]+-argon$/i.test(id) && byEffort.has("medium")
+      ? "medium" : byEffort.has("high") ? "high" : efforts[efforts.length - 1]
     const defaultModel = sorted.find(variant => variant.effort === defaultEffort)
     const baseName = defaultModel.name.replace(/\s+\((?:minimal|low|medium|high|xhigh|max)\)$/i, "").trim()
     models.push({
@@ -800,7 +802,8 @@ class Turn {
     for (const waiter of this.lateWaiters.splice(0)) waiter.resolve()
   }
 
-  // Inactivity timeout: agy output, or the client's tool result while one is pending.
+  // Only substantive model output or an actual MCP/result transition renews this
+  // clock. Session titles, plans, usage/status updates and transport pings do not.
   arm() {
     this.lastProgressAt = Date.now()
     this.rearm()
@@ -813,12 +816,26 @@ class Turn {
     const waitingForTools = this.hasPendingMcp()
     const timeout = waitingForTools ? TOOL_RESULT_TIMEOUT_MS : TURN_TIMEOUT_MS
     const now = Date.now()
-    this.deadlineAt = (waitingForTools && !this.attached ? this.clientProgressAt : now) + timeout
+    this.deadlineAt = (waitingForTools ? this.clientProgressAt : this.lastProgressAt) + timeout
     this.timer = setTimeout(() => {
       const what = waitingForTools ? "waiting for a client tool result" : "reading agy output"
-      this.proc.timeoutTurn(this, new Error(
-        `agy bridge: timed out ${what} after ${timeout}ms; stderr tail: ${this.proc.stderrTail.trim() || "(empty)"}`,
-      ))
+      const model = this.proc.currentModel || this.proc.model
+      const effort = this.proc.currentEffort || "upstream default"
+      const error = new Error(
+        `agy bridge: timed out ${what} after ${timeout}ms without meaningful progress ` +
+        `(model=${model}, effort=${effort}). ` +
+        (waitingForTools
+          ? "Check the client tool execution; AGY_BRIDGE_TOOL_TIMEOUT_MS controls this limit. "
+          : "agy/ACP may be stalled or retrying upstream. Check agy connectivity/model availability, choose another route, " +
+            "or increase AGY_BRIDGE_TURN_TIMEOUT_MS for intentionally slow models. ") +
+        (this.promptSubmitted
+          ? "The prompt was submitted and its outcome is unknown; automatic retry is unsafe."
+          : "No prompt was submitted; retry is safe."),
+      )
+      error.code = waitingForTools ? "client_tool_timeout" : "upstream_idle_timeout"
+      error.retryable = !this.promptSubmitted
+      error.noRetry = !error.retryable
+      this.proc.timeoutTurn(this, error)
     }, Math.max(0, this.deadlineAt - now))
     this.timer.unref?.()
   }
@@ -907,6 +924,7 @@ class Proc {
       this.child = spawnAgy(this.agyPath, args, {
         cwd: this.workspace,
         stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
         windowsHide: true,
         env: {
           ...childEnv,
@@ -1018,6 +1036,7 @@ class Proc {
   async #setModel(model, selection, force = false) {
     const selectionKey = stableJSON({ model, selection })
     if (!force && this.currentSelectionKey === selectionKey) return
+    let effectiveEffort = /-(minimal|low|medium|high|xhigh|max)$/.exec(model)?.[1] || ""
     try {
       let configured = false
       const target = this.configMethodUnsupported ? null : configModelSelection(this.configOptions, model, selection)
@@ -1030,6 +1049,7 @@ class Proc {
           if (target.effort && levels.length) {
             const level = closestEffort(target.effort, levels)
             if (force || thought.currentValue !== level) await this.#setConfig(thought, level)
+            effectiveEffort = level
             configured = true
           } else {
             // A standalone model is fully selected by its advertised value.
@@ -1050,6 +1070,7 @@ class Proc {
       throw wrapped
     }
     this.currentModel = model
+    this.currentEffort = effectiveEffort
     this.currentSelectionKey = selectionKey
   }
 
@@ -1151,14 +1172,19 @@ class Proc {
     const turn = this.turn
     if (!turn || turn.done || turn.finalized) return
     const update = params.update ?? {}
-    turn.arm()
     if (turn.cancelRequested) return
     if (update.sessionUpdate === "agent_message_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
-      if (text) turn.pushText(text)
+      if (typeof text === "string" && text.length) {
+        turn.arm()
+        turn.pushText(text)
+      }
     } else if (update.sessionUpdate === "agent_thought_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
-      if (text) turn.push({ type: "thinking", text })
+      if (typeof text === "string" && text.length) {
+        turn.arm()
+        turn.push({ type: "thinking", text })
+      }
     }
   }
 
@@ -1363,6 +1389,15 @@ class Proc {
     turn.fail(error)
     dropFromPool(this)
     this.stop().catch(() => {})
+    // Stop active tool resources even without an HTTP reader. Keep failed tool
+    // IDs until the client consumes the error (or fail's bounded cleanup runs),
+    // so a late result finds this failure instead of replaying an uncertain turn.
+    for (const call of turn.calls) clearTimeout(call.deadline)
+    for (const waiter of turn.awaitCalls.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.reply({ content: [{ type: "text", text: error.message }], isError: true })
+    }
+    if (!turn.calls.length) this.finalizeTurn(turn)
   }
 
   acceptMcpCall(message, socket) {
@@ -1396,6 +1431,9 @@ class Proc {
       mcpMeta: message.meta,
     }
     turn.flushText()
+    // The first outstanding call starts a new client wait, even if generation
+    // before that call lasted longer than the client's tool-result budget.
+    if (!turn.hasPendingMcp()) turn.touchClient()
     turn.calls.push(call)
     toolCalls.set(call.id, { proc: this, turn, call })
     socket.once("close", () => {
@@ -1609,13 +1647,18 @@ class Proc {
         if (process.platform === "win32" && child.pid) {
           await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3_000 })
         } else {
-          try { child.kill("SIGTERM") } catch {}
+          try { process.kill(-child.pid, "SIGTERM") } catch { try { child.kill("SIGTERM") } catch {} }
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 3_000))])
         }
         if (alive()) {
           try { child.kill("SIGKILL") } catch {}
           await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 1_000))])
         }
+      }
+      // The ACP parent may exit before its MCP helper; kill remaining members
+      // of our private process group as well. Never target a user's agy group.
+      if (process.platform !== "win32" && child.pid) {
+        try { process.kill(-child.pid, "SIGKILL") } catch {}
       }
     }
     this.child = null
@@ -1953,9 +1996,41 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   return withAcquireLock(convKey, () => acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew))
 }
 
+// The opening-message key identifies a family, not a single line of history.
+// Fork slots retain their own pool/persistence keys; exact history routes later
+// prompts (including after parking/restart) back to the appropriate session.
+function conversationSlot(convKey, opts, forceNew) {
+  if (opts.ownerKey) return opts.ownerKey
+  const inFamily = (key) => key === convKey || key.startsWith(`${convKey}:fork:`)
+  const owners = new Set()
+  for (const message of opts.messages || []) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      const owner = block?.type === "tool_use" ? toolCalls.get(block.id)?.proc : null
+      if (owner?.turn && inFamily(owner.convKey)) owners.add(owner.convKey)
+    }
+  }
+  if (owners.size === 1) return [...owners][0]
+  if (owners.size > 1) throw new ConflictError("agy bridge: pending calls from different conversation branches cannot be combined", "tool_state_conflict")
+  const matches = [...pool].filter(([key, proc]) => inFamily(key) && !proc.dead && !proc.retiring &&
+    Array.isArray(proc.expectedMessages) &&
+    proc.workDir === opts.workDir && sameInstructions(proc.instructions, opts.instructions) &&
+    proc.matchesHistory(opts.history))
+  if (matches.length === 1) return matches[0][0]
+  if (matches.length > 1) throw new BusyError("agy bridge: history matches more than one conversation branch")
+  if (!forceNew) {
+    loadParked()
+    const saved = [...parked.keys()].filter(key => inFamily(key) && !pool.has(key) && peekParked(key, opts))
+    if (saved.length === 1) return saved[0]
+    if (saved.length > 1) throw new BusyError("agy bridge: history matches more than one parked conversation branch")
+  }
+  return convKey
+}
+
 // Caller holds the conversation lock; recovery must not acquire it recursively.
 async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
   await evictIdle()
+  convKey = conversationSlot(convKey, opts, forceNew)
   let existing = pool.get(convKey)
   if (existing?.turn?.cancelRequested) {
     await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
@@ -1964,8 +2039,13 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     const lineage = lineageVerdict(existing, existing.turn, opts)
     if (lineage === "fork") {
       const orphan = existing.turn
-      logBridgeEvent(existing, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
-      await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
+      if (!staleTurnVerdict(existing, orphan).stale && !pendingCallsAnsweredIn(orphan, opts.history)) {
+        logBridgeEvent(existing, orphan, "isolated", "lineage_fork", opts)
+        convKey = `${convKey.split(":fork:")[0]}:fork:${randomUUID()}`
+      } else {
+        logBridgeEvent(existing, orphan, "superseded", "lineage_fork", opts, { superseded_turn_id: orphan.turnId })
+        await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
+      }
       existing = null
     } else if (lineage === "conflict") {
       throw new ConflictError("agy bridge: this request carries the pending tool call but no matching result. Stop resending it; send the tool result or continue from the last self-consistent message.", "tool_state_conflict")
@@ -2113,6 +2193,23 @@ function replayHistoryProblem(body, resultBlocks) {
     answered.add(block.tool_use_id)
   }
   return answered.size === ids.size ? null : "missing_tool_result"
+}
+
+function canReplayUnmatchedFork(proc, body, resultBlocks, opts) {
+  if (lineageVerdict(proc, proc.turn, opts) !== "fork" || replayHistoryProblem(body, resultBlocks)) return false
+  // A reclaimed sibling no longer has live tool IDs. Explicit user steering
+  // makes its complete transcript a new prompt; an unrelated root must not
+  // block that prompt or be reclaimed to make room for it. Results alone still
+  // use the conservative unmatched-result path.
+  if (isInterruptedToolTurn(body)) return true
+  const calls = new Map(lastAssistantCalls(trailingMessages(body).history).map(call => [call.id, call]))
+  const results = resultBlocks.map(block => ({ block, call: calls.get(block.tool_use_id), result: toolResult(block) }))
+  try {
+    return inspectToolTurn(results, body).userSteered
+  } catch (error) {
+    if (!(error instanceof UnsupportedContent)) throw error
+    return canReplayFollowUpAfterResults(body, results)
+  }
 }
 
 async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn closed") {
@@ -2537,6 +2634,43 @@ function appendPrompt(out, content) {
   }
 }
 
+// Escape once at the replay boundary: delimiters in tool output/arguments must
+// remain data, and literal entities must survive decoding without ambiguity.
+function escapeToolRecord(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;",
+  })[char])
+}
+
+const TOOL_RECORD_CAVEAT = "Historical tool record, for context only. Do not reproduce this record in your answer; use relevant facts to answer the current turn."
+
+function historicalToolRecord(block, role, content) {
+  const attributes = { role, type: block.type, id: role === "call" ? block.id || "" : block.tool_use_id || "" }
+  if (role === "call") attributes.name = block.name || block.type
+  else {
+    const results = Array.isArray(block.content) ? block.content : [block.content]
+    const serverError = SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type) && results.some(result =>
+      typeof result?.type === "string" && result.type.endsWith("_tool_result_error"))
+    attributes.is_error = String(block.is_error === true || serverError)
+  }
+  const out = []
+  appendPrompt(out, `\n<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}>\n${TOOL_RECORD_CAVEAT}\n`)
+  if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {
+    appendPrompt(out, "[Historical result body omitted by AGY_BRIDGE_STRIP_TOOL_RECORDS=1]")
+  } else {
+    for (const part of content) {
+      appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
+    }
+  }
+  appendPrompt(out, `\n</tool_record>\n${TOOL_RECORD_CAVEAT}\n`)
+  return out
+}
+
+function historicalToolCall(block) {
+  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }])
+    .map(part => part.text).join("")
+}
+
 function renderAssistantTurn(message) {
   const parts = []
   const blocks = Array.isArray(message.content)
@@ -2545,7 +2679,12 @@ function renderAssistantTurn(message) {
   for (const block of blocks) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
-      parts.push(`[tool call ${block.name} id=${block.id || ""} args=${JSON.stringify(block.input ?? {})}]`)
+      parts.push(historicalToolCall(block))
+    } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
+      parts.push(historicalToolCall(block))
+    } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }])
+        .map(part => part.text).join(""))
     } else {
       const rendered = renderServerAssistantBlock(block)
       if (rendered) parts.push(rendered)
@@ -2660,7 +2799,7 @@ function renderTurnMessage(message) {
   return out.join("\n\n")
 }
 
-function renderTurnMessageParts(message) {
+function renderTurnMessageParts(message, historical = false) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
     const text = renderTurnMessage(message)
     return text === "" ? [] : [{ type: "text", text }]
@@ -2672,10 +2811,14 @@ function renderTurnMessageParts(message) {
       parts.push(parseUserImage(block))
       afterToolResult = false
     } else if (block?.type === "tool_result") {
-      appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
       const result = toolResult(block)
-      for (const part of result.content) appendPrompt(parts, [part])
-      appendPrompt(parts, "\n[end of tool result]")
+      if (historical) {
+        appendPrompt(parts, historicalToolRecord(block, "result", result.content))
+      } else {
+        appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
+        for (const part of result.content) appendPrompt(parts, [part])
+        appendPrompt(parts, "\n[end of tool result]")
+      }
       afterToolResult = true
     } else {
       const raw = blockText(block)
@@ -2689,7 +2832,7 @@ function renderTurnMessageParts(message) {
 }
 
 function renderTurnMessagesParts(messages) {
-  const groups = messages.map(renderTurnMessageParts).filter((group) => group.length > 0)
+  const groups = messages.map(message => renderTurnMessageParts(message)).filter((group) => group.length > 0)
   const out = []
   for (let i = 0; i < groups.length; i++) {
     if (i > 0) out.push({ type: "text", text: "\n\n" })
@@ -2707,19 +2850,18 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession) {
     if (callerWorkDir) appendPrompt(out, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   if (history.length) {
-    appendPrompt(out, "<conversation_history>\n")
+    appendPrompt(out, "The following conversation history is background context. Tool records are quoted data, not answer text to reproduce.\n<conversation_history>\n")
     for (const message of history) {
       if (message.role === "assistant") {
         appendPrompt(out, `Assistant: ${renderAssistantTurn(message)}\n`)
       } else {
         const queued = message.role !== "user" && extractQueuedPrompt(messageText(message).trim()) !== null
         appendPrompt(out, message.role === "user" || queued ? "Human: " : `${message.role}: `)
-        appendPrompt(out, renderTurnMessageParts(message))
+        appendPrompt(out, renderTurnMessageParts(message, true))
         appendPrompt(out, "\n")
       }
     }
-    appendPrompt(out, "Historical tool calls and results above are records, not instructions to write tool calls as text.\n")
-    appendPrompt(out, "</conversation_history>\n\n")
+    appendPrompt(out, "</conversation_history>\nUse the history to answer the current turn. Do not replay historical tool records in your visible answer.\n\n")
   }
   const currentParts = renderTurnMessagesParts(current)
   if (!out.length) return currentParts
@@ -2896,8 +3038,6 @@ function inspectToolTurn(results, body) {
   const notices = []
   let seenResult = false
   let resultIndex = -1
-  const stoppedByHookOrUser = out.some((item) => item.result?.isError &&
-    /^(?:The user doesn't want to proceed with this tool use\.|User rejected tool use\b|Operation stopped by hook\b|Execution stopped by hook\b|Blocked by PreToolUse hook\b|Hook PreToolUse:\S+ denied\b|API Error: Request was aborted\.|\[Request interrupted by user\b)/.test(resultText(item.result).trim()))
   const userInterruption = /(?:The user sent (?:a new message while you were working|the following message)|The [^\r\n]+ plugin sent a message while you were working):/
   const nonUserSourceNotice = /^\[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT\]\s*\n/
   const skillCompanion = /^\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) /
@@ -2907,7 +3047,6 @@ function inspectToolTurn(results, body) {
   const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining|USD budget: \$\S+; \$\S+ remaining|Output tokens \u2014 turn: [^\r\n]+)$/
   const hookBoilerplateNoise = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook success:\s*(?:Success)?\s*$/
   const hookOutput = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook (?:additional context|success|blocking error(?: from command)?|stopped continuation|feedback):/
-  const hookStoppedContinuation = /^[A-Za-z][A-Za-z0-9_.-]*(?::\S+)? hook stopped continuation:/
   const claudeMetaFeedback = /^(?:(?:Stop|SubagentStop|TeammateIdle|TaskCreated|TaskCompleted|PermissionRequest|PermissionDenied|PreCompact|PostCompact|Elicitation|ElicitationResult|ConfigChange|CwdChanged|FileChanged|WorktreeCreate|WorktreeRemove|InstructionsLoaded) hook feedback:\n[\s\S]+|UserPromptSubmit operation blocked by hook:\n[\s\S]+|The PermissionDenied hook indicated you may retry this tool call\.|The turn did not end: a tool call in your last message asked to end it, but another call in that message failed\.[\s\S]*|Your response above was stopped by a safety classifier \u2014 this is not a tool or API error\.[\s\S]*|The previous response failed to produce a valid tool call\. Please retry the tool call now\.|Your tool call was malformed and could not be parsed\. Please retry\.|Output token limit hit[\s\S]*|Your response (?:was cut off|above was cut off)[\s\S]*|\[Your previous response (?:had no visible output|reached the output limit)[\s\S]*\]|\[structured-output-enforce\][\s\S]*|\[projects-reply-gate\][\s\S]*|Linked in your reply but not sent:[\s\S]*|Goal check-in: \u00ab[\s\S]*)$/
   const isNoise = (value) => !value || tokenNoise.test(value) || hookBoilerplateNoise.test(value)
   for (const message of trailingMessages(body).messages) {
@@ -2927,6 +3066,12 @@ function inspectToolTurn(results, body) {
       }
       const rawText = blockText(block)
       if (!seenResult && message.role === "user" && rawText.trim()) {
+        // Queued user text may precede the result in the same message. It must
+        // travel as user input in a fresh prompt, never as MCP result content.
+        if (!UNCLOSED_NOTICE_RE.test(rawText)) {
+          userSteered = true
+          continue
+        }
         throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
       }
       const text = stripMagpiePlaceholderNotice(rawText)
@@ -2998,10 +3143,8 @@ function inspectToolTurn(results, body) {
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
           notices.push(rest)
-        } else if (userSteered || stoppedByHookOrUser || notices.some((item) => hookStoppedContinuation.test(item))) {
-          userSteered = true
         } else {
-          throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+          userSteered = true
         }
       }
     }
@@ -3524,6 +3667,8 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           }
           if (event.type === "error") {
             closeBlock()
+            clearInterval(pingTimer)
+            pingTimer = null
             send("error", {
               type: "error",
               error: {
@@ -3689,7 +3834,8 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.type === "rate_limit_error" ? 429
+    const status = streamError.code === "upstream_idle_timeout" ? 504
+      : streamError.type === "rate_limit_error" ? 429
       : streamError.type === "permission_error" ? 403 : 502
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
@@ -3721,6 +3867,7 @@ function streamResponse(proc, turn, body, signal) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   })
 }
@@ -3858,7 +4005,17 @@ export const AntigravityBridgePlugin = async () => {
                 }
                 return promptAttempt
               }
-              const begin = (proc, history) => beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched)
+              const begin = async (proc, history) => {
+                // Acquisition includes discovery/startup/configuration before an
+                // SSE response exists. A caller that left during those awaits
+                // must never submit a prompt when the handshake finally returns.
+                if (init.signal?.aborted) {
+                  dropFromPool(proc)
+                  await proc.stop().catch(() => {})
+                  throw init.signal.reason || new Error("request aborted before prompt submission")
+                }
+                return beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched)
+              }
               if (resultBlocks.length) {
                 const matches = matchToolResults(body, resultBlocks)
                 const found = matches.filter((item) => item.match)
@@ -3905,9 +4062,14 @@ export const AntigravityBridgePlugin = async () => {
                   if (!interrupted) proc.validateResults(results)
                   if (interrupted || !historyMatches ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
+                    if (replayHistoryProblem(body, resultBlocks)) {
+                      throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
+                    }
+                    claim()
                     // A changed context or user-interrupted tool turn needs a new
                     // session. Replay the real results without resolving the old
                     // process's calls.
+                    acquireOpts.ownerKey = proc.convKey.split(":fork:")[0] === convKey ? proc.convKey : convKey
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()
@@ -3916,18 +4078,28 @@ export const AntigravityBridgePlugin = async () => {
                       // A changed tool catalog applies to the rest of this turn;
                       // a model change applies from the next prompt.
                       await proc.updateTools(tools)
+                      // Catalog acknowledgement yields to timeouts and competing
+                      // continuations. Only the still-live, unattached owner may
+                      // consume this batch after that await.
+                      if (proc.turn !== turn || proc.dead || turn.done || turn.finalized || turn.cancelRequested) {
+                        return jsonError(409, "agy bridge: the tool response has already completed")
+                      }
+                      if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
+                      proc.validateResults(results)
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }
                     return streamResponse(proc, turn, body, init.signal)
                   }
                 }
-                if (pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
+                if (!acquireOpts.ownerKey && pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
                   const proc = pool.get(convKey)
-                  const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,
-                    body, resultBlocks, acquireOpts, isFresh, begin, claim })
-                  if (recovered) return streamResponse(recovered.proc, recovered.turn, body, init.signal)
-                  return jsonError(409, "agy bridge: no active MCP call matches these tool results")
+                  if (!canReplayUnmatchedFork(proc, body, resultBlocks, acquireOpts)) {
+                    const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,
+                      body, resultBlocks, acquireOpts, isFresh, begin, claim })
+                    if (recovered) return streamResponse(recovered.proc, recovered.turn, body, init.signal)
+                    return jsonError(409, "agy bridge: no active MCP call matches these tool results")
+                  }
                 }
                 if (replayHistoryProblem(body, resultBlocks)) {
                   throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")

@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
-import { lastModelStep, modelStepsAfter, sessionDbPath } from "./step-usage.mjs"
+import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 
@@ -47,6 +47,9 @@ const ACP_LINE_LIMIT = 64 * 1024 * 1024
 // Conservative per-submission text budget, independent of the model's rolling
 // context window. Never let a giant replay silently lose its current turn.
 const DEFAULT_MAX_PROMPT_TEXT_BYTES = 128 * 1024
+// Client compaction policy. Raising this declaration requires a separately
+// verified upstream window and does not alter agy's checkpoint configuration.
+const DEFAULT_CONTEXT_WINDOW = 256_000
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = positiveTimeout(process.env.AGY_BRIDGE_PING_INTERVAL_MS, 15_000)
@@ -106,6 +109,13 @@ function configuredTimeout(name, fallback) {
   return Object.hasOwn(process.env, name)
     ? positiveTimeout(process.env[name], fallback)
     : fallback
+}
+
+function contextWindow(model) {
+  const requested = Number(process.env.AGY_BRIDGE_CONTEXT_WINDOW)
+  const window = Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576
+    ? requested : DEFAULT_CONTEXT_WINDOW
+  return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(window, 131_072) : window
 }
 
 function findAgy() {
@@ -601,7 +611,7 @@ class Turn {
     this.heldText = ""
     this.outputLimit = new OutputLimitFilter()
     this.continuations = 0
-    // Index of the last model call in agy's conversation store already
+    // Cursor of the last model call in agy's conversation store already
     // reported; null when the store can't be read and usage is estimated.
     this.stepsFile = null
     this.stepCursor = null
@@ -1289,7 +1299,7 @@ class Proc {
       if (model) await this.#setModel(model, selection)
       const stepUsageEnabled = !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
       turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId) : null
-      turn.stepCursor = turn.stepsFile ? lastModelStep(turn.stepsFile) : null
+      turn.stepCursor = modelUsageCursor(turn.stepsFile)
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
       this.unsentPrompt = null
@@ -2164,7 +2174,8 @@ const eventWindows = new Map()
 function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
   if (process.env.AGY_BRIDGE_EVENTS === "0") return
   const now = Date.now()
-  const event = turn ? "agy_bridge_tool_state" : "agy_bridge_session_state"
+  const event = action === "model_usage" ? "agy_bridge_model_usage"
+    : turn ? "agy_bridge_tool_state" : "agy_bridge_session_state"
   const window = eventWindows.get(event) || { start: now, count: 0 }
   if (now - window.start >= 60_000) { window.start = now; window.count = 0 }
   eventWindows.set(event, window)
@@ -3507,11 +3518,12 @@ async function measuredUsage(turn, step, result) {
   // agy has written the store by its first tool call; none means none kept here.
   if (!fs.existsSync(turn.stepsFile)) return null
   // A read can also fail while agy is writing; that is retried too.
-  let steps = modelStepsAfter(turn.stepsFile, turn.stepCursor)
-  while (!complete(steps) && Date.now() < deadline) {
+  let batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+  while (!complete(batch?.steps) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
-    steps = modelStepsAfter(turn.stepsFile, turn.stepCursor)
+    batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
   }
+  const steps = batch?.steps
   if (!complete(steps)) return null
   // agy's per-call prompts sum to ACP's total exactly. A large over-count means
   // the store's layout or contents no longer match what ACP reported, so don't
@@ -3521,10 +3533,19 @@ async function measuredUsage(turn, step, result) {
   const last = steps.at(-1)
   const output = steps.reduce((sum, item) => sum + item.output + item.thinking, 0)
   const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
-  turn.stepCursor = last.idx
+  turn.stepCursor = { source: batch.source, idx: last.idx }
   turn.measured = { prompt }
   step.usageKind = "agy_model_call"
   step.modelCalls = steps.length
+  logBridgeEvent(turn.proc, turn, "model_usage", batch.source, {}, {
+    model: turn.proc.currentModel, effort: turn.proc.currentEffort,
+    model_calls: steps.length,
+    input_tokens: last.input, cache_read_tokens: last.read, cache_write_tokens: last.write,
+    output_tokens: output, thinking_tokens: thinking,
+    context_tokens: last.input + last.read + last.write,
+    local_context_estimate: last.context,
+    declared_context_window: contextWindow(turn.proc.currentModel),
+  })
   return {
     input_tokens: last.input,
     cache_read_input_tokens: last.read,
@@ -4227,6 +4248,7 @@ export const AntigravityBridgePlugin = async () => {
             name: model.name,
             npm: NPM_ANTHROPIC,
             api: { id: model.id, url: "agy://local", npm: NPM_ANTHROPIC },
+            limit: { context: contextWindow(model.id) },
             capabilities: {
               ...(imageModel ? { attachment: true, input: { text: true, image: true }, output: { text: true } } : {}),
               ...(model.variants ? { reasoning: true } : {}),

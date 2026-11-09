@@ -47,6 +47,7 @@ if (argv.includes("models")) {
   log({ type: "models", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE })
   process.stdout.write("gemini-test-medium\tGemini Test (Medium)\ngemini-test-high\tGemini Test (High)\ngemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
   process.stdout.write("gemini-4-argon-low\tGemini 4 Argon (Low)\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-argon-high\tGemini 4 Argon (High)\n")
+  process.stdout.write("gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n")
   process.exit(0)
 }
 if (argv[0] !== "acp") {
@@ -162,12 +163,23 @@ function recordModelCall({ input = 0, read = 0, output = 0, thinking = 0 }) {
   if (!sqliteOpen || !dir) return
   const db = sqliteOpen(path.join(dir, session.id + ".db"))
   try {
-    db.run("CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)")
     const usage = [0x10, ...varint(input), 0x18, ...varint(output), 0x28, ...varint(read), 0x48, ...varint(thinking)]
     session.stepIdx = (session.stepIdx ?? -1) + 1
-    db.run("INSERT INTO steps VALUES (?, 132, 3, ?)", session.stepIdx, new Uint8Array([0x18, 2]))
-    session.stepIdx++
-    db.run("INSERT INTO steps VALUES (?, 15, 3, ?)", session.stepIdx, new Uint8Array([0x18, 2, 0x4a, usage.length, ...usage]))
+    const store = process.env.FAKE_AGY_USAGE_STORE
+    if (store) {
+      db.run("CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+      if (store !== "empty-generation") {
+        const estimate = [0x52, ...varint(varint(input + read + 100).length + 1), 8, ...varint(input + read + 100)]
+        const chat = [0x22, ...varint(usage.length), ...usage, 0x4a, ...varint(estimate.length), ...estimate]
+        db.run("INSERT INTO gen_metadata VALUES (?, ?)", session.stepIdx, new Uint8Array([0x0a, ...varint(chat.length), ...chat]))
+      }
+    }
+    if (store !== "generation") {
+      db.run("CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)")
+      db.run("INSERT INTO steps VALUES (?, 132, 3, ?)", session.stepIdx, new Uint8Array([0x18, 2]))
+      session.stepIdx++
+      db.run("INSERT INTO steps VALUES (?, 15, 3, ?)", session.stepIdx, new Uint8Array([0x18, 2, 0x4a, usage.length, ...usage]))
+    }
   } finally {
     db.close()
   }
@@ -713,6 +725,17 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
   check("grouped model declares Magpie and OpenCode reasoning", models["gemini-test"]?.capabilities?.reasoning === true && models["gemini-test"]?.reasoning === true)
   check("Gemini and Claude models expose image input to the host", models["gemini-test"]?.capabilities?.input?.image === true && models["claude-test-medium"]?.capabilities?.input?.image === true)
   check("single-effort models stay ungrouped", models["claude-test-medium"]?.name === "Claude Test (Medium)" && !models["claude-test-medium"]?.variants)
+  check("models declare the conservative client context window", models["gemini-test"]?.limit?.context === 256000)
+  check("GPT-OSS declares its smaller physical window", models["gpt-oss-120b-medium"]?.limit?.context === 131072)
+  process.env.AGY_BRIDGE_CONTEXT_WINDOW = "512000"
+  const expanded = await plugin.provider.models()
+  check("context declaration accepts an explicit verified-window override", expanded["gemini-test"]?.limit?.context === 512000)
+  check("expanded Gemini windows keep GPT-OSS within its physical window", expanded["gpt-oss-120b-medium"]?.limit?.context === 131072)
+  for (const invalid of ["0", "-1", "bad", "512000.5", "1048577", "Infinity"]) {
+    process.env.AGY_BRIDGE_CONTEXT_WINDOW = invalid
+    check(`invalid context declaration ${invalid} retains the default`, (await plugin.provider.models())["gemini-test"]?.limit?.context === 256000)
+  }
+  delete process.env.AGY_BRIDGE_CONTEXT_WINDOW
 }
 
 {
@@ -3024,25 +3047,29 @@ for (const compacted of [true, false]) {
 {
   const usageOf = events => events.find(event => event.event === "message_delta")?.data?.usage || {}
   const hasSqlite = await import("node:sqlite").then(() => true, () => import("bun:sqlite").then(() => true, () => false))
-  for (const variant of ["MEASURED", "MEASURED_LAG"]) {
-    const first = { model, metadata: { user_id: "measured-" + variant }, messages: [{ role: "user", content: variant + " usage" }], tools: [echoTool] }
+  for (const [variant, store] of [["MEASURED", ""], ["MEASURED_LAG", ""], ["MEASURED", "generation"],
+    ["MEASURED_LAG", "generation"], ["MEASURED", "both"], ["MEASURED", "empty-generation"]]) {
+    process.env.FAKE_AGY_USAGE_STORE = store
+    const label = variant + "/" + (store || "steps")
+    const first = { model, metadata: { user_id: "measured-" + label }, messages: [{ role: "user", content: variant + " usage" }], tools: [echoTool] }
     const firstEvents = (await readSSE(await callFetch(first))).events
     const lastEvents = (await readSSE(await callFetch(continuation(first, firstEvents, "measured-result")))).events
     const step = usageOf(firstEvents)
     const final = usageOf(lastEvents)
     if (!hasSqlite) {
       // No SQLite in this runtime (Node < 22.5): the estimate still applies.
-      check(`${variant}: without SQLite the step usage is estimated`,
+      check(`${label}: without SQLite the step usage is estimated`,
         stopOf(lastEvents) === "end_turn" && step.input_tokens > 0 && final.input_tokens + final.cache_read_input_tokens > 0)
       continue
     }
-    check(`${variant}: tool step reports its model call from agy's store`,
+    check(`${label}: tool step reports its model call from agy's store`,
       stopOf(firstEvents) === "tool_use" && step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44,
       JSON.stringify(step))
-    check(`${variant}: final step reports its own call with the cache hit`,
+    check(`${label}: final step reports its own call with the cache hit`,
       stopOf(lastEvents) === "end_turn" && final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20,
       JSON.stringify(final))
   }
+  delete process.env.FAKE_AGY_USAGE_STORE
 }
 
 {

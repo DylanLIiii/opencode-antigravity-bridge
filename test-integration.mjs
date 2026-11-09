@@ -145,6 +145,13 @@ try {
     ] }, { role: "system", content: "SessionStart hook additional context: Keep the current user request and image together." }],
   })
   assert.equal(first.toolCalls, 1, "Expected exactly one native MCP tool call")
+  if (first.bridgeEvents.some(event => event.action === "model_usage")) {
+    const usageEvents = first.bridgeEvents.filter(event => event.action === "model_usage")
+    assert(usageEvents.every(event => ["gen_metadata", "steps"].includes(event.reason)))
+    assert(usageEvents.every(event => event.context_tokens === event.input_tokens + event.cache_read_tokens + event.cache_write_tokens))
+    assert(usageEvents.every(event => !Object.hasOwn(event, "text") && !Object.hasOwn(event, "prompt")))
+    console.log(`info - measured model calls from ${[...new Set(usageEvents.map(event => event.reason))].join(", ")}`)
+  }
   assert.match(first.content.filter(block => block.type === "text").map(block => block.text).join(""), /\bred\b/i, "Model did not recognize the red image")
   const before = JSON.parse(await fs.readFile(process.env.AGY_BRIDGE_STATE_FILE, "utf8"))
   assert.equal(before.entries.length, 1, "Expected one persisted session")

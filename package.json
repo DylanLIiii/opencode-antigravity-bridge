@@ -1,7 +1,7 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.1.1",
-  "description": "Antigravity subscription provider that bridges to a real agy CLI over the Agent Client Protocol (agy acp), avoiding HTTP impersonation",
+  "version": "0.1.2",
+  "description": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage.",
   "type": "module",
   "main": "./index.mjs",
   "files": [
@@ -33,6 +33,11 @@
   ],
   "license": "MIT",
   "magpie": {
+    "name": "Antigravity Bridge",
+    "summary": {
+      "en": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage.",
+      "zh": "通过官方 agy CLI 接入 Antigravity，旨在降低模拟客户端带来的封号风险；精简提示词、复用会话，减少重复上下文与 Token 消耗。"
+    },
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
     "maxConcurrency": 4
   },

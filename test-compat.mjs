@@ -263,6 +263,21 @@ test("server and MCP historical records use the same boundaries and optional omi
   })
 })
 
+test("strict historical server results retain failures encoded inside their content", () => withStripToolRecords("1", () => {
+  const text = promptText(renderInitialPromptParts({ messages: [
+    { role: "assistant", content: [
+      { type: "web_search_tool_result", tool_use_id: "failed-search", content: { type: "web_search_tool_result_error", error_code: "max_uses_exceeded" } },
+      { type: "web_fetch_tool_result", tool_use_id: "failed-fetch", content: { type: "web_fetch_tool_result_error", error_code: "url_not_allowed" } },
+      { type: "web_search_tool_result", tool_use_id: "successful-search", content: [{ type: "web_search_result", title: "Found" }] },
+    ] },
+    { role: "user", content: "Which tools failed?" },
+  ] }, null, true))
+  assert.match(text, /id="failed-search" is_error="true"/)
+  assert.match(text, /id="failed-fetch" is_error="true"/)
+  assert.match(text, /id="successful-search" is_error="false"/)
+  assert.ok(!text.includes("max_uses_exceeded") && !text.includes("url_not_allowed"))
+}))
+
 test("state lock recovers a stale lock only after its owning process has exited", () => {
   const file = path.join(workspace, "dead-owner-state.json")
   fs.writeFileSync(file + ".lock", JSON.stringify({ pid: 2147483647 }))

@@ -2550,7 +2550,12 @@ const TOOL_RECORD_CAVEAT = "Historical tool record, for context only. Do not rep
 function historicalToolRecord(block, role, content) {
   const attributes = { role, type: block.type, id: role === "call" ? block.id || "" : block.tool_use_id || "" }
   if (role === "call") attributes.name = block.name || block.type
-  else attributes.is_error = String(block.is_error === true)
+  else {
+    const results = Array.isArray(block.content) ? block.content : [block.content]
+    const serverError = SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type) && results.some(result =>
+      typeof result?.type === "string" && result.type.endsWith("_tool_result_error"))
+    attributes.is_error = String(block.is_error === true || serverError)
+  }
   const out = []
   appendPrompt(out, `\n<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}>\n${TOOL_RECORD_CAVEAT}\n`)
   if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {

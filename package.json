@@ -12,11 +12,13 @@
     "tool-schema.mjs",
     "upstream-error.mjs",
     "usage.mjs",
+    "output-limit.mjs",
+    "step-usage.mjs",
     "README.md",
     "README.en.md"
   ],
   "scripts": {
-    "test": "node --test test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-upstream-error.mjs test-mcp-server.mjs && node test-smoke.mjs",
+    "test": "node --test test-step-usage.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-upstream-error.mjs test-mcp-server.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [

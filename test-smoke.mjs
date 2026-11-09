@@ -16,6 +16,7 @@ const bridgeStateFile = path.join(stateDir, "bridge-sessions.json")
 process.env.AGY_BRIDGE_STATE_FILE = bridgeStateFile
 process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "5000"
+process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
 // the real one does: by running `nc 127.0.0.1 <--ide-mcp-port>` from PATH.
@@ -24,6 +25,7 @@ import { spawn } from "node:child_process"
 import fs from "node:fs"
 import path from "node:path"
 import readline from "node:readline"
+import { createRequire } from "node:module"
 
 const argv = process.argv.slice(2)
 const log = value => fs.appendFileSync(process.env.FAKE_AGY_LOG, JSON.stringify(value) + "\n")
@@ -138,6 +140,36 @@ async function invoke(name, args) {
 }
 
 const textOf = result => (result.content || []).map(part => part.text || "").join("")
+
+// agy's conversation store: one steps row per model call, usage in metadata field 9.
+const sqliteOpen = (() => {
+  const require = createRequire(import.meta.url)
+  try {
+    const { DatabaseSync } = require("node:sqlite")
+    if (DatabaseSync) return file => { const db = new DatabaseSync(file); return { run: (sql, ...args) => db.prepare(sql).run(...args), close: () => db.close() } }
+  } catch {}
+  try {
+    const { Database } = require("bun:sqlite")
+    return file => { const db = new Database(file); return { run: (sql, ...args) => db.query(sql).run(...args), close: () => db.close() } }
+  } catch {}
+  return null
+})()
+const varint = n => { const out = []; while (n > 127) { out.push((n & 127) | 128); n = Math.floor(n / 128) } out.push(n); return out }
+function recordModelCall({ input = 0, read = 0, output = 0, thinking = 0 }) {
+  const dir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR
+  if (!sqliteOpen || !dir) return
+  const db = sqliteOpen(path.join(dir, session.id + ".db"))
+  try {
+    db.run("CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)")
+    const usage = [0x10, ...varint(input), 0x18, ...varint(output), 0x28, ...varint(read), 0x48, ...varint(thinking)]
+    session.stepIdx = (session.stepIdx ?? -1) + 1
+    db.run("INSERT INTO steps VALUES (?, 132, 3, ?)", session.stepIdx, new Uint8Array([0x18, 2]))
+    session.stepIdx++
+    db.run("INSERT INTO steps VALUES (?, 15, 3, ?)", session.stepIdx, new Uint8Array([0x18, 2, 0x4a, usage.length, ...usage]))
+  } finally {
+    db.close()
+  }
+}
 
 function finish(reply, extra = {}) {
   const cached = extra.cached || 0
@@ -285,6 +317,41 @@ async function prompt(params) {
     await invoke("echo", { text: "probe" })
     chunk("After esc.\n")
     return finish("After esc.\n")
+  }
+  if (text.includes("Continue exactly where your previous output stopped")) {
+    if (session.cutOff === "always") {
+      chunk(" more")
+      return { stopReason: "max_tokens", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } }
+    }
+    chunk("\n⚠ Your previous response was cut off because it exceeded the output token limit\n")
+    chunk("Please continue from where you left off, keeping your response shorter\nRetries remaining: 3\n")
+    chunk("part two")
+    return finish("part two")
+  }
+  if (text.includes("CUTOFF")) {
+    session.cutOff = text.includes("CUTOFF_ALWAYS") ? "always" : "once"
+    chunk("part one, ")
+    return { stopReason: "max_tokens", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } }
+  }
+  if (text.includes("MEASURED_INFLATED")) {
+    // One call whose recorded prompt wildly exceeds ACP's total for the turn.
+    chunk("Inflated one.\n")
+    recordModelCall({ input: 99999, output: 40, thinking: 4 })
+    await invoke("echo", { text: "inflated" })
+    chunk("Inflated two.\n")
+    recordModelCall({ input: 500, read: 3000, output: 20 })
+    return finish("Inflated one.\nInflated two.\n", { input: 3500, cached: 3000, exclusive: true })
+  }
+  if (text.includes("MEASURED")) {
+    const lag = text.includes("MEASURED_LAG")
+    chunk("Measured one.\n")
+    recordModelCall({ input: 3000, output: 40, thinking: 4 })
+    await invoke("echo", { text: "measured" })
+    chunk("Measured two.\n")
+    // agy commits the last call a moment after answering session/prompt.
+    if (lag) setTimeout(() => recordModelCall({ input: 500, read: 3000, output: 20 }), 150)
+    else recordModelCall({ input: 500, read: 3000, output: 20 })
+    return finish("Measured one.\nMeasured two.\n", { input: 3500, cached: 3000, exclusive: true })
   }
   if (text.includes("MULTISTEP")) {
     chunk("Step one.\n")
@@ -2571,6 +2638,81 @@ for (const compacted of [true, false]) {
   const st = response.status
   if (st === 200) await readSSE(response); else await response.text()
   check("a compaction that rewrote earlier replies and dropped the pending call supersedes instead of 503", st === 200, `got ${st}`)
+}
+
+{
+  const usageOf = events => events.find(event => event.event === "message_delta")?.data?.usage || {}
+  const hasSqlite = await import("node:sqlite").then(() => true, () => import("bun:sqlite").then(() => true, () => false))
+  for (const variant of ["MEASURED", "MEASURED_LAG"]) {
+    const first = { model, metadata: { user_id: "measured-" + variant }, messages: [{ role: "user", content: variant + " usage" }], tools: [echoTool] }
+    const firstEvents = (await readSSE(await callFetch(first))).events
+    const lastEvents = (await readSSE(await callFetch(continuation(first, firstEvents, "measured-result")))).events
+    const step = usageOf(firstEvents)
+    const final = usageOf(lastEvents)
+    if (!hasSqlite) {
+      // No SQLite in this runtime (Node < 22.5): the estimate still applies.
+      check(`${variant}: without SQLite the step usage is estimated`,
+        stopOf(lastEvents) === "end_turn" && step.input_tokens > 0 && final.input_tokens + final.cache_read_input_tokens > 0)
+      continue
+    }
+    check(`${variant}: tool step reports its model call from agy's store`,
+      stopOf(firstEvents) === "tool_use" && step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44,
+      JSON.stringify(step))
+    check(`${variant}: final step reports its own call with the cache hit`,
+      stopOf(lastEvents) === "end_turn" && final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20,
+      JSON.stringify(final))
+  }
+}
+
+{
+  // AGY_BRIDGE_STEP_USAGE=0 must skip the conversation store and keep the
+  // estimate, even when the store has real per-call numbers.
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  try {
+    const first = { model, metadata: { user_id: "measured-disabled" }, messages: [{ role: "user", content: "MEASURED disabled" }], tools: [echoTool] }
+    const firstEvents = (await readSSE(await callFetch(first))).events
+    const lastEvents = (await readSSE(await callFetch(continuation(first, firstEvents, "disabled-result")))).events
+    const usageOf = events => events.find(event => event.event === "message_delta")?.data?.usage || {}
+    const step = usageOf(firstEvents)
+    check("AGY_BRIDGE_STEP_USAGE=0 skips the store and keeps the estimate",
+      stopOf(lastEvents) === "end_turn" && step.input_tokens > 0 &&
+        !(step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44),
+      JSON.stringify(step))
+  } finally {
+    delete process.env.AGY_BRIDGE_STEP_USAGE
+  }
+}
+
+{
+  // A store whose per-call prompts cannot be reconciled with ACP's total must
+  // not be reported as measured usage.
+  const first = { model, metadata: { user_id: "measured-inflated" }, messages: [{ role: "user", content: "MEASURED_INFLATED usage" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const lastEvents = (await readSSE(await callFetch(continuation(first, firstEvents, "inflated-result")))).events
+  const usageOf = events => events.find(event => event.event === "message_delta")?.data?.usage || {}
+  const final = usageOf(lastEvents)
+  check("an over-counted store falls back instead of reporting unreconciled numbers",
+    stopOf(lastEvents) === "end_turn" &&
+      !(final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20),
+    JSON.stringify(final))
+}
+
+{
+  const body = { model, metadata: { user_id: "cutoff-once" }, messages: [{ role: "user", content: "CUTOFF write a lot" }] }
+  const events = (await readSSE(await callFetch(body))).events
+  const prompts = logs().filter(event => event.type === "user" && /Continue exactly where your previous output stopped/.test(event.text))
+  check("max_tokens continues in the same response", stopOf(events) === "end_turn" && textOf(events) === "part one, part two", JSON.stringify(textOf(events)))
+  check("agy's output-cap notice is not shown", !/cut off|Retries remaining/.test(textOf(events)))
+  check("one continuation prompt for one cut", prompts.length === 1, String(prompts.length))
+}
+
+{
+  const before = logs().filter(event => event.type === "user" && /Continue exactly where your previous output stopped/.test(event.text)).length
+  const body = { model, metadata: { user_id: "cutoff-always" }, messages: [{ role: "user", content: "CUTOFF_ALWAYS write a lot" }] }
+  const events = (await readSSE(await callFetch(body))).events
+  const after = logs().filter(event => event.type === "user" && /Continue exactly where your previous output stopped/.test(event.text)).length
+  check("continuations stop after three and report max_tokens", stopOf(events) === "max_tokens" && after - before === 3, `${stopOf(events)} ${after - before}`)
+  check("all continued text stays in one response", textOf(events) === "part one,  more more more", JSON.stringify(textOf(events)))
 }
 
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))

@@ -128,9 +128,20 @@ magpie plugin add ./opencode-antigravity-bridge
   blocks are flattened. User messages, tool results, code quotations, vendor
   names and safety instructions are not globally rewritten. Set
   `AGY_BRIDGE_PROMPT_GUARD=0` to disable this compatibility layer.
-- **Per-turn token usage** from ACP prompt usage: cached prompt tokens are
-  reported as `cache_read_input_tokens`, and thought tokens are included in
-  `output_tokens` and itemized in `output_tokens_details.thinking_tokens`.
+- **Per-response token usage.** ACP reports one total per `session/prompt`,
+  which can span several responses (tool round-trips), and agy sends no
+  `usage_update`. agy does record every model call in its conversation store
+  (`~/.gemini/antigravity-cli/conversations/<sessionId>.db`); each response
+  reports the calls it covered from there: the latest call's uncached input,
+  `cache_read_input_tokens` and cache writes, and the calls' output with
+  thought tokens itemized in `output_tokens_details.thinking_tokens`. Without
+  SQLite support (Node < 22.5, or Node 22/23 without `--experimental-sqlite`)
+  or a readable store, responses fall back to an estimate calibrated on ACP's
+  totals. Set `AGY_BRIDGE_STEP_USAGE=0` to disable store reads entirely.
+- **Long answers continue.** A prompt that stops on `max_tokens` is continued in
+  the same session and response, up to 3 times (`AGY_BRIDGE_MAX_CONTINUATIONS`).
+  agy's own output-cap notice ("Your previous response was cut off…") is not
+  shown.
 - **Subscription quota reporting** in Magpie through `auth.usage`, using the
   real CLI's structured `/usage` report.
 - **Client-compatible continuation**: cache markers, string/block text, split
@@ -388,6 +399,9 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 | `AGY_BRIDGE_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips automatic quota probes entirely |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | quota subprocess budget, capped at 18000 ms |
 | `AGY_BRIDGE_MCP_TRACE` | unset | file that receives the MCP helper's traffic (diagnostics) |
+| `AGY_BRIDGE_MAX_CONTINUATIONS` | 3 | automatic continuations of an answer cut at the output cap (`0` disables) |
+| `AGY_BRIDGE_CONVERSATIONS_DIR` | `~/.gemini/antigravity-cli/conversations` | agy's conversation store, read for per-call usage |
+| `AGY_BRIDGE_STEP_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips per-call usage from agy's conversation store entirely |
 
 ## Development
 

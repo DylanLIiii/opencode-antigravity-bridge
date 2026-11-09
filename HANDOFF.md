@@ -1,5 +1,18 @@
 # Handoff: opencode-antigravity-bridge
 
+## 2026-11-09: combined validation for #17, #18, and #19
+
+- Integrated the three issue fixes on `fix/open-issues-17-19`. Final Node tests:
+  **91 focused tests + 413 smoke checks**, all passing. The combined regression
+  failed before #17 because a background fork destroyed the main pending tool;
+  it now passes fork timeout, queued-result replay, dedupe, and subsequent reuse.
+- Real macOS agy **1.5.2** integration passes image input, complex-schema MCP
+  round trip, cross-process resume, effort change, and historical-result recall.
+  The reported agy 1.5.3 Argon upstream stall and 68k-token echo were not tested
+  directly. Windows and Bun were not available for live validation.
+- Syntax checks, `git diff --check`, and `npm pack --dry-run --json` pass.
+  Changes are local commits; no push, release, installation, or GitHub issue update.
+
 ## 2026-11-09: GitHub issue #19 replay boundaries
 
 - Historical tool calls/results now use escaped `<tool_record>` boundaries and

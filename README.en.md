@@ -429,7 +429,7 @@ titles, plans, usage/status updates, empty chunks, stderr/log retry messages and
 downstream pings cannot extend this window. Waiting for a client tool result
 uses the separate tool deadline; agy's status traffic and repeated polls cannot
 extend a detached client's wait. Slow generation with substantive output can
-continue beyond 120 seconds. A genuinely silent model may need a larger explicit
+continue beyond 120 seconds. A model that emits no output may need a larger explicit
 timeout; raising it also allows agy's internal retries to run longer.
 
 An upstream inactivity timeout produces an SSE `error` with code

@@ -194,24 +194,27 @@ try {
   assert.equal(new Set(replayState.entries.map(entry => entry.sessionId)).size, 2, "Historical replay must create a separate session")
   console.log("ok - historical tool replay recalls the result without emitting tool records")
 
-  process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "150"
-  const steered = await runWorker({
-    model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
-    system: "Follow the latest user instruction. Use the tool only when asked. Keep answers brief.",
-    tools: [{ name: "bridge_echo", description: "Verify the bridge.", input_schema: {
-      type: "object", properties: { token: { type: "string", enum: ["bridge-integration"] } }, required: ["token"],
-    } }],
-    messages: [{ role: "user", content: "Remember the session code SEED-582. Call bridge_echo with token bridge-integration exactly once, then explain the result." }],
-    toolDelayMs: 750,
-    steering: "Change of plan. Do not call any more tools. Reply with BRIDGE-STEER-904, the session code from my original instruction, and the code returned by bridge_echo, separated by spaces.",
-  })
-  delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
-  assert.equal(steered.toolCalls, 1, "User steering executed another tool")
-  assert.equal(steered.content.filter(block => block.type === "text").map(block => block.text).join("").trim(), "BRIDGE-STEER-904 SEED-582 ORCHID-731")
-  const created = steered.bridgeEvents.filter(event => event.action === "created")
-  assert.equal(created.length, 1, "User steering created a replacement AGY session")
-  assert(steered.bridgeEvents.some(event => event.reason === "user_steering" && event.session_id === created[0].session_id))
-  console.log("ok - deferred user steering retains the AGY session, recalls earlier context and the real tool result, and obeys the latest instruction")
+  for (const toolDelayMs of [0, 750]) {
+    if (toolDelayMs) process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "150"
+    const steered = await runWorker({
+      model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
+      system: "Follow the latest user instruction. Use the tool only when asked. Keep answers brief.",
+      tools: [{ name: "bridge_echo", description: "Verify the bridge.", input_schema: {
+        type: "object", properties: { token: { type: "string", enum: ["bridge-integration"] } }, required: ["token"],
+      } }],
+      messages: [{ role: "user", content: `Remember the session code SEED-582. Call bridge_echo with token bridge-integration exactly once, then explain the result. Test case: ${toolDelayMs ? "deferred" : "live"}.` }],
+      toolDelayMs,
+      steering: "Change of plan. Do not call any more tools. Reply with BRIDGE-STEER-904, the session code from my original instruction, and the code returned by bridge_echo, separated by spaces.",
+    })
+    delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+    assert.equal(steered.toolCalls, 1, "User steering executed another tool")
+    assert.equal(steered.content.filter(block => block.type === "text").map(block => block.text).join("").trim(), "BRIDGE-STEER-904 SEED-582 ORCHID-731")
+    const created = steered.bridgeEvents.filter(event => event.action === "created")
+    assert.equal(created.length, 1, "User steering created a replacement AGY session")
+    assert(steered.bridgeEvents.some(event => event.reason === "user_steering" && event.session_id === created[0].session_id && event.steering_method === "native_prompt"), "Expected AGY 1.5.0+ native steering")
+    assert(!steered.bridgeEvents.some(event => event.steering_method === "cancel_then_prompt"), "Native steering unexpectedly fell back to cancellation")
+    console.log(`ok - ${toolDelayMs ? "deferred" : "live"} native steering retains the AGY session, recalls earlier context and the real tool result, and obeys the latest instruction`)
+  }
 
   const large = {
     model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",

@@ -2,6 +2,13 @@
 
 ## 0.3.2
 
+- Prefer AGY 1.5.0+ native steering by sending another prompt in the running
+  session. Wait for both ACP requests before finishing the client response;
+  deliver live results only through MCP and include undelivered deferred results
+  with the instruction. Older versions, model changes and explicit concurrent-
+  prompt rejections fall back to cancel/settle/prompt in the same session.
+  Compatible ended or cancelling tool turns also continue without replay.
+  Report the actual incompatible-context reason when replay is necessary.
 - Preserve the AGY session when user steering or interruption accompanies a
   complete batch of deferred tool results, including tools AGY stopped waiting
   for. Keep earlier undelivered results and avoid a duplicate late-result prompt.

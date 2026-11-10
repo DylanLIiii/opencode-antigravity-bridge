@@ -147,14 +147,17 @@ Refreshing the model catalog re-scans the accounts directory.
   `session/cancel`; the session stays alive and the partial answer the client
   saw becomes part of the expected history.
 - **User steering during tools.** With compatible history, instructions and
-  working directory, a complete batch of live tool results is delivered once.
-  The bridge cancels and settles the old ACP prompt, then submits this batch's
-  real results with the queued user instruction in the same AGY session. This
-  preserves its context and internal compaction state, and keeps the result
-  available when AGY stores a cancellation for the old tool call. Each tool
-  executes once. This also covers deferred calls, whether AGY is polling them or
-  has already stopped waiting. Changed histories and incompatible session
-  instructions still use replay.
+  working directory, AGY 1.5.0+ receives another `session/prompt` in the running
+  session, using its documented native steering. Live results go only through
+  MCP; undelivered deferred results accompany the new instruction. Both ACP
+  requests must settle before the client response ends. Each tool executes once.
+  Older agents, model changes and explicit concurrent-prompt rejections fall
+  back to cancel → settle → prompt in the same session. Ended or cancelling
+  compatible turns also continue in that session. Authentication and transport
+  failures do not automatically resend an uncertain prompt. Replay is reserved
+  for incompatible context or unavailable sessions. History comparison normalizes
+  representation differences such as message chunks and tool IDs; a text similarity
+  percentage cannot override changed tool results or a different history branch.
 - **Bounded recovery input.** Submitted text plus session instructions has a
   1 MiB UTF-8 budget, configured by the positive byte count
   `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`. Separately, each ACP user prompt is limited
@@ -431,9 +434,8 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   history, and completed branches have separate snapshots for resume after
   eviction or restart. Ambiguous history matches are not guessed.
 - **Queued user text beside a live `tool_result`**, before or after the result
-  in the same message, starts a new prompt containing the current result batch
-  and user instruction in the same session, after delivering live results and
-  cancelling and settling the old prompt, including complete deferred results.
+  in the same message, uses native steering when supported, including complete
+  deferred results. The next choice is cancel/settle/prompt in the same session.
   Incompatible histories recover through budget-checked replay. Incomplete
   batches are rejected before closing the live owner.
   If a sibling was already reclaimed, its complete late results plus user

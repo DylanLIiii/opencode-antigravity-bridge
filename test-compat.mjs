@@ -16,8 +16,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, renderReplayPromptParts };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -40,6 +40,62 @@ test("prompt budget counts UTF-8 text and installed instructions, preserving com
       error.statusCode === 400 && error.code === "context_length_exceeded" && error.noRetry &&
       /Compact the conversation/.test(error.message))
     assert.deepEqual(parts, original)
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+test("prompt budget defaults to 1 MiB so compacted histories can replay", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  try {
+    assert.equal(validatePromptBudget([{ type: "text", text: "中".repeat(113_000) }]), 339_000)
+    assert.throws(() => validatePromptBudget([{ type: "text", text: "a".repeat(1024 * 1024 + 1) }]),
+      error => error.code === "context_length_exceeded")
+  } finally {
+    if (previous !== undefined) process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+test("oversized replay omits historical tool-result bodies before failing", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "4000"
+  try {
+    const body = { messages: [
+      { role: "user", content: "Read the file." },
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: { path: "a.txt" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "BIG".repeat(5000) }] },
+      { role: "assistant", content: "Done." },
+      { role: "user", content: "CURRENT-INSTRUCTION" },
+    ] }
+    const text = parts => parts.map(part => part.text || "").join("")
+    const replay = text(renderReplayPromptParts(body, null, true))
+    assert(!replay.includes("BIGBIG"))
+    assert.match(replay, /omitted to fit the bridge prompt budget/)
+    assert.match(replay, /name="Read"/)
+    assert.match(replay, /CURRENT-INSTRUCTION/)
+    assert.equal(validatePromptBudget(renderReplayPromptParts(body, null, true), "", body) > 0, true)
+
+    process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "100000"
+    assert.match(text(renderReplayPromptParts(body, null, true)), /BIGBIG/)
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+test("an already compacted conversation over budget avoids the reactive-compaction phrase", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "10"
+  try {
+    const summary = "This session is being continued from a previous conversation that ran out of context."
+    const compacted = { messages: [{ role: "user", content: [{ type: "text", text: summary }] }] }
+    assert.throws(() => validatePromptBudget([{ type: "text", text: "x".repeat(20) }], "", compacted), error =>
+      error.statusCode === 400 && error.code === "prompt_budget_exceeded" && !/prompt is too long/i.test(error.message))
+    const quoted = { messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: summary }] }] }
+    assert.throws(() => validatePromptBudget([{ type: "text", text: "x".repeat(20) }], "", quoted), error =>
+      error.code === "context_length_exceeded")
   } finally {
     if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
     else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous

@@ -154,13 +154,18 @@ Refreshing the model catalog re-scans the accounts directory.
   available when AGY stores a cancellation for the old tool call. Each tool
   executes once. Deferred tool delivery and changed histories use replay.
 - **Bounded recovery input.** Submitted text plus session instructions has a
-  conservative 128 KiB UTF-8 budget, configured by the positive byte count
+  1 MiB UTF-8 budget, configured by the positive byte count
   `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`. Image base64 travels separately. Existing
   session history can exceed this per-submission budget during continuation or
-  resume. Oversized replay returns HTTP 400 `context_length_exceeded` before
+  resume. A replay over budget first omits historical tool-result bodies (calls
+  and the current turn stay complete). If it is still too large, the bridge
+  returns HTTP 400 `context_length_exceeded` before
   replacing the existing session. The client must compact its history and submit
   the summary with the complete current instruction. Automatic client compaction
-  depends on the client's error handling. The bridge leaves summarization to the
+  depends on the client's error handling. When the history already carries a
+  Claude Code compaction summary, the error uses code `prompt_budget_exceeded`
+  without the "prompt is too long" wording, so the client does not compact in a
+  loop. The bridge leaves summarization to the
   client. Bounded, content-free events record session IDs, replay reasons and
   prompt sizes; `AGY_BRIDGE_EVENTS=0` disables them.
 - **Upstream errors without retry amplification.** agy reports API failures as
@@ -509,7 +514,7 @@ account, set `AGY_BRIDGE_CONTEXT_WINDOW=512000` in the bridge's environment,
 restart the plugin and refresh the client's model catalog. Valid declarations
 are integers from 1 to 1,048,576. Invalid values use the default policy.
 GPT-OSS remains capped at 131,072 tokens. This setting changes the client-facing
-metadata. Usable capacity still depends on AGY. The 128 KiB per-submission text
+metadata. Usable capacity still depends on AGY. The 1 MiB per-submission text
 budget is configured separately with `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`.
 
 Content-free `agy_bridge_model_usage` events identify the billing source
@@ -537,7 +542,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
-| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 131072 | positive UTF-8 text budget for each submitted prompt or tool-result batch plus session instructions; oversized input returns `context_length_exceeded` |
+| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | positive UTF-8 text budget for each submitted prompt or tool-result batch plus session instructions; an oversized replay first omits historical tool-result bodies, then returns `context_length_exceeded` (`prompt_budget_exceeded` for an already compacted history) |
 | `AGY_BRIDGE_CONTEXT_WINDOW` | 256000 | client context declaration, integer 1–1048576; GPT-OSS capped at 131072; requires separately verified upstream capacity |
 | `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session, tool and model usage diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |

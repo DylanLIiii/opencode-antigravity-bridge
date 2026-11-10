@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.2
+
+- Prefer AGY 1.5.0+ native steering by sending another prompt in the running
+  session. Wait for both ACP requests before finishing the client response;
+  deliver live results only through MCP and include undelivered deferred results
+  with the instruction. Older versions, model changes and explicit concurrent-
+  prompt rejections fall back to cancel/settle/prompt in the same session.
+  Compatible ended or cancelling tool turns also continue without replay.
+  Report the actual incompatible-context reason when replay is necessary.
+- Preserve the AGY session when user steering or interruption accompanies a
+  complete batch of deferred tool results, including tools AGY stopped waiting
+  for. Keep earlier undelivered results and avoid a duplicate late-result prompt.
+- Guard each ACP user prompt against AGY's independent input truncation limit.
+  AGY 1.5.4 was observed truncating rendered user input at 192,000 bytes, dropping
+  the latest instruction during carbon history replay. Use a 180,000-byte text
+  ceiling with room for wrappers and image labels, separate from the configurable
+  1 MiB total budget. Oversized replay tries historical-result omission, then
+  rejects before replacing the session or accepting tools. Already compacted
+  input keeps the non-looping `prompt_budget_exceeded` error.
+
 ## 0.3.1
 
 - Fix an endless compaction loop in Claude Code after a history change (#27).

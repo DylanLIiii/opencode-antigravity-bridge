@@ -16,8 +16,8 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, renderReplayPromptParts };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
@@ -46,7 +46,7 @@ test("prompt budget counts UTF-8 text and installed instructions, preserving com
   }
 })
 
-test("prompt budget defaults to 1 MiB so compacted histories can replay", () => {
+test("total submission budget defaults to 1 MiB independently of ACP user-input limits", () => {
   const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
   delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
   try {
@@ -79,6 +79,46 @@ test("oversized replay omits historical tool-result bodies before failing", () =
 
     process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "100000"
     assert.match(text(renderReplayPromptParts(body, null, true)), /BIGBIG/)
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+test("replay below 1 MiB still fits AGY's user-input limit and keeps the current instruction", () => {
+  const body = { messages: [
+    { role: "user", content: "Read an old file." },
+    { role: "assistant", content: [{ type: "tool_use", id: "old", name: "Read", input: { path: "old.txt" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "old", content: "中".repeat(80_000) }] },
+    { role: "assistant", content: "Remembered." },
+    { role: "user", content: "CURRENT-INSTRUCTION-731" },
+  ] }
+  const original = structuredClone(body)
+  const text = renderReplayPromptParts(body, null, true).map(part => part.text || "").join("")
+  assert(Buffer.byteLength(text) <= 180_000)
+  assert.match(text, /CURRENT-INSTRUCTION-731\n<\/current_turn>$/)
+  assert.match(text, /omitted to fit the bridge prompt budget/)
+  assert.deepEqual(body, original)
+})
+
+test("ACP user-input limit counts combined UTF-8 text and image labels separately from installed instructions", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "2000000"
+  try {
+    const parts = [{ type: "text", text: "中".repeat(30_000) }, { type: "text", text: "x".repeat(90_000) }]
+    assert.equal(validateAcpPromptBudget(parts, "s".repeat(300_000)), 480_000)
+    const original = structuredClone(parts)
+    assert.throws(() => validateAcpPromptBudget([...parts, { type: "text", text: "尾" }]), error =>
+      error.code === "context_length_exceeded" && error.noRetry && /180000/.test(error.message))
+    assert.throws(() => validateAcpPromptBudget([...parts, { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]), error =>
+      error.code === "context_length_exceeded")
+    assert.equal(validateAcpPromptBudget([{ type: "image", data: "a".repeat(500_000), mimeType: "image/png" }]), 0)
+    const compacted = { messages: [{ role: "user", content:
+      "This session is being continued from a previous conversation that ran out of context." }] }
+    assert.throws(() => validateAcpPromptBudget([...parts, { type: "text", text: "x" }], "", compacted), error =>
+      error.code === "prompt_budget_exceeded" && !/prompt is too long/i.test(error.message) &&
+      /cannot raise this upstream limit/.test(error.message))
+    assert.deepEqual(parts, original)
   } finally {
     if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
     else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous

@@ -72,11 +72,15 @@ let mcpReady = null
 let nextMcpId = 0
 const mcpPending = new Map()
 let cancelWaiter = null
+let activePrompt = null
 
 function update(value) {
   send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: session.id, update: value } })
 }
-const chunk = text => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } })
+const chunk = text => {
+  if (activePrompt?.steers.length && !activePrompt.delivering) return
+  update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } })
+}
 const thought = text => update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text } })
 
 function mcpRequest(method, params) {
@@ -211,12 +215,28 @@ async function reply(text) {
   chunk(text.slice(half))
 }
 
-async function prompt(params) {
-  const text = params.prompt.map(block => block.text || "").join("")
-  const images = params.prompt.filter(block => block.type === "image").length
+function recordPrompt(params) {
   session.prompts++
   saveState()
-  log({ type: "user", convId: session.id, prompt: session.prompts, text, images, content: params.prompt, model })
+  log({ type: "user", convId: session.id, prompt: session.prompts,
+    text: params.prompt.map(block => block.text || "").join(""),
+    images: params.prompt.filter(block => block.type === "image").length, content: params.prompt, model })
+}
+
+async function prompt(params, recorded = false) {
+  const text = params.prompt.map(block => block.text || "").join("")
+  const images = params.prompt.filter(block => block.type === "image").length
+  if (!recorded) recordPrompt(params)
+  if (text.includes("NATIVE_FINAL")) {
+    await new Promise(resolve => setTimeout(resolve, 80))
+    chunk("NATIVE_FINAL_AFTER_ACK")
+    return finish("NATIVE_FINAL_AFTER_ACK")
+  }
+  if (text === "TOOL_FINISH_EARLY") {
+    invoke("echo", { text: "finished prompt" }).catch(() => {})
+    await new Promise(resolve => setTimeout(resolve, 30))
+    return finish("ended before tool result")
+  }
   if (text.includes("DELAY_BEFORE_TOOL")) await new Promise(resolve => setTimeout(resolve, 1500))
   if (text.includes("IDLE_SILENT") || text.includes("IDLE_METADATA")) {
     if (text.includes("IDLE_METADATA")) {
@@ -470,7 +490,7 @@ async function handle(message) {
           sessionCapabilities: { resume: {}, close: {} },
           _meta: { antigravity: { systemPrompt: { append: true } } },
         },
-        agentInfo: { name: "Antigravity ACP Server", version: process.env.FAKE_AGY_IMAGES === "omit" ? "1.4.12" : "1.5.0" },
+        agentInfo: { name: "Antigravity ACP Server", version: process.env.FAKE_AGY_VERSION || (process.env.FAKE_AGY_IMAGES === "omit" ? "1.4.12" : "1.5.0") },
         authMethods: [],
       }
     case "session/new":
@@ -517,8 +537,44 @@ async function handle(message) {
       model = params.modelId
       log({ type: "setModel", convId: session.id, model })
       return {}
-    case "session/prompt":
-      return prompt(params)
+    case "session/prompt": {
+      if (activePrompt) {
+        if (process.env.FAKE_AGY_STEER === "reject" || process.env.FAKE_AGY_STEER === "auth-error") {
+          log({ type: "steerRejected", convId: session.id })
+          throw { code: -32000, message: process.env.FAKE_AGY_STEER === "reject"
+            ? "Concurrent prompts are not supported: another prompt is already running"
+            : "Authentication required" }
+        }
+        recordPrompt(params)
+        log({ type: "nativeSteer", convId: session.id })
+        const item = { params, resolve: null }
+        activePrompt.steers.push(item)
+        if (process.env.FAKE_AGY_STEER === "original-first") {
+          return new Promise(resolve => { item.resolve = resolve })
+        }
+        // Acceptance is not completion: the original prompt keeps streaming.
+        return { stopReason: "end_turn" }
+      }
+      const context = { steers: [], delivering: false }
+      activePrompt = context
+      const result = await prompt(params)
+      const drain = async () => {
+        let final = result
+        while (context.steers.length) {
+          const item = context.steers.shift()
+          context.delivering = true
+          final = await prompt(item.params, true)
+          item.resolve?.(final)
+        }
+        activePrompt = null
+        return final
+      }
+      if (context.steers.length && process.env.FAKE_AGY_STEER === "original-first") {
+        drain().catch(() => {})
+        return { stopReason: "cancelled" }
+      }
+      return drain()
+    }
     default:
       throw { code: -32601, message: "unknown method " + message.method }
   }
@@ -1590,6 +1646,33 @@ for (const mode of ["IDLE_SILENT", "IDLE_METADATA"]) {
   delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
 }
 
+for (const mode of ["LONGTOOL", "LONGQUIT"]) {
+  for (const marker of ["", "[Request interrupted by user]\n"]) {
+    process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "150"
+    const first = { model, messages: [{ role: "user", content: `${mode} deferred steering ${!!marker}` }], tools: [echoTool] }
+    const pending = (await readSSE(await callFetch(first))).events
+    const session = inits().at(-1)
+    await new Promise(resolve => setTimeout(resolve, 400))
+    const second = continuation(first, pending, "DEFERRED-RESULT-731")
+    second.messages.push({ role: "user", content: marker + "Use the real result and follow NEW-INSTRUCTION-942." })
+    const response = await callFetch(second)
+    const final = (await readSSE(response)).events
+    const prompts = logs().filter(event => event.type === "user" && event.convId === session.convId)
+    check(`${mode}/${!!marker}: deferred steering keeps the original session`, response.status === 200 &&
+      stopOf(final) === "end_turn" && inits().at(-1).convId === session.convId && prompts.length === 2)
+    check(`${mode}/${!!marker}: deferred steering preserves the result and new instruction once`,
+      (prompts.at(-1).text.split("DEFERRED-RESULT-731").length - 1 + logs().filter(event =>
+        event.type === "mcpResult" && event.convId === session.convId && JSON.stringify(event.result).includes("DEFERRED-RESULT-731")).length) === 1 &&
+      prompts.at(-1).text.includes("NEW-INSTRUCTION-942") && !prompts.at(-1).text.includes("<conversation_history>") &&
+      !toolCalls(final).length)
+    const follow = nextTurn(second, final, "MEMORY after deferred steering")
+    const resumed = (await readSSE(await callFetch(follow))).events
+    check(`${mode}/${!!marker}: follow-up keeps the steered session`, stopOf(resumed) === "end_turn" &&
+      lastOf("user").convId === session.convId && lastOf("user").text === "MEMORY after deferred steering")
+    delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+  }
+}
+
 {
   const firstBody = { model, messages: [{ role: "user", content: "TOOL extra text" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
@@ -1624,7 +1707,7 @@ for (const [index, text] of [
     else await response.text()
     check(`merged follow-up ${index}/${before} retains the session and sends user text as a new prompt`, response.status === 200 &&
       lastOf("user").convId === old.convId && lastOf("user").text.includes(text) &&
-      lastOf("user").text.includes("real merged output") && !lastOf("user").text.includes("<conversation_history>"))
+      !lastOf("user").text.includes("real merged output") && !lastOf("user").text.includes("<conversation_history>"))
     check(`merged follow-up ${index}/${before} delivers the actual result once`, logs().filter(event =>
       event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("real merged output")).length === 1)
     check(`merged follow-up ${index}/${before} never injects user text into MCP`, !logs().some(event =>
@@ -2207,10 +2290,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const response = await callFetch(second)
   const final = (await readSSE(response)).events
   const replay = lastOf("user")
-  check("user-interrupted tool turn cancels the old prompt and retains the session",
+  check("user-interrupted tool turn steers natively and retains the session",
     response.status === 200 && stopOf(final) === "end_turn" && replay.convId === old.convId &&
     replay.text.includes("New instruction after Esc") && !replay.text.includes("<conversation_history>") &&
-    logs().some(event => event.type === "cancel" && event.convId === old.convId), `got ${response.status}`)
+    !logs().some(event => event.type === "cancel" && event.convId === old.convId) &&
+    logs().some(event => event.type === "nativeSteer" && event.convId === old.convId), `got ${response.status}`)
   const third = nextTurn(second, final, "MEMORY after interrupted tool turn")
   const thirdRes = await callFetch(third)
   await readSSE(thirdRes)
@@ -2218,9 +2302,89 @@ for (const location of ["inline", "system", "developer", "user"]) {
     thirdRes.status === 200 && lastOf("user").convId === replay.convId)
 }
 
+for (const mode of ["ack-first", "original-first", "reject", "auth-error"]) {
+  process.env.FAKE_AGY_STEER = mode
+  const first = { model, messages: [{ role: "user", content: `ESCCALL native steering ${mode}` }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  delete process.env.FAKE_AGY_STEER
+  const session = inits().at(-1)
+  const second = continuation(first, pending, "NATIVE-RESULT-731")
+  second.messages.push({ role: "user", content: "NATIVE_FINAL" })
+  const response = await callFetch(second)
+  const final = (await readSSE(response)).events
+  const records = logs().filter(event => event.convId === session.convId)
+  if (mode === "auth-error") {
+    check("native steering auth errors do not resend or replay", final.some(event => event.event === "error") &&
+      records.filter(event => event.type === "user").length === 1 && inits().at(-1).convId === session.convId)
+    const duplicate = await callFetch(second)
+    check("a submitted failed steer cannot be automatically retried", duplicate.status !== 200 &&
+      duplicate.headers.get("x-should-retry") === "false")
+    await duplicate.text()
+    continue
+  }
+  check(`${mode}: steering waits for final output after both ACP replies`, stopOf(final) === "end_turn" &&
+    textOf(final).includes("NATIVE_FINAL_AFTER_ACK") && inits().at(-1).convId === session.convId)
+  check(`${mode}: steering uses only the expected same-session fallback`,
+    records.filter(event => event.type === "cancel").length === (mode === "reject" ? 1 : 0) &&
+    records.filter(event => event.type === "user").length === 2 &&
+    !records.some(event => event.type === "user" && event.text.includes("<conversation_history>")))
+  const follow = nextTurn(second, final, "MEMORY after native steering " + mode)
+  const resumed = (await readSSE(await callFetch(follow))).events
+  check(`${mode}: follow-up retains native context`, stopOf(resumed) === "end_turn" && lastOf("user").convId === session.convId)
+}
+
 {
+  const first = { model, messages: [{ role: "user", content: "ESCCALL native steering chain" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const session = inits().at(-1)
+  const second = continuation(first, pending, "FIRST-CHAIN-RESULT")
+  second.messages.push({ role: "user", content: "ESCCALL native second tool" })
+  const nextPending = (await readSSE(await callFetch(second))).events
+  const third = continuation(second, nextPending, "SECOND-CHAIN-RESULT")
+  third.messages.push({ role: "user", content: "NATIVE_FINAL" })
+  const final = (await readSSE(await callFetch(third))).events
+  const records = logs().filter(event => event.convId === session.convId)
+  check("multiple steers and intervening tools retain one ACP turn and session", stopOf(nextPending) === "tool_use" &&
+    stopOf(final) === "end_turn" && textOf(final).includes("NATIVE_FINAL_AFTER_ACK") &&
+    records.filter(event => event.type === "nativeSteer").length === 2 &&
+    records.filter(event => event.type === "user").length === 3 &&
+    !records.some(event => event.type === "cancel") && inits().at(-1).convId === session.convId)
+  const follow = (await readSSE(await callFetch(nextTurn(third, final, "MEMORY after steering chain")))).events
+  check("a follow-up after repeated steering does not replay history", stopOf(follow) === "end_turn" &&
+    lastOf("user").convId === session.convId && lastOf("user").text === "MEMORY after steering chain")
+}
+
+{
+  const first = { model, messages: [{ role: "user", content: "TOOL_FINISH_EARLY" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const session = inits().at(-1)
+  await new Promise(resolve => setTimeout(resolve, 60))
+  const second = continuation(first, pending, "RESULT-AFTER-PROMPT-END")
+  second.messages.push({ role: "user", content: "NATIVE_FINAL" })
+  const final = (await readSSE(await callFetch(second))).events
+  check("an ended prompt with compatible complete results continues without replay", stopOf(final) === "end_turn" &&
+    textOf(final).includes("NATIVE_FINAL_AFTER_ACK") && lastOf("user").convId === session.convId &&
+    lastOf("user").text.includes("RESULT-AFTER-PROMPT-END") && !lastOf("user").text.includes("<conversation_history>"))
+}
+
+{
+  const first = { model, messages: [{ role: "user", content: "ESCCALL native large MCP result" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const session = inits().at(-1)
+  const second = continuation(first, pending, "z".repeat(200_000))
+  second.messages.push({ role: "user", content: "NATIVE_FINAL" })
+  const response = await callFetch(second)
+  const final = response.status === 200 ? (await readSSE(response)).events : []
+  check("a large live MCP result is not forced into the ACP user-input ceiling", stopOf(final) === "end_turn" &&
+    lastOf("user").convId === session.convId && lastOf("user").text === "NATIVE_FINAL")
+  if (response.status !== 200) await response.text()
+}
+
+{
+  process.env.FAKE_AGY_VERSION = "1.4.12"
   const first = { model, messages: [{ role: "user", content: "ESCCALL STEER_CANCEL_DELAY" }], tools: [echoTool] }
   const pending = (await readSSE(await callFetch(first))).events
+  delete process.env.FAKE_AGY_VERSION
   const session = inits().at(-1)
   const steered = continuation(first, pending, "actual result before cancellation")
   steered.messages.at(-1).content.push({ type: "text", text: "ABORTED-STEERING-731" })
@@ -2262,11 +2426,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
 }
 
 {
-  let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(300_000) }], tools: [echoTool] }
+  let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(150_000) }], tools: [echoTool] }
   let events = (await readSSE(await callFetch(body))).events
   const session = inits().at(-1)
-  for (let round = 0; round < 3; round++) {
-    body = nextTurn(body, events, "MEMORY " + "h".repeat(300_000))
+  for (let round = 0; round < 7; round++) {
+    body = nextTurn(body, events, "MEMORY " + "h".repeat(150_000))
     events = (await readSSE(await callFetch(body))).events
   }
   body = nextTurn(body, events, "ESCCALL large accumulated history")
@@ -2315,6 +2479,41 @@ for (const steering of [false, true]) {
   const final = (await readSSE(await callFetch(corrected))).events
   check(`a corrected tool result ${steering} completes in its original session`, stopOf(final) === "end_turn" &&
     inits().at(-1).convId === session.convId)
+}
+
+{
+  const before = inits().length
+  const tooLarge = { model, messages: [{ role: "user", content: "中文".repeat(40_000) + " CURRENT-TAIL-731" }] }
+  const rejected = await callFetch(tooLarge)
+  check("a user turn below 1 MiB but above AGY's limit is rejected before session creation", rejected.status === 400 &&
+    (await rejected.json()).error?.code === "context_length_exceeded" && inits().length === before)
+
+  const first = { model, messages: [{ role: "user", content: "MEMORY before oversized continuation" }] }
+  const initial = (await readSSE(await callFetch(first))).events
+  const session = inits().at(-1)
+  const next = nextTurn(first, initial, "x".repeat(200_000) + " KEEP-TAIL-942")
+  const response = await callFetch(next)
+  check("oversized native continuation leaves the original session usable", response.status === 400 &&
+    (await response.json()).error?.code === "context_length_exceeded" && fs.existsSync(session.cwd) &&
+    logs().filter(event => event.type === "user" && event.convId === session.convId).length === 1)
+  const corrected = nextTurn(first, initial, "MEMORY smaller continuation")
+  const final = (await readSSE(await callFetch(corrected))).events
+  check("a corrected native continuation reuses the preserved session", stopOf(final) === "end_turn" &&
+    lastOf("user").convId === session.convId)
+
+  process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "150"
+  const late = { model, messages: [{ role: "user", content: "LONGQUIT oversized deferred result" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(late))).events
+  const lateSession = inits().at(-1)
+  await new Promise(resolve => setTimeout(resolve, 400))
+  const oversized = await callFetch(continuation(late, pending, "z".repeat(200_000)))
+  check("a deferred result cannot bypass the ACP user-input limit", oversized.status === 400 &&
+    (await oversized.json()).error?.code === "context_length_exceeded" && fs.existsSync(lateSession.cwd) &&
+    logs().filter(event => event.type === "user" && event.convId === lateSession.convId).length === 1)
+  const resumed = (await readSSE(await callFetch(continuation(late, pending, "small-deferred-result")))).events
+  check("rejected deferred input retains the pending tool for a corrected result", stopOf(resumed) === "end_turn" &&
+    lastOf("user").convId === lateSession.convId && textOf(resumed).includes("small-deferred-result"))
+  delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
 }
 
 {
@@ -2661,7 +2860,7 @@ for (const steering of [false, true]) {
   check('native steering retains image bytes inside the real MCP result', response.status === 200 && logs().some(event =>
     event.type === 'mcpResult' && event.convId === lastOf('user').convId &&
     event.result?.content?.some(part => part.type === 'image' && part.data === 'cmVwbGF5aW1hZ2U=')))
-  check('steered prompt preserves the returned image across AGY cancellation', lastOf('user').content.some(part =>
+  check('native steering does not duplicate the MCP image in a user prompt', !lastOf('user').content.some(part =>
     part.type === 'image' && part.data === 'cmVwbGF5aW1hZ2U='))
   if (response.status !== 200) await drive(first, events, 'cleanup replay image')
 }

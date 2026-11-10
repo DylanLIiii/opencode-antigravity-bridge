@@ -133,8 +133,8 @@ Refreshing the model catalog re-scans the accounts directory.
   session, prior tool calls and results use `<tool_record>` boundaries with
   nearby reminders to use the records as context without copying them into the
   visible answer. Text and attributes are XML-escaped; full arguments and result
-  bodies are retained by default, including tool references and inline images
-  in their original order. There is no automatic payload truncation.
+  bodies are retained by default when they fit the input budgets below, including
+  tool references and inline images in their original order.
   If a model still echoes old results, set `AGY_BRIDGE_STRIP_TOOL_RECORDS=1` in
   the bridge process environment. This omits historical result bodies (including
   their images and tool references), keeping call arguments, IDs, error status,
@@ -147,17 +147,29 @@ Refreshing the model catalog re-scans the accounts directory.
   `session/cancel`; the session stays alive and the partial answer the client
   saw becomes part of the expected history.
 - **User steering during tools.** With compatible history, instructions and
-  working directory, a complete batch of live tool results is delivered once.
-  The bridge cancels and settles the old ACP prompt, then submits this batch's
-  real results with the queued user instruction in the same AGY session. This
-  preserves its context and internal compaction state, and keeps the result
-  available when AGY stores a cancellation for the old tool call. Each tool
-  executes once. Deferred tool delivery and changed histories use replay.
+  working directory, AGY 1.5.0+ receives another `session/prompt` in the running
+  session, using its documented native steering. Live results go only through
+  MCP; undelivered deferred results accompany the new instruction. Both ACP
+  requests must settle before the client response ends. Each tool executes once.
+  Older agents, model changes and explicit concurrent-prompt rejections fall
+  back to cancel → settle → prompt in the same session. Ended or cancelling
+  compatible turns also continue in that session. Authentication and transport
+  failures do not automatically resend an uncertain prompt. Replay is reserved
+  for incompatible context or unavailable sessions. History comparison normalizes
+  representation differences such as message chunks and tool IDs; a text similarity
+  percentage cannot override changed tool results or a different history branch.
 - **Bounded recovery input.** Submitted text plus session instructions has a
   1 MiB UTF-8 budget, configured by the positive byte count
-  `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`. Image base64 travels separately. Existing
+  `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`. Separately, each ACP user prompt is limited
+  to **180,000 UTF-8 text bytes**, with an additional 1,024-byte allowance charged
+  per image for AGY's labels and URIs. AGY 1.5.4 was observed truncating rendered
+  user input at 192,000 bytes, including the current instruction at the end of a
+  replay; the lower ceiling leaves room for its wrappers and timestamps. Raising
+  the total budget cannot raise this upstream limit. Session instructions
+  installed through ACP metadata count toward the total budget, but not the user
+  prompt ceiling. Image base64 travels separately. Existing
   session history can exceed this per-submission budget during continuation or
-  resume. A replay over budget first omits historical tool-result bodies (calls
+  resume. A replay over either limit first omits historical tool-result bodies (calls
   and the current turn stay complete). If it is still too large, the bridge
   returns HTTP 400 `context_length_exceeded` before
   replacing the existing session. The client must compact its history and submit
@@ -165,7 +177,7 @@ Refreshing the model catalog re-scans the accounts directory.
   depends on the client's error handling. When the history already carries a
   Claude Code compaction summary, the error uses code `prompt_budget_exceeded`
   without the "prompt is too long" wording, so the client does not compact in a
-  loop. The bridge leaves summarization to the
+  loop; shorten that summary or the current input to proceed. The bridge leaves summarization to the
   client. Bounded, content-free events record session IDs, replay reasons and
   prompt sizes; `AGY_BRIDGE_EVENTS=0` disables them.
 - **Upstream errors without retry amplification.** agy reports API failures as
@@ -422,11 +434,10 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   history, and completed branches have separate snapshots for resume after
   eviction or restart. Ambiguous history matches are not guessed.
 - **Queued user text beside a live `tool_result`**, before or after the result
-  in the same message, starts a new prompt containing the current result batch
-  and user instruction in the same session, after delivering live results and
-  cancelling and settling the old prompt. Deferred results and incompatible
-  histories recover through budget-checked replay. Incomplete batches are
-  rejected before closing the live owner.
+  in the same message, uses native steering when supported, including complete
+  deferred results. The next choice is cancel/settle/prompt in the same session.
+  Incompatible histories recover through budget-checked replay. Incomplete
+  batches are rejected before closing the live owner.
   If a sibling was already reclaimed, its complete late results plus user
   steering can replay while the main branch still waits on its own tools.
   Unmatched results without steering retain the conservative 409 response.
@@ -542,7 +553,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
-| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | positive UTF-8 text budget for each submitted prompt or tool-result batch plus session instructions; an oversized replay first omits historical tool-result bodies, then returns `context_length_exceeded` (`prompt_budget_exceeded` for an already compacted history) |
+| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | total UTF-8 text budget per submission plus session instructions; does not override the separate 180,000-byte ACP user-input ceiling (including image-label reserves); oversized replay first omits historical tool-result bodies, then returns `context_length_exceeded` (`prompt_budget_exceeded` for an already compacted history) |
 | `AGY_BRIDGE_CONTEXT_WINDOW` | 256000 | client context declaration, integer 1–1048576; GPT-OSS capped at 131072; requires separately verified upstream capacity |
 | `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session, tool and model usage diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |

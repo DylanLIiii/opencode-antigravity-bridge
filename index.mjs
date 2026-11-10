@@ -2511,8 +2511,11 @@ function lastAssistantCalls(messages) {
     ? message.content.filter(block => block.type === "tool_use") : [])
 }
 
-function matchToolResults(body, blocks) {
-  const direct = blocks.map(block => ({ block, match: toolCalls.get(block.tool_use_id) }))
+function matchToolResults(body, blocks, accountName = null) {
+  // A tool result only ever belongs to the account that issued the call; a
+  // continuation addressed to another account must not match it.
+  const own = (match) => match && (match.proc.account ?? null) === (accountName ?? null) ? match : undefined
+  const direct = blocks.map(block => ({ block, match: own(toolCalls.get(block.tool_use_id)) }))
   if (direct.every(item => item.match)) return direct
   const { history } = trailingMessages(body)
   const calls = lastAssistantCalls(history)
@@ -2521,11 +2524,12 @@ function matchToolResults(body, blocks) {
     blocks.some(block => !byID.has(block.tool_use_id))) return direct
   let found = null
   for (const proc of allProcs) {
+    if ((proc.account ?? null) !== (accountName ?? null)) continue
     if (!proc.turn || proc.turn.finalized || !proc.matchesHistory(history)) continue
     const shown = lastAssistantCalls(proc.expectedMessages)
     if (shown.length !== calls.length || shown.some((call, index) =>
       call.name !== calls[index].name || stableJSON(call.input ?? {}) !== stableJSON(calls[index].input ?? {}))) continue
-    const mapped = blocks.map(block => ({ block, match: toolCalls.get(shown[byID.get(block.tool_use_id)].id) }))
+    const mapped = blocks.map(block => ({ block, match: own(toolCalls.get(shown[byID.get(block.tool_use_id)].id)) }))
     if (mapped.some((item, index) => direct[index].match && item.match !== direct[index].match)) continue
     if (mapped.some(item => !item.match) || !mapped.some(item => !item.match.call.mcpResponded || (item.match.call.deferred && !item.match.call.result))) continue
     if (found) throw new BusyError("agy bridge: renamed tool IDs match more than one pending conversation")
@@ -4115,6 +4119,7 @@ export const AntigravityBridgePlugin = async () => {
                   if (block?.type !== "tool_use") continue
                   const entry = toolCalls.get(block.id)
                   if (!entry || entry.call.clientSeen) continue
+                  if ((entry.proc.account ?? null) !== (account.name ?? null)) continue
                   entry.call.clientSeen = true
                   entry.turn.touchClient()
                 }
@@ -4143,7 +4148,7 @@ export const AntigravityBridgePlugin = async () => {
                 return beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched)
               }
               if (resultBlocks.length) {
-                const matches = matchToolResults(body, resultBlocks)
+                const matches = matchToolResults(body, resultBlocks, account.name)
                 const found = matches.filter((item) => item.match)
                 if (found.length) {
                   if (found.length !== matches.length) {

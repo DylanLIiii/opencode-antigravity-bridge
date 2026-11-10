@@ -12,8 +12,10 @@ export const PROVIDER_ID = "antigravity-bridge"
 export const DEFAULT_ACCOUNT = { name: null, dir: null, key: "default" }
 
 export function accountsRootDir(env = process.env) {
-  return env.AGY_BRIDGE_ACCOUNTS_DIR ||
-    path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "magpie-agy-bridge", "accounts")
+  // Always absolute: agy child processes launch from a temporary workspace, so a
+  // relative root would resolve differently at discovery and at request time.
+  return path.resolve(env.AGY_BRIDGE_ACCOUNTS_DIR ||
+    path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "magpie-agy-bridge", "accounts"))
 }
 
 let cache = null
@@ -30,7 +32,7 @@ export function listAccounts(env = process.env, { refresh = false } = {}) {
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith(".")) continue
       if (entry.name === PROVIDER_ID) continue // would collide with the provider prefix
-      const dir = path.join(root, entry.name)
+      const dir = path.resolve(root, entry.name)
       const token = path.join(dir, "antigravity-cli", "antigravity-oauth-token")
       if (!fs.existsSync(token)) continue
       accounts.push({ name: entry.name, dir, key: `dir:${dir}` })

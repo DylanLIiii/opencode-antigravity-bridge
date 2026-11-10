@@ -3304,6 +3304,37 @@ for (const compacted of [true, false]) {
     usageCalls.filter(call => call.args.includes(`--gemini_dir=${path.join(accountsDir, "personal")}`)).length === 1,
     JSON.stringify(usageCalls.map(call => call.args)))
 
+  // P1: a tool result addressed to another account must never reach the issuing
+  // account's process; the issuing account keeps its pending call.
+  const toolOpening = { model: "work/gemini-test", metadata: { user_id: "multi-account-tools" }, tools: [echoTool],
+    messages: [{ role: "user", content: "TOOL cross-account pending opening" }] }
+  const toolEvents = (await readSSE(await fetchMulti(toolOpening))).events
+  const pendingCall = toolCalls(toolEvents)[0]
+  check("work account leaves a tool call pending", !!pendingCall, JSON.stringify(toolCalls(toolEvents)))
+  const workOwner = inits().at(-1)
+  const withResult = continuation(toolOpening, toolEvents, "cross-account result")
+  const crossResponse = await fetchMulti({ ...withResult, model: "personal/gemini-test" })
+  const crossStatus = crossResponse.status
+  await crossResponse.text()
+  check("cross-account continuation never completes on the work process",
+    crossStatus === 409 || (crossStatus === 200 && inits().at(-1).geminiDir === path.join(accountsDir, "personal")),
+    `status=${crossStatus} lastInit=${inits().at(-1)?.geminiDir}`)
+  check("work process still owns the pending call",
+    !logs().some(event => event.type === "mcpResult" && event.convId === workOwner.convId))
+  const workDone = (await readSSE(await fetchMulti(withResult))).events
+  check("work account completes with its own result exactly once", stopOf(workDone) === "end_turn" &&
+    logs().filter(event => event.type === "mcpResult" && event.convId === workOwner.convId).length === 1)
+
+  // P2: a relative AGY_BRIDGE_ACCOUNTS_DIR must resolve to the same absolute dir
+  // at request time (agy children launch from a temporary workspace).
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = path.relative(process.cwd(), accountsDir)
+  await multiPlugin.provider.models() // refresh re-scans accounts
+  const relEvents = (await readSSE(await fetchMulti({ model: "work/gemini-test", metadata: { user_id: "multi-account-relative" },
+    messages: [{ role: "user", content: "relative accounts dir probe" }] }))).events
+  check("relative accounts dir resolves absolutely for agy children",
+    stopOf(relEvents) === "end_turn" && inits().at(-1)?.geminiDir === path.join(accountsDir, "work"),
+    `${stopOf(relEvents)} ${inits().at(-1)?.geminiDir}`)
+
   delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
   fs.rmSync(accountsDir, { recursive: true, force: true })
 }

@@ -1,8 +1,8 @@
 // Per-model-call usage from agy's local conversation store.
 //
-// ACP reports usage once, accumulated over a whole session/prompt, and agy
-// 1.5.x sends no usage_update notifications. agy does record each model call:
-// <conversations>/<sessionId>.db, table `steps`, one row per call with
+// ACP reports usage once, accumulated over a whole session/prompt. Prefer
+// `gen_metadata`, written when generation ends, before client tools return.
+// Older stores record each completed model call in table `steps`, with
 // step_type 15 and status 3 (done), the counts in Protobuf field 9 of
 // `metadata` (2 uncached input, 3 output, 4 cache write, 5 cache read,
 // 9 thinking). Summed over a prompt they equal the ACP total exactly.
@@ -98,6 +98,19 @@ function walk(buf, fn) {
 
 const count = (value) => Number.isSafeInteger(value) && value > 0 ? value : 0
 
+function decodeUsage(buf) {
+  const usage = { input: 0, output: 0, write: 0, read: 0, thinking: 0 }
+  const ok = walk(buf, (field, wire, n) => {
+    if (wire !== 0) return
+    if (field === 2) usage.input = count(n)
+    else if (field === 3) usage.output = count(n)
+    else if (field === 4) usage.write = count(n)
+    else if (field === 5) usage.read = count(n)
+    else if (field === 9) usage.thinking = count(n)
+  })
+  return ok ? usage : null
+}
+
 export function decodeStepUsage(metadata) {
   const buf = metadata instanceof Uint8Array ? metadata
     : ArrayBuffer.isView(metadata) ? new Uint8Array(metadata.buffer, metadata.byteOffset, metadata.byteLength)
@@ -106,18 +119,37 @@ export function decodeStepUsage(metadata) {
   let stats = null
   const ok = walk(buf, (field, wire, value) => {
     if (field !== 9 || wire !== 2) return
-    const usage = { input: 0, output: 0, write: 0, read: 0, thinking: 0 }
-    if (!walk(value, (sub, subWire, n) => {
-      if (subWire !== 0) return
-      if (sub === 2) usage.input = count(n)
-      else if (sub === 3) usage.output = count(n)
-      else if (sub === 4) usage.write = count(n)
-      else if (sub === 5) usage.read = count(n)
-      else if (sub === 9) usage.thinking = count(n)
-    })) return
-    stats = usage
+    stats = decodeUsage(value)
   })
   return ok ? stats : null
+}
+
+// gen_metadata.data contains the same usage message at field 1 -> 4.
+// Its pre-send local context estimate is separate, at 1 -> 9 -> 10 -> 1.
+// A context estimate alone is not a completed, billed model call.
+export function decodeGenerationUsage(data) {
+  if (!(data instanceof Uint8Array)) return null
+  let stats = null
+  let context = null
+  let valid = true
+  const ok = walk(data, (field, wire, chat) => {
+    if (field !== 1 || wire !== 2) return
+    valid = walk(chat, (sub, subWire, value) => {
+      if (subWire !== 2) return
+      if (sub === 4) {
+        stats = decodeUsage(value)
+        if (!stats) valid = false
+      } else if (sub === 9) {
+        if (!walk(value, (key, kind, start) => {
+          if (key !== 10 || kind !== 2) return
+          if (!walk(start, (k, w, n) => {
+            if (k === 1 && w === 0) context = count(n)
+          })) valid = false
+        })) valid = false
+      }
+    }) && valid
+  })
+  return ok && valid && stats ? { ...stats, ...(context !== null ? { context } : {}) } : null
 }
 
 function query(file, sql, ...args) {
@@ -160,4 +192,42 @@ export function modelStepsAfter(file, afterIdx) {
     steps.push({ idx, ...usage })
   }
   return steps
+}
+
+// Pin a turn to one table. Reading both tables for a turn would bill the same
+// generation twice. A new store is discovered after its first generation.
+export function modelUsageCursor(file) {
+  if (!file) return null
+  if (!fs.existsSync(file)) return { source: null, idx: -1, generationIdx: -1 }
+  const rows = query(file, "SELECT COALESCE(MAX(idx), -1) AS idx FROM gen_metadata")
+  const generationIdx = Number(rows?.[0]?.idx)
+  const step = lastModelStep(file)
+  if (Number.isSafeInteger(generationIdx)) {
+    return step === null ? { source: "gen_metadata", idx: generationIdx }
+      : { source: null, idx: step, generationIdx }
+  }
+  return step === null ? null : { source: "steps", idx: step }
+}
+
+export function modelUsageAfter(file, cursor) {
+  if (!cursor) return null
+  if (cursor.source !== "steps") {
+    const after = cursor.source === "gen_metadata" ? cursor.idx : cursor.generationIdx
+    const rows = query(file, "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx", after)
+    if (rows) {
+      const steps = []
+      for (const row of rows) {
+        const idx = Number(row.idx)
+        const usage = decodeGenerationUsage(row.data)
+        if (!Number.isSafeInteger(idx)) return null
+        // Failed generations and pre-send estimates carry no billing counters.
+        if (!usage || !(usage.input + usage.read + usage.write + usage.output + usage.thinking)) continue
+        steps.push({ idx, ...usage })
+      }
+      if (steps.length || cursor.source === "gen_metadata") return { source: "gen_metadata", steps }
+    }
+    if (cursor.source === "gen_metadata") return null
+  }
+  const steps = modelStepsAfter(file, cursor.idx)
+  return steps === null ? null : { source: "steps", steps }
 }

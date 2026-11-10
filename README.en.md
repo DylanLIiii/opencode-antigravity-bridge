@@ -163,11 +163,15 @@ magpie plugin add ./opencode-antigravity-bridge
   which can span several responses (tool round-trips), and agy sends no
   `usage_update`. agy does record every model call in its conversation store
   (`~/.gemini/antigravity-cli/conversations/<sessionId>.db`); each response
-  reports the calls it covered from there: the latest call's uncached input,
+  prefers `gen_metadata`, available when generation ends before client tools
+  return. Older stores and unused generation tables use completed `steps`.
+  Each turn pins one source to avoid duplicate billing, and final input is
+  reconciled against ACP totals. Each response reports the calls it covered
+  from there, including the latest call's uncached input,
   `cache_read_input_tokens` and cache writes, and the calls' output with
-  thought tokens itemized in `output_tokens_details.thinking_tokens`. Without
-  SQLite support (Node < 22.5, or Node 22/23 without `--experimental-sqlite`)
-  or a readable store, responses fall back to an estimate calibrated on ACP's
+  thought tokens itemized in `output_tokens_details.thinking_tokens`. When
+  SQLite support or complete store records are unavailable, responses fall
+  back to an estimate calibrated on ACP's
   totals. Set `AGY_BRIDGE_STEP_USAGE=0` to disable store reads entirely.
 - **Long answers continue.** A prompt that stops on `max_tokens` is continued in
   the same session and response, up to 3 times (`AGY_BRIDGE_MAX_CONTINUATIONS`).
@@ -473,6 +477,37 @@ completed. A failure before submission releases the claim for safe retry.
 Heartbeats and medium effort do not repair Google/agy upstream stalls, guarantee
 time to first model token, or override a client's total request deadline.
 
+### Context windows and compaction
+
+Models declare a conservative `limit.context` of 256,000 tokens to the host,
+which clients can use for compaction and context displays. AGY's checkpoint
+threshold, per-step input limit and the model's physical window also constrain
+usable context. The locally inspected AGY 1.5.3 ACP session exposes model,
+thought level and mode selectors, with no context selector.
+
+After independently verifying a larger usable window for your CLI, model and
+account, set `AGY_BRIDGE_CONTEXT_WINDOW=512000` in the bridge's environment,
+restart the plugin and refresh the client's model catalog. Valid declarations
+are integers from 1 to 1,048,576. Invalid values use the default policy.
+GPT-OSS remains capped at 131,072 tokens. This setting changes the client-facing
+metadata. Usable capacity still depends on AGY. The 128 KiB per-submission text
+budget is configured separately with `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`.
+
+Content-free `agy_bridge_model_usage` events identify the billing source
+(`gen_metadata` or `steps`) and record actual input, cache reads/writes, output,
+thinking and `context_tokens`. Generation records can also supply
+`local_context_estimate`, AGY's pre-send estimate. Compare it with billed input
+and session lifecycle events when investigating context changes. Normal
+estimation differences are possible. Events are bounded to 30 per minute and
+can be disabled with `AGY_BRIDGE_EVENTS=0`.
+
+The community context investigation, ACP integration and generation decoder
+informed this change. Reported quota multipliers for larger windows are
+community observations and depend on the current account and CLI.
+[Context investigation](https://linux.do/t/topic/3117832) ·
+[ACP integration](https://linux.do/t/topic/3133812) ·
+[Reference decoder](https://github.com/lili-luo/dsh-plugin-bundle/blob/457b9395e9bd8a1aefae2b83cda7e5e9e08af783/dsh-llm-antigravity-acp/src/usage-db.ts)
+
 ### Environment variables
 
 | Variable | Default | Effect |
@@ -484,7 +519,8 @@ time to first model token, or override a client's total request deadline.
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
 | `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 131072 | positive UTF-8 text budget for each submitted prompt or tool-result batch plus session instructions; oversized input returns `context_length_exceeded` |
-| `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session/tool lifecycle diagnostics; each event category is limited to 30 entries per minute |
+| `AGY_BRIDGE_CONTEXT_WINDOW` | 256000 | client context declaration, integer 1–1048576; GPT-OSS capped at 131072; requires separately verified upstream capacity |
+| `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session, tool and model usage diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
@@ -512,9 +548,10 @@ npm pack --dry-run
 The smoke test runs the plugin against a fake agy that speaks ACP on stdio and
 reaches the client tools the way the real one does, by running `nc` from PATH,
 so the bridge's shim, the real stdio MCP helper and the control channel are all
-exercised. The current suite has 330 smoke checks and 67 focused Node tests.
-Historical Bun results are documented below; the current expanded suite has not
-been rerun on Bun. These tests do not substitute for Windows end-to-end
+exercised. Node 22.17 passes 463 smoke checks and 95 focused tests. Bun 1.3.9
+passes the same 463 smoke checks and the 8 focused usage/output-filter tests.
+Real AGY 1.5.3 checks also verify generation billing, image/tool handling,
+resume, steering and oversized-replay recovery. These tests do not substitute for Windows end-to-end
 validation. Together they cover the minimal agent, the allowlisted ACP identity,
 scoped prompt guarding, submitted-prompt dedupe, session
 instructions, streaming, thought

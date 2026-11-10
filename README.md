@@ -29,6 +29,8 @@ Gemini、Claude、GPT-OSS 全系可用。
 - **会话不丢**：每轮结束自动记录会话状态（只存哈希，不落明文），
   重启 magpie 或插件后上下文原样续上。
 - **额度可见**：在 Magpie 的 Usage 页面直接查看 Antigravity 订阅额度。
+- **上下文与用量可追踪**：向客户端声明上下文窗口，并在工具等待前读取生成级账单，
+  日志分别记录实际输入、缓存与 AGY 本地上下文估算。
 - **安全隔离**：不读取你的全局 MCP 配置和凭据；agy 的权限请求一律拒绝，
   真正的操作都发生在客户端侧。
 - **省 token 实测**：见下。
@@ -131,6 +133,32 @@ magpie quota refresh antigravity-bridge --json
 客户端声明的 `ToolSearch` 若缺少 schema，会补齐 `query` / `max_results`；搜索后
 新增的工具会先刷新目录，再继续同一回合。插件无法发现客户端未发送定义的工具。
 
+## 上下文窗口与压缩
+
+插件默认向宿主返回 `limit.context = 256000`，供客户端安排压缩和显示上下文占用。
+这是保守的客户端策略值。AGY 自身的 checkpoint 阈值、单步输入上限和模型物理窗口
+也会影响实际可用上下文。本机 AGY 1.5.3 的 ACP 配置只提供模型、思考等级和模式，
+尚未暴露上下文档位。
+
+如果已独立确认当前 CLI、模型和账号能使用更大的窗口，可在 Bridge 进程环境中设置
+`AGY_BRIDGE_CONTEXT_WINDOW=512000`，重启插件并刷新客户端模型目录。
+该变量接受 1 至 1,048,576 的整数，非法值回到默认策略。
+GPT-OSS 的声明始终取配置值与 131,072 中的较小值。
+窗口声明只改变客户端收到的元数据，扩容效果仍取决于 AGY 本身。
+每次提交的 128 KiB 文本预算另由 `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` 控制。
+
+生成级用量日志 `agy_bridge_model_usage` 包含账单来源 `gen_metadata` 或 `steps`、
+实际输入、缓存读写、输出、思考量及 `context_tokens`。生成记录提供的
+`local_context_estimate` 是发送前的本地估算，可与实际输入对照排查上下文变化。
+两者可能存在正常差异，需要结合会话重放和用户操作判断原因。
+日志只记录数值和会话标识，每分钟最多 30 条，`AGY_BRIDGE_EVENTS=0` 可关闭。
+
+本次改进参考了社区的上下文调研和 ACP 插件，以及其生成记录解码方式。
+512K、900K 的额度倍率来自社区经验，适用情况需要以当前账号实测为准。
+[上下文调研](https://linux.do/t/topic/3117832) ·
+[ACP 接入方案](https://linux.do/t/topic/3133812) ·
+[参考实现](https://github.com/lili-luo/dsh-plugin-bundle/blob/457b9395e9bd8a1aefae2b83cda7e5e9e08af783/dsh-llm-antigravity-acp/src/usage-db.ts)
+
 ## FAQ / 注意事项
 
 - **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和二进制/PDF 文档；纯文本 document 和 search_result 可用。
@@ -162,9 +190,11 @@ magpie quota refresh antigravity-bridge --json
   409 `prompt_outcome_unknown`；进程内有界去重保留默认至多 6 小时，不跨重启。
   心跳不能绕过客户端总时限。详细行为及清理边界见英文说明。
 - **用量**：ACP 一轮只给一次累计值、agy 不推 `usage_update`；插件从 agy 本地会话库
-  （`~/.gemini/antigravity-cli/conversations/<sessionId>.db`）读每次模型调用的真实用量，
-  每个响应报自己覆盖的调用（含缓存读）。运行时没有 SQLite（Node < 22.5，Node 22/23 需
-  `--experimental-sqlite`）或读不到库时回落估算；`AGY_BRIDGE_STEP_USAGE=0` 可完全关闭会话库读取。
+  （`~/.gemini/antigravity-cli/conversations/<sessionId>.db`）优先读 `gen_metadata`，
+  生成结束即能读取，工具等待期间也可得到真实用量。旧版或未使用该表的会话使用完成的
+  `steps` 记录，同一回合固定一个来源。每个响应报自己覆盖的调用（含缓存读），最终与
+  ACP 累计输入核对。运行时无 `node:sqlite` / `bun:sqlite` 或读不到完整记录时回落估算；
+  `AGY_BRIDGE_STEP_USAGE=0` 可完全关闭会话库读取。
 - **长输出续写**：撞 `max_tokens` 时在同一会话、同一响应里自动续写，最多 3 次
   （`AGY_BRIDGE_MAX_CONTINUATIONS`，`0` 关闭）；agy 自己插入的"输出被截断"提示不会出现在正文里。
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0
+
+- Declare a conservative 256,000-token client context window, configurable with
+  `AGY_BRIDGE_CONTEXT_WINDOW`, so hosts can plan compaction. Keep GPT-OSS within
+  its 131,072-token physical window. Window declarations are independent of the
+  per-submission text budget and require a separately verified upstream capacity.
+- Prefer generation-time `gen_metadata` billing before client tools finish,
+  retaining completed `steps` for older or unused-generation stores. Pin each
+  turn to one source to avoid duplicate accounting, and reconcile final input
+  with ACP totals before reporting measured usage.
+- Emit bounded, content-free model usage diagnostics with actual input, cache,
+  output, thinking and the separate local context estimate when available.
+
 ## 0.1.3
 
 - Keep the AGY session when user steering accompanies a complete batch of live

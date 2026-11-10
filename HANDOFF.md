@@ -492,6 +492,24 @@ Chat 风格。现在 provider 和模型都补全 OpenCode 的 `api: {id, url, np
 [`host.js`](https://github.com/yetone/magpie/blob/v0.1.1356/internal/plugin/host.js)
 和 [`plugins.go`](https://github.com/yetone/magpie/blob/v0.1.1356/internal/provider/plugins.go)。
 
+## 2026-11-10：多账号支持（0.3.0）
+
+- 调研结论：agy 1.5.3 的 ACP `authenticate` 是登录方式选择而非账号切换（会改全局
+  登录态，1.4.12 实测还会报 `User location is not supported`），`AGY_ACCOUNT` env
+  只影响 plugin 沙盒 CLI 子命令（实测 `AGY_ACCOUNT=bogus` 下 ACP prompt 照常完成）。
+  真正可用的是 `--gemini_dir=<dir>`：实测带 token 的目录正常工作、空目录报未登录
+  且不回退全局；keyring/ADC 登录态整机全局、无法按目录隔离，因此命名账号要求目录内
+  有文件 token（`antigravity-cli/antigravity-oauth-token`）。
+- 实现：`accounts.mjs` 扫描 `~/.config/magpie-agy-bridge/accounts/<name>/`
+  （`AGY_BRIDGE_ACCOUNTS_DIR` 可覆盖），默认账号始终保留。模型目录中每个命名账号
+  以 `<name>/<model-id>` 复出、显示名加 `[name]`；请求按前缀路由，convKey 加
+  `account:<name>::` 前缀，进程池/快照/去重/会话库（`conversations`）全部按账号隔离；
+  `Proc.start()` 给命名账号传 `--gemini_dir`；老 agy 不支持该 flag 时扫描阶段探测
+  跳过。`fetchUsage` 支持传入已有账号目录（不建临时目录、不回退、不删除），
+  `createUsageReader` 聚合所有账号的 quota 窗口并加 `[name]` 标签。
+- 验证：95 单元测试 + 472 smoke checks 全过（含多账号 8 项新 checks）；设计与限制见
+  `docs/plans/2026-11-10-multi-account.md`。
+
 ## 当前架构
 
 ### 原生工具闭环
@@ -527,7 +545,9 @@ Chat 风格。现在 provider 和模型都补全 OpenCode 的 `api: {id, url, np
 ## 关键文件
 
 - `index.mjs`：插件入口、进程池、turn 状态、控制通道、Anthropic SSE、
-  Anthropic 内容转换、模型发现及思考等级聚合与路由。
+  Anthropic 内容转换、模型发现及思考等级聚合与路由、多账号路由与隔离。
+- `accounts.mjs`：命名账号扫描（`AGY_BRIDGE_ACCOUNTS_DIR`）与模型 ID
+  `<账号>/<模型>` 前缀解析。
 - `mcp-server.mjs`：无外部依赖的 stdio JSON-RPC helper，支持 modern/legacy
   MCP、并发 pending 调用、取消和断线处理。
 - `test-smoke.mjs`：fake agy + 真实 MCP helper 的端到端烟雾测试。

@@ -8,6 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
+import { DEFAULT_ACCOUNT, invalidateAccounts, listAccounts, splitModelAccount } from "./accounts.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
@@ -165,8 +166,8 @@ function execOnce(file, args, opts = {}) {
   })
 }
 
-async function listAgyModels(agyPath) {
-  const { err, stdout, code } = await execOnce(agyPath, ["models"], { timeoutMs: 15_000 })
+async function listAgyModels(agyPath, extraArgs = []) {
+  const { err, stdout, code } = await execOnce(agyPath, [...extraArgs, "models"], { timeoutMs: 15_000 })
   if (err || code !== 0) return FALLBACK_MODELS
   const out = []
   for (const raw of stdout.split("\n")) {
@@ -183,7 +184,27 @@ async function listAgyModels(agyPath) {
 }
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
-let cachedModelCatalog
+const catalogCache = new Map()
+
+// Named accounts live in AGY_BRIDGE_ACCOUNTS_DIR (default
+// ~/.config/magpie-agy-bridge/accounts/<name>/) as full Gemini dirs. Each needs
+// a file-based token and an agy new enough to accept --gemini_dir; both are
+// probed once per agy and cached. The default account always remains available.
+let accountsCache = null
+
+async function getAccounts(agy, { refresh = false } = {}) {
+  if (accountsCache && !refresh) return accountsCache
+  invalidateAccounts()
+  const accounts = listAccounts()
+  const usable = [DEFAULT_ACCOUNT]
+  await Promise.all(accounts.slice(1).map(async account => {
+    if (!agy) return
+    const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "--version"], { timeoutMs: 3_000 })
+    if (!probe.err && probe.code === 0) usable.push(account)
+  }))
+  accountsCache = usable
+  return usable
+}
 
 function modelFamilyId(model) {
   if (!model.effort) return ""
@@ -235,10 +256,12 @@ function buildModelCatalog(list) {
   return { models, routes, rawIds }
 }
 
-async function loadModelCatalog(agyPath, refresh = false) {
-  if (!refresh && cachedModelCatalog?.agyPath === agyPath) return cachedModelCatalog.catalog
-  const catalog = buildModelCatalog(await listAgyModels(agyPath))
-  cachedModelCatalog = { agyPath, catalog }
+async function loadModelCatalog(agyPath, refresh = false, account = DEFAULT_ACCOUNT) {
+  const key = `${agyPath}|${account.key}`
+  if (!refresh && catalogCache.has(key)) return catalogCache.get(key)
+  const extraArgs = account.dir ? [`--gemini_dir=${account.dir}`] : []
+  const catalog = buildModelCatalog(await listAgyModels(agyPath, extraArgs))
+  catalogCache.set(key, catalog)
   return catalog
 }
 
@@ -880,6 +903,8 @@ class Proc {
   constructor(agyPath, convKey, opts) {
     this.agyPath = agyPath
     this.convKey = convKey
+    this.account = opts.account || null
+    this.geminiDir = opts.geminiDir || null
     this.model = opts.model
     this.selection = opts.selection
     this.tools = opts.tools
@@ -944,6 +969,8 @@ class Proc {
       "--log-file", this.logPath,
       "--ide-mcp-port", String(controlServer.address().port),
     ]
+    // A named account pins this process to its own Gemini dir (own OAuth token).
+    if (this.geminiDir) args.push(`--gemini_dir=${this.geminiDir}`)
     if (this.workDir) args.push("--add-dir", this.workDir)
     try {
       const childEnv = { ...process.env }
@@ -1298,7 +1325,11 @@ class Proc {
       turn.arm()
       if (model) await this.#setModel(model, selection)
       const stepUsageEnabled = !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
-      turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId) : null
+      // A named account keeps its conversation store inside its own Gemini dir.
+      const stepsEnv = this.geminiDir
+        ? { AGY_BRIDGE_CONVERSATIONS_DIR: path.join(this.geminiDir, "antigravity-cli", "conversations") }
+        : process.env
+      turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId, stepsEnv) : null
       turn.stepCursor = modelUsageCursor(turn.stepsFile)
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
@@ -2183,6 +2214,7 @@ function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
   const row = {
     event, host_epoch: HOST_EPOCH, ts: now,
     conv: digest(proc.convKey).slice(0, 12), session_id: proc.sessionId, turn_id: turn?.turnId,
+    ...(proc.account ? { account: proc.account } : {}),
     action, reason, attached: turn?.attached, done: turn?.done, dead: proc.dead,
     pending: turn?.calls.filter((call) => !call.result).length,
     client_idle_ms: turn ? Math.max(0, now - (turn.clientProgressAt ?? turn.lastProgressAt)) : undefined,
@@ -3975,7 +4007,7 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
 }
 
 export const AntigravityBridgePlugin = async () => {
-  const readUsage = createUsageReader(findAgy)
+  const readUsage = createUsageReader(findAgy, { resolveAccounts: agy => getAccounts(agy) })
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -4052,17 +4084,21 @@ export const AntigravityBridgePlugin = async () => {
             body = guarded.body
             const promptGuardMatched = guarded.diagnostics.length > 0
             const rawModel = body.model || ""
-            const requestedModel = (rawModel.includes("/") ? rawModel.split("/").pop() : rawModel).replace(/\[1m\]$/i, "")
+            const accounts = await getAccounts(agy)
+            const { account: accountName, model: modelId } = splitModelAccount(rawModel, accounts)
+            const account = accounts.find(item => item.name === accountName) || DEFAULT_ACCOUNT
+            const requestedModel = modelId.replace(/\[1m\]$/i, "")
             const layout = canonicalBody(body) === body ? "hoisted" : "inline"
             body = { ...canonicalBody(body), model: requestedModel }
             let model
             try {
-              model = resolveAgyModel(await loadModelCatalog(agy), requestedModel, body)
+              model = resolveAgyModel(await loadModelCatalog(agy, false, account), requestedModel, body)
             } catch (error) {
               return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
             }
             const selection = { model: requestedModel, effort: requestedEffort(body) }
-            const convKey = conversationKey(body)
+            // Accounts never share conversations, pooled processes or dedup state.
+            const convKey = account.name ? `account:${account.name}::${conversationKey(body)}` : conversationKey(body)
             const trailing = trailingMessages(body)
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
@@ -4085,6 +4121,7 @@ export const AntigravityBridgePlugin = async () => {
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false,
+                account: account.name, geminiDir: account.dir,
                 validateReplay: () => validatePromptBudget(mergePromptParts(
                   renderInitialPromptParts(body, callerWorkDir, true), outputFormatReminder(body)), instructions) }
               const claim = () => {
@@ -4239,26 +4276,33 @@ export const AntigravityBridgePlugin = async () => {
       npm: NPM_ANTHROPIC,
       models: async () => {
         const agy = findAgy()
-        const catalog = agy ? await loadModelCatalog(agy, true) : buildModelCatalog(FALLBACK_MODELS)
+        // Refreshing the model catalog also re-discovers named accounts.
+        const accounts = await getAccounts(agy, { refresh: true })
         const out = {}
-        for (const model of catalog.models) {
-          const imageModel = /^(?:gemini-|claude-)/.test(model.id)
-          out[model.id] = {
-            id: model.id,
-            name: model.name,
-            npm: NPM_ANTHROPIC,
-            api: { id: model.id, url: "agy://local", npm: NPM_ANTHROPIC },
-            limit: { context: contextWindow(model.id) },
-            capabilities: {
-              ...(imageModel ? { attachment: true, input: { text: true, image: true }, output: { text: true } } : {}),
-              ...(model.variants ? { reasoning: true } : {}),
-            },
-            ...(model.variants ? {
-              reasoning: true,
-              variants: Object.fromEntries(model.variants.map(effort => [effort, {}])),
-            } : {}),
+        await Promise.all(accounts.map(async account => {
+          const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)
+          for (const model of catalog.models) {
+            // Named accounts expose the same catalog under "<account>/<model>".
+            const id = account.name ? `${account.name}/${model.id}` : model.id
+            const name = account.name ? `[${account.name}] ${model.name}` : model.name
+            const imageModel = /^(?:gemini-|claude-)/.test(model.id)
+            out[id] = {
+              id,
+              name,
+              npm: NPM_ANTHROPIC,
+              api: { id, url: "agy://local", npm: NPM_ANTHROPIC },
+              limit: { context: contextWindow(model.id) },
+              capabilities: {
+                ...(imageModel ? { attachment: true, input: { text: true, image: true }, output: { text: true } } : {}),
+                ...(model.variants ? { reasoning: true } : {}),
+              },
+              ...(model.variants ? {
+                reasoning: true,
+                variants: Object.fromEntries(model.variants.map(effort => [effort, {}])),
+              } : {}),
+            }
           }
-        }
+        }))
         return out
       },
     },

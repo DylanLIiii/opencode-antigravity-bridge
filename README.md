@@ -97,6 +97,21 @@ Google Code Assist 后端
 **切换模型 / 思考等级**：在 magpie 的模型选择器中切换即可，会话不中断，
 历史保留。
 
+**多账号**：在 `~/.config/magpie-agy-bridge/accounts/<名称>/` 下为每个额外账号
+准备一个完整的 Gemini 配置目录（可用 `AGY_BRIDGE_ACCOUNTS_DIR` 覆盖根目录），
+并在该目录里交互式登录一次：
+
+```sh
+agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
+```
+
+登录产生的 `antigravity-cli/antigravity-oauth-token` 会落在该目录里。之后每个
+账号的模型都会以 `<名称>/<模型id>`（显示名带 `[名称]` 前缀）出现在 magpie 模型
+选择器里，选哪个就走哪个账号；会话、进程、快照和额度都按账号隔离。默认账号
+（agy 自己的全局登录态，模型不带前缀）始终保留。要求 agy 支持 `--gemini_dir`
+ 且账号使用文件 token 登录态——钥匙串/ADC 登录态是整机全局的，无法按目录隔离。
+刷新模型目录会重新扫描账号目录。
+
 **查看订阅额度**：
 
 ```sh
@@ -165,8 +180,9 @@ GPT-OSS 的声明始终取配置值与 131,072 中的较小值。
   需要服务端声明 ACP 图片能力（agy 1.5.0 起）。
 - **平台**：Linux / macOS 已验证。Windows 已补充 `.exe` / `.cmd` / `.bat`
   发现、启动和 WSL 路径处理，并有命令构造测试；维护者尚未完成 Windows 实机验证。
-- **账号**：一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
-  `authenticate` 去切换登录。
+- **账号**：默认一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
+  `authenticate` 去切换登录。需要多账号时使用上方"多账号"小节的
+  `--gemini_dir` 隔离方案（模型名 `<账号>/<模型id>` 前缀路由）。
 - **Prompt Guard**：默认开启，仅处理 system 中的独立计费元数据和已知 Agent SDK
   身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭。不会全局替换厂商名称或清洗 user 正文。
 - **错误与重试**：通用 `RESOURCE_EXHAUSTED` 不再被当作确定配额耗尽；已提交 Prompt

@@ -496,6 +496,7 @@ async function handle(message) {
         type: "init", pid: process.pid, convId: session.id, resumed: message.method === "session/resume", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
         cwd: process.cwd(), addDir, agentConfig, clientInfo, systemAppend: params._meta?.antigravity?.systemPrompt?.append ?? null,
         tools, idePort, mcpPid: mcp?.pid,
+        geminiDir: argv.find(a => a.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length) ?? null,
       })
       return { sessionId: session.id, models: { currentModelId: model, availableModels: [] }, configOptions: configOptions() }
     }
@@ -3242,6 +3243,69 @@ for (const compacted of [true, false]) {
       inits().length === beforeRootResult && logs().some(event => event.type === "mcpResult" &&
         event.convId === rootOwner.convId && event.result?.content?.[0]?.text === rootResult))
   }
+}
+
+// Multi-account: named accounts under AGY_BRIDGE_ACCOUNTS_DIR are isolated
+// Gemini dirs; model ids gain an "<account>/" prefix that routes per account.
+{
+  const accountsDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-accounts-"))
+  for (const name of ["work", "personal"]) {
+    const cliDir = path.join(accountsDir, name, "antigravity-cli")
+    fs.mkdirSync(cliDir, { recursive: true })
+    fs.writeFileSync(path.join(cliDir, "antigravity-oauth-token"), `fake-token-${name}`, { mode: 0o600 })
+  }
+  fs.mkdirSync(path.join(accountsDir, "no-token"), { recursive: true }) // ignored: no file token
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  const { default: multiDefault } = await import("./index.mjs?multi-account")
+  const multiPlugin = await multiDefault.server({ client: null, directory: os.tmpdir() }, {})
+  const multiModels = await multiPlugin.provider.models()
+  check("models lists default plus per-account prefixed ids",
+    !!multiModels["gemini-test"] && !!multiModels["work/gemini-test"] && !!multiModels["personal/gemini-test"] &&
+    !multiModels["no-token/gemini-test"], Object.keys(multiModels).join(","))
+  check("account models carry a label prefix in their display name",
+    multiModels["work/gemini-test"]?.name === "[work] Gemini Test" && multiModels["gemini-test"]?.name === "Gemini Test",
+    JSON.stringify([multiModels["work/gemini-test"]?.name, multiModels["gemini-test"]?.name]))
+
+  const multiLoader = await multiPlugin.auth.loader(async () => ({ key: "agy" }))
+  const fetchMulti = body => multiLoader.fetch("agy://local/messages", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    signal: AbortSignal.timeout(8000),
+  })
+  const opening = "ACCOUNT_PROBE shared opening text"
+  const workBody = { model: "work/gemini-test", metadata: { user_id: "multi-account" }, tools: [echoTool],
+    messages: [{ role: "user", content: opening }] }
+  const workEvents = (await readSSE(await fetchMulti(workBody))).events
+  check("prefixed account model request succeeds", stopOf(workEvents) === "end_turn", stopOf(workEvents))
+  check("account process is pinned to its gemini dir",
+    inits().at(-1)?.geminiDir === path.join(accountsDir, "work"), String(inits().at(-1)?.geminiDir))
+
+  const defaultBody = { ...workBody, model: "antigravity-bridge/gemini-test" }
+  const defaultEvents = (await readSSE(await fetchMulti(defaultBody))).events
+  check("default account request succeeds without --gemini_dir",
+    stopOf(defaultEvents) === "end_turn" && inits().at(-1)?.geminiDir === null, `${stopOf(defaultEvents)} ${inits().at(-1)?.geminiDir}`)
+  check("same user_id on different accounts uses separate sessions",
+    inits().at(-2).convId !== inits().at(-1).convId)
+
+  const stateKeys = JSON.parse(fs.readFileSync(bridgeStateFile, "utf8")).entries.map(entry => entry.key)
+  check("parked session state is keyed per account",
+    stateKeys.some(key => key.startsWith("account:work::")) && stateKeys.some(key => !key.startsWith("account:")),
+    stateKeys.join(","))
+
+  const usageBefore = logs().filter(event => event.type === "usage").length
+  const usage = await multiPlugin.auth.usage(async () => ({ key: "agy" }), {})
+  const names = (usage.windows || []).map(window => window.name)
+  check("usage aggregates every account with labels",
+    names.includes("[work] Gemini · 7 days") && names.includes("[personal] Gemini · 7 days") &&
+    names.includes("Gemini · 7 days"), JSON.stringify(names))
+  const usageCalls = logs().filter(event => event.type === "usage").slice(usageBefore)
+  check("usage probes each account with its own --gemini_dir",
+    usageCalls.length === 3 &&
+    usageCalls.filter(call => call.args.includes(`--gemini_dir=${path.join(accountsDir, "work")}`)).length === 1 &&
+    usageCalls.filter(call => call.args.includes(`--gemini_dir=${path.join(accountsDir, "personal")}`)).length === 1,
+    JSON.stringify(usageCalls.map(call => call.args)))
+
+  delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
+  fs.rmSync(accountsDir, { recursive: true, force: true })
 }
 
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))

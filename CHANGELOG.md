@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0
+
+- Support multiple Antigravity accounts. Each named account is a full Gemini CLI
+  directory under `~/.config/magpie-agy-bridge/accounts/<name>/` (override with
+  `AGY_BRIDGE_ACCOUNTS_DIR`) containing its own `antigravity-cli/antigravity-oauth-token`;
+  sign in per account by running `agy --gemini_dir=<dir>` once. Named accounts appear
+  in the model catalog as `<account>/<model-id>` (display name prefixed `[account]`),
+  start agy processes with `--gemini_dir=<dir>`, and keep conversations, parked
+  session state, dedup keys and the local usage store isolated per account. The
+  default account (agy's global sign-in) stays available without a prefix.
+  Accounts need a file-based token and an agy that accepts `--gemini_dir`;
+  keyring/ADC sign-in is machine-global and cannot be isolated per directory.
+  The quota hook aggregates all accounts, labelling each window with `[account]`.
+
 ## 0.2.0
 
 - Declare a conservative 256,000-token client context window, configurable with

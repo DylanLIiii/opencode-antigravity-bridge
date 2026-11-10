@@ -56,6 +56,23 @@ magpie plugin add ./opencode-antigravity-bridge
    `agy models` are grouped into one model with variants, then mapped back to
    the corresponding agy ID for each request.
 
+**Multiple accounts**: put each extra account in
+`~/.config/magpie-agy-bridge/accounts/<name>/` (override the root with
+`AGY_BRIDGE_ACCOUNTS_DIR`) as a full Gemini directory, and sign in once inside it:
+
+```sh
+agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
+```
+
+The login writes `antigravity-cli/antigravity-oauth-token` into that directory.
+Every account's models then show up in magpie's model picker as
+`<name>/<model-id>` (display name prefixed `[name]`); picking one routes to that
+account. Sessions, processes, parked state and quota are isolated per account.
+The default account (agy's global sign-in, unprefixed model IDs) always remains.
+Accounts require an agy that accepts `--gemini_dir` and a file-based token;
+keyring/ADC sign-in is machine-global and cannot be isolated per directory.
+Refreshing the model catalog re-scans the accounts directory.
+
 ## What works
 
 - **Streaming responses** from ACP `agent_message_chunk` updates, with
@@ -417,9 +434,11 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   matches return 503; unrecognized results that conflict with a pending pooled
   conversation return 409. Conflicting duplicates and mixed-conversation result
   batches also remain 409 errors.
-- **One Google account.** agy owns one sign-in; the bridge never calls ACP
-  `authenticate` (it switches agy to a different sign-in path) and relies on the
-  CLI's existing login.
+- **One Google account by default.** agy owns the default sign-in; the bridge
+  never calls ACP `authenticate` (it switches agy to a different sign-in path)
+  and relies on the CLI's existing login. Multiple accounts are supported via
+  the `--gemini_dir` isolation described under Use (model IDs get an
+  `<account>/` prefix); ACP `authenticate` is still never used to switch.
 - **The IDE tool connection uses a private `nc`.** agy runs `nc host port` for
   `--ide-mcp-port`; the bridge puts its own `nc` (and `nc.cmd` on Windows) first
   in agy's PATH, which runs `mcp-server.mjs` authenticated by a per-process
@@ -526,6 +545,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume and submitted-prompt dedupe retention |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
+| `AGY_BRIDGE_ACCOUNTS_DIR` | `~/.config/magpie-agy-bridge/accounts` | root of named account profiles; each subdirectory with its own `antigravity-cli/antigravity-oauth-token` becomes a `<name>/<model-id>` account |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60000 / 120000 / 1800000 | startup, meaningful agy inactivity, client tool result; positive milliseconds |
 | `AGY_BRIDGE_PING_INTERVAL_MS` | 15000 | Anthropic SSE heartbeat interval in positive milliseconds; never renews upstream inactivity |
 | `AGY_BRIDGE_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips automatic quota probes entirely |
@@ -539,6 +559,7 @@ community observations and depend on the current account and CLI.
 
 ```sh
 node --check index.mjs
+node --check accounts.mjs
 node --check mcp-server.mjs
 node --check usage.mjs
 npm test

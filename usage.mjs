@@ -188,21 +188,32 @@ export async function fetchUsage(agy, {
   signal,
   tempRoot = os.tmpdir(),
   home = os.homedir(),
+  geminiDir: fixedGeminiDir,
 } = {}) {
   if (!agy) throw new UsageError("agy CLI not found. Install it and run `agy` once to sign in.")
   // Browser launcher blocking and owned process-group cleanup are POSIX-specific.
   if (process.platform === "win32") throw new UsageError("agy bridge usage queries currently require macOS or Linux.")
   const deadline = Date.now() + timeout(timeoutMs)
-  const directory = await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-"))
+  // A caller-supplied Gemini dir is a named account profile: use it as-is and
+  // never delete it. Otherwise build a private one that only links the token.
+  const owned = !fixedGeminiDir
+  const directory = owned ? await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-")) : null
+  let workDir = null
   try {
-    await fs.chmod(directory, 0o700)
-    // Print mode reloads system slash commands and global skills even when the
-    // selected agent opts out. A private Gemini dir keeps that discovery local.
-    const geminiDir = path.resolve(directory, "gemini")
-    await fs.mkdir(geminiDir, { recursive: true, mode: 0o700 })
-    await fs.chmod(geminiDir, 0o700)
-    await linkIsolatedAccount(home, geminiDir)
-    const agentDir = path.join(directory, ".agents", "agents", "magpie-usage")
+    let geminiDir
+    if (fixedGeminiDir) {
+      geminiDir = path.resolve(fixedGeminiDir)
+    } else {
+      await fs.chmod(directory, 0o700)
+      // Print mode reloads system slash commands and global skills even when the
+      // selected agent opts out. A private Gemini dir keeps that discovery local.
+      geminiDir = path.resolve(directory, "gemini")
+      await fs.mkdir(geminiDir, { recursive: true, mode: 0o700 })
+      await fs.chmod(geminiDir, 0o700)
+      await linkIsolatedAccount(home, geminiDir)
+    }
+    workDir = owned ? directory : await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-work-"))
+    const agentDir = path.join(workDir, ".agents", "agents", "magpie-usage")
     await fs.mkdir(agentDir, { recursive: true })
     await fs.writeFile(path.join(agentDir, "agent.md"), [
       "---", "name: magpie-usage", "description: Read CLI usage only", "mainAgent: true", "subagent: false",
@@ -211,20 +222,22 @@ export async function fetchUsage(agy, {
       "---", "Do not run model prompts or tools.", "",
     ].join("\n"), { mode: 0o600 })
     for (const name of ["open", "xdg-open"]) {
-      await fs.writeFile(path.join(directory, name), "#!/bin/sh\nexit 1\n", { mode: 0o700 })
+      await fs.writeFile(path.join(workDir, name), "#!/bin/sh\nexit 1\n", { mode: 0o700 })
     }
     const childEnv = {
       ...env,
       AGY_CLI_DISABLE_AUTO_UPDATE: "true",
-      PATH: directory + path.delimiter + (env.PATH || "/usr/bin:/bin"),
-      BROWSER: path.join(directory, "open"),
+      PATH: workDir + path.delimiter + (env.PATH || "/usr/bin:/bin"),
+      BROWSER: path.join(workDir, "open"),
     }
-    const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes }
+    const options = { cwd: workDir, env: childEnv, deadline, signal, maxOutputBytes }
     // Probe the hidden profile flag within the version call. Older CLIs reject
-    // it; only then fall back to the user's real Gemini directory.
+    // it; only then fall back to the user's real Gemini directory. A fixed
+    // account dir must never fall back: that would read the wrong account.
     let version = await run(agy, [`--gemini_dir=${geminiDir}`, "--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
     let isolated = version.code === 0
     if (!isolated && /flags? provided but not defined|unknown (?:flag|option)|unrecognized/i.test(version.stderr + version.stdout)) {
+      if (fixedGeminiDir) throw new UsageError("this agy version does not support --gemini_dir; update the CLI to use named accounts.")
       version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
     }
     if (version.code !== 0) throw commandFailure(version.stderr)
@@ -237,24 +250,55 @@ export async function fetchUsage(agy, {
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
     return parseUsageReport(result.stdout)
   } finally {
-    await fs.rm(directory, { recursive: true, force: true })
+    await fs.rm(owned ? directory : workDir, { recursive: true, force: true }).catch(() => {})
   }
 }
 
 // No completed-result cache: sequential refreshes must see account/allowance changes.
+// options.resolveAccounts (async (agy) => [{ name, dir }]) enables multi-account:
+// every account's quota windows are merged, named accounts prefixed with [name].
 export function createUsageReader(resolveAgy, options = {}) {
   const pending = new Map()
+  const query = (agy, account) => {
+    const key = `${agy}|${account.dir ?? ""}`
+    if (!pending.has(key)) {
+      const run = fetchUsage(agy, { ...options, geminiDir: account.dir ?? undefined }).finally(() => {
+        if (pending.get(key) === run) pending.delete(key)
+      })
+      pending.set(key, run)
+    }
+    return pending.get(key)
+  }
   return async () => {
     if (usageDisabled(options.env ?? process.env)) return { windows: [], signIn: "kept" }
     try {
       const agy = resolveAgy()
-      if (!pending.has(agy)) {
-        const query = fetchUsage(agy, options).finally(() => {
-          if (pending.get(agy) === query) pending.delete(agy)
-        })
-        pending.set(agy, query)
+      const accounts = options.resolveAccounts
+        ? await options.resolveAccounts(agy)
+        : [{ name: null, dir: null }]
+      const results = await Promise.all(accounts.map(async account => {
+        try {
+          return { account, report: await query(agy, account) }
+        } catch (error) {
+          return { account, error }
+        }
+      }))
+      const windows = []
+      const errors = []
+      for (const { account, report, error } of results) {
+        if (error) {
+          errors.push(`${account.name ?? "default"}: ${error instanceof UsageError ? error.message : "agy usage query failed."}`)
+          continue
+        }
+        // Clone per account so callers can never mutate each other's reports.
+        for (const window of structuredClone(report).windows) {
+          windows.push(account.name ? { ...window, name: `[${account.name}] ${window.name}` } : window)
+        }
       }
-      return { ...structuredClone(await pending.get(agy)), signIn: "kept" }
+      if (!windows.length && errors.length) {
+        return { windows: [], error: errors.join("; "), signIn: "kept" }
+      }
+      return { windows, ...(errors.length ? { errors } : {}), signIn: "kept" }
     } catch (error) {
       return { windows: [], error: error instanceof UsageError ? error.message : "agy usage query failed. Check the CLI and temporary-directory permissions.", signIn: "kept" }
     }

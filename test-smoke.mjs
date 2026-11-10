@@ -1590,6 +1590,32 @@ for (const mode of ["IDLE_SILENT", "IDLE_METADATA"]) {
   delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
 }
 
+for (const mode of ["LONGTOOL", "LONGQUIT"]) {
+  for (const marker of ["", "[Request interrupted by user]\n"]) {
+    process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "150"
+    const first = { model, messages: [{ role: "user", content: `${mode} deferred steering ${!!marker}` }], tools: [echoTool] }
+    const pending = (await readSSE(await callFetch(first))).events
+    const session = inits().at(-1)
+    await new Promise(resolve => setTimeout(resolve, 400))
+    const second = continuation(first, pending, "DEFERRED-RESULT-731")
+    second.messages.push({ role: "user", content: marker + "Use the real result and follow NEW-INSTRUCTION-942." })
+    const response = await callFetch(second)
+    const final = (await readSSE(response)).events
+    const prompts = logs().filter(event => event.type === "user" && event.convId === session.convId)
+    check(`${mode}/${!!marker}: deferred steering keeps the original session`, response.status === 200 &&
+      stopOf(final) === "end_turn" && inits().at(-1).convId === session.convId && prompts.length === 2)
+    check(`${mode}/${!!marker}: deferred steering preserves the result and new instruction once`,
+      prompts.at(-1).text.split("DEFERRED-RESULT-731").length === 2 &&
+      prompts.at(-1).text.includes("NEW-INSTRUCTION-942") && !prompts.at(-1).text.includes("<conversation_history>") &&
+      !toolCalls(final).length)
+    const follow = nextTurn(second, final, "MEMORY after deferred steering")
+    const resumed = (await readSSE(await callFetch(follow))).events
+    check(`${mode}/${!!marker}: follow-up keeps the steered session`, stopOf(resumed) === "end_turn" &&
+      lastOf("user").convId === session.convId && lastOf("user").text === "MEMORY after deferred steering")
+    delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
+  }
+}
+
 {
   const firstBody = { model, messages: [{ role: "user", content: "TOOL extra text" }], tools: [echoTool] }
   const firstEvents = (await readSSE(await callFetch(firstBody))).events
@@ -2262,11 +2288,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
 }
 
 {
-  let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(300_000) }], tools: [echoTool] }
+  let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(150_000) }], tools: [echoTool] }
   let events = (await readSSE(await callFetch(body))).events
   const session = inits().at(-1)
-  for (let round = 0; round < 3; round++) {
-    body = nextTurn(body, events, "MEMORY " + "h".repeat(300_000))
+  for (let round = 0; round < 7; round++) {
+    body = nextTurn(body, events, "MEMORY " + "h".repeat(150_000))
     events = (await readSSE(await callFetch(body))).events
   }
   body = nextTurn(body, events, "ESCCALL large accumulated history")
@@ -2305,7 +2331,7 @@ for (const steering of [false, true]) {
   const first = { model, messages: [{ role: "user", content: `TOOL result budget ${steering}` }], tools: [echoTool] }
   const pending = (await readSSE(await callFetch(first))).events
   const session = inits().at(-1)
-  const oversized = continuation(first, pending, "z".repeat(1_200_000))
+  const oversized = continuation(first, pending, "z".repeat(steering ? 200_000 : 1_200_000))
   if (steering) oversized.messages.at(-1).content.push({ type: "text", text: "Please explain this result." })
   const response = await callFetch(oversized)
   check(`oversized tool result ${steering} preserves its pending owner`, response.status === 400 &&
@@ -2315,6 +2341,41 @@ for (const steering of [false, true]) {
   const final = (await readSSE(await callFetch(corrected))).events
   check(`a corrected tool result ${steering} completes in its original session`, stopOf(final) === "end_turn" &&
     inits().at(-1).convId === session.convId)
+}
+
+{
+  const before = inits().length
+  const tooLarge = { model, messages: [{ role: "user", content: "中文".repeat(40_000) + " CURRENT-TAIL-731" }] }
+  const rejected = await callFetch(tooLarge)
+  check("a user turn below 1 MiB but above AGY's limit is rejected before session creation", rejected.status === 400 &&
+    (await rejected.json()).error?.code === "context_length_exceeded" && inits().length === before)
+
+  const first = { model, messages: [{ role: "user", content: "MEMORY before oversized continuation" }] }
+  const initial = (await readSSE(await callFetch(first))).events
+  const session = inits().at(-1)
+  const next = nextTurn(first, initial, "x".repeat(200_000) + " KEEP-TAIL-942")
+  const response = await callFetch(next)
+  check("oversized native continuation leaves the original session usable", response.status === 400 &&
+    (await response.json()).error?.code === "context_length_exceeded" && fs.existsSync(session.cwd) &&
+    logs().filter(event => event.type === "user" && event.convId === session.convId).length === 1)
+  const corrected = nextTurn(first, initial, "MEMORY smaller continuation")
+  const final = (await readSSE(await callFetch(corrected))).events
+  check("a corrected native continuation reuses the preserved session", stopOf(final) === "end_turn" &&
+    lastOf("user").convId === session.convId)
+
+  process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "150"
+  const late = { model, messages: [{ role: "user", content: "LONGQUIT oversized deferred result" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(late))).events
+  const lateSession = inits().at(-1)
+  await new Promise(resolve => setTimeout(resolve, 400))
+  const oversized = await callFetch(continuation(late, pending, "z".repeat(200_000)))
+  check("a deferred result cannot bypass the ACP user-input limit", oversized.status === 400 &&
+    (await oversized.json()).error?.code === "context_length_exceeded" && fs.existsSync(lateSession.cwd) &&
+    logs().filter(event => event.type === "user" && event.convId === lateSession.convId).length === 1)
+  const resumed = (await readSSE(await callFetch(continuation(late, pending, "small-deferred-result")))).events
+  check("rejected deferred input retains the pending tool for a corrected result", stopOf(resumed) === "end_turn" &&
+    lastOf("user").convId === lateSession.convId && textOf(resumed).includes("small-deferred-result"))
+  delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
 }
 
 {

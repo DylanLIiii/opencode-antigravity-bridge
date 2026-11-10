@@ -45,10 +45,9 @@ const TOOL_LIST_WAIT_MS = 5_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
-// Per-submission text budget, independent of the model's rolling context
-// window. Never let a giant replay silently lose its current turn. Compacted
-// client histories routinely serialize to several hundred KiB (CJK text, code
-// and escaped tool records), so the default leaves room for them.
+// Total per-submission budget, including installed system instructions and MCP
+// results. ACP user prompts have a separate upstream ceiling below; neither
+// budget describes the model's rolling context window.
 const DEFAULT_MAX_PROMPT_TEXT_BYTES = 1024 * 1024
 // Claude Code prefixes the first message after compaction with this summary.
 const COMPACTION_SUMMARY_MARKER = "This session is being continued from a previous conversation"
@@ -430,6 +429,15 @@ function promptTextLimit() {
   return configuredTimeout("AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES", DEFAULT_MAX_PROMPT_TEXT_BYTES)
 }
 
+// Observed AGY 1.5.4 truncating a rendered USER_REQUEST at 192,000 bytes, independently
+// of the model context window and our total submission budget. Leave space for
+// its wrappers/timestamps, and reserve text for each uploaded image's label/URI.
+// Raising the bridge budget cannot raise this upstream per-user-step limit.
+const MAX_ACP_PROMPT_TEXT_BYTES = 180_000
+function acpPromptTextBytes(parts) {
+  return promptTextBytes(parts) + parts.filter(part => part.type === "image").length * 1024
+}
+
 function hasCompactionSummary(body) {
   return Array.isArray(body?.messages) && body.messages.some(message => {
     if (message?.role !== "user") return false
@@ -461,6 +469,24 @@ function validatePromptBudget(parts, instructions = "", body = null) {
     "AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES controls this conservative bridge limit.",
     "context_length_exceeded",
   )
+}
+
+function validateAcpPromptBudget(parts, instructions = "", body = null) {
+  const bytes = acpPromptTextBytes(parts)
+  if (bytes > MAX_ACP_PROMPT_TEXT_BYTES) {
+    const compacted = hasCompactionSummary(body)
+    throw new ConflictError(
+      (compacted ? "agy bridge: the compacted conversation" : "prompt is too long: agy bridge") +
+      ` would submit ${bytes} UTF-8 user-input bytes including image-label reserves (safe limit ${MAX_ACP_PROMPT_TEXT_BYTES}). ` +
+      "AGY can silently truncate a larger user turn, losing the latest instruction. " +
+      (compacted ? "Shorten the summary or current instruction, or start a new conversation. "
+        : "Compact the conversation in the client and retry with its summary and the complete current instruction. ") +
+      "Increasing AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES cannot raise this upstream limit. " +
+      "No model prompt or tool result from this request was sent.",
+      compacted ? "prompt_budget_exceeded" : "context_length_exceeded",
+    )
+  }
+  return validatePromptBudget(parts, instructions, body)
 }
 
 class PromptOutcomeUnknownError extends Error {
@@ -1288,7 +1314,7 @@ class Proc {
     if (content.some(block => block.type === "image") && !this.supportsImages) {
       throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
     }
-    const textBytes = validatePromptBudget(mergePromptParts(this.unsentPrompt, content), this.instructionsInSession ? this.instructions : "", { messages })
+    const textBytes = validateAcpPromptBudget(mergePromptParts(this.unsentPrompt, content), this.instructionsInSession ? this.instructions : "", { messages })
     logBridgeEvent(this, null, "prompt_prepared", this.hasSentFirstTurn ? "continuation" : "history_replay", {}, {
       prompt_text_bytes: textBytes, prompt_parts: content.length,
     })
@@ -1376,6 +1402,7 @@ class Proc {
           turn.complete({ stopReason: "cancelled" })
           return
         }
+        validateAcpPromptBudget(promptParts, this.instructionsInSession ? this.instructions : "", { messages: this.expectedMessages })
         turn.arm()
         unpark(this.convKey)
         this.hasSentFirstTurn = true
@@ -1422,6 +1449,12 @@ class Proc {
         }
         turn.arm()
         await turn.waitLate()
+        // Steering has already put these results in its next user prompt. Do
+        // not queue a second late-results prompt (or retain it as unsent input).
+        if (turn.cancelRequested) {
+          turn.complete({ stopReason: "cancelled" })
+          return
+        }
         for (const call of late) call.lateDelivered = true
         promptParts = renderLateResultParts(late, this.supportsImages)
         lateCalls = late
@@ -1628,6 +1661,16 @@ class Proc {
       if (!previous) unique.set(id, item)
     }
     return unique
+  }
+
+  validateContinuationBudget(results, body) {
+    validatePromptBudget(results.flatMap(item => item.result.content), this.instructions, body)
+    // A deferred result may be submitted as a user prompt once ACP stops
+    // waiting. Validate before accepting it, so rejection preserves the owner.
+    const late = this.turn.calls.filter(call => call.deferred && !call.lateDelivered).map(call => ({
+      ...call, result: results.find(item => item.call === call)?.result || call.result,
+    }))
+    if (late.length) validateAcpPromptBudget(renderLateResultParts(late, this.supportsImages), this.instructions, body)
   }
 
   continueWith(results) {
@@ -3024,7 +3067,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
 function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, instructions = "") {
   const reminder = outputFormatReminder(body)
   const full = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession), reminder)
-  if (promptTextBytes(full, instructions) <= promptTextLimit()) return full
+  if (promptTextBytes(full, instructions) <= promptTextLimit() && acpPromptTextBytes(full) <= MAX_ACP_PROMPT_TEXT_BYTES) return full
   return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
 }
 
@@ -4171,7 +4214,7 @@ export const AntigravityBridgePlugin = async () => {
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false,
                 account: account.name, geminiDir: account.dir,
-                validateReplay: () => validatePromptBudget(
+                validateReplay: () => validateAcpPromptBudget(
                   renderReplayPromptParts(body, callerWorkDir, true, instructions), instructions, body) }
               const claim = () => {
                 if (!promptAttempt) {
@@ -4238,14 +4281,17 @@ export const AntigravityBridgePlugin = async () => {
                   if (!interrupted) proc.validateResults(results)
                   const sameSession = historyMatches && proc.workDir === workDir && sameInstructions(proc.instructions, instructions)
                   const canSteer = interrupted && sameSession && !turn.done && !turn.cancelRequested &&
-                    turn.calls.every(call => !call.deferred && (call.result || rawResults.some(item => item.call === call)))
+                    turn.calls.every(call => call.result || rawResults.some(item => item.call === call))
                   if (canSteer) {
                     // AGY may store a cancellation in place of the MCP result.
                     // Repeat this batch's real results with the new instruction
                     // so they survive cancellation, without replaying history.
-                    const content = mergePromptParts(renderContinuedTurnParts(trailing.messages), outputFormatReminder(body))
+                    const earlierLate = turn.calls.filter(call => call.deferred && !call.lateDelivered && call.result &&
+                      !rawResults.some(item => item.call === call))
+                    const content = mergePromptParts(earlierLate.length ? renderLateResultParts(earlierLate, proc.supportsImages) : [],
+                      mergePromptParts(renderContinuedTurnParts(trailing.messages), outputFormatReminder(body)))
                     if (promptHasImage(content) && !proc.supportsImages) throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
-                    validatePromptBudget(content, instructions, body)
+                    validateAcpPromptBudget(mergePromptParts(proc.unsentPrompt, content), instructions, body)
                     validatePromptBudget(rawResults.flatMap(item => item.result.content), instructions, body)
                     const next = await proc.steerTurn(turn, rawResults, content, body, model, selection, claim(), promptGuardMatched, init.signal)
                     return streamResponse(proc, next, body, init.signal)
@@ -4261,16 +4307,15 @@ export const AntigravityBridgePlugin = async () => {
                       : proc.workDir !== workDir ? "work_dir_changed" : "instructions_changed"
                     logBridgeEvent(proc, turn, "replay", acquireOpts.replayReason)
                     claim()
-                    // Incompatible context or deferred interrupted tools need
-                    // replay. Keep the results for the new session and close the
-                    // old process's calls.
+                    // Incompatible context needs replay. Keep the results for
+                    // the new session and close the old process's calls.
                     acquireOpts.ownerKey = proc.convKey.split(":fork:")[0] === convKey ? proc.convKey : convKey
                     dropFromPool(proc)
                     proc.abandonTurn(turn)
                     await proc.stop()
                   } else {
                     if (!proc.dead && !turn.done) {
-                      validatePromptBudget(results.flatMap(item => item.result.content), instructions, body)
+                      proc.validateContinuationBudget(results, body)
                       // A changed tool catalog applies to the rest of this turn;
                       // a model change applies from the next prompt.
                       await proc.updateTools(tools)
@@ -4282,6 +4327,7 @@ export const AntigravityBridgePlugin = async () => {
                       }
                       if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
                       proc.validateResults(results)
+                      proc.validateContinuationBudget(results, body)
                       proc.continueWith(results)
                       proc.recordToolResults(turn, body.messages)
                     }

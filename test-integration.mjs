@@ -70,6 +70,8 @@ if (worker) {
     let body = JSON.parse(input)
     const steering = body.steering
     delete body.steering
+    const toolDelayMs = body.toolDelayMs || 0
+    delete body.toolDelayMs
     const { AntigravityBridgePlugin } = await import("./index.mjs")
     const plugin = await AntigravityBridgePlugin()
     const loader = await plugin.auth.loader(async () => ({ key: "agy" }))
@@ -98,6 +100,7 @@ if (worker) {
         assert.equal(call.input.token, "bridge-integration")
       }
       toolCalls += calls.length
+      if (toolDelayMs) await new Promise(resolve => setTimeout(resolve, toolDelayMs))
       body = { ...body, messages: [...body.messages, { role: "assistant", content }, { role: "user", content: calls.map(call => ({
         type: "tool_result", tool_use_id: call.id, content: "Tool verified. Remember the code ORCHID-731.",
       })) }, { role: "system", content: "PostToolUse hook additional context: Continue with the verified tool result." }] }
@@ -191,21 +194,24 @@ try {
   assert.equal(new Set(replayState.entries.map(entry => entry.sessionId)).size, 2, "Historical replay must create a separate session")
   console.log("ok - historical tool replay recalls the result without emitting tool records")
 
+  process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS = "150"
   const steered = await runWorker({
     model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
     system: "Follow the latest user instruction. Use the tool only when asked. Keep answers brief.",
     tools: [{ name: "bridge_echo", description: "Verify the bridge.", input_schema: {
       type: "object", properties: { token: { type: "string", enum: ["bridge-integration"] } }, required: ["token"],
     } }],
-    messages: [{ role: "user", content: "Call bridge_echo with token bridge-integration exactly once, then explain the result." }],
-    steering: "Change of plan. Do not call any more tools. Reply with BRIDGE-STEER-904 followed by one space and the code returned by bridge_echo.",
+    messages: [{ role: "user", content: "Remember the session code SEED-582. Call bridge_echo with token bridge-integration exactly once, then explain the result." }],
+    toolDelayMs: 750,
+    steering: "Change of plan. Do not call any more tools. Reply with BRIDGE-STEER-904, the session code from my original instruction, and the code returned by bridge_echo, separated by spaces.",
   })
+  delete process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS
   assert.equal(steered.toolCalls, 1, "User steering executed another tool")
-  assert.equal(steered.content.filter(block => block.type === "text").map(block => block.text).join("").trim(), "BRIDGE-STEER-904 ORCHID-731")
+  assert.equal(steered.content.filter(block => block.type === "text").map(block => block.text).join("").trim(), "BRIDGE-STEER-904 SEED-582 ORCHID-731")
   const created = steered.bridgeEvents.filter(event => event.action === "created")
   assert.equal(created.length, 1, "User steering created a replacement AGY session")
   assert(steered.bridgeEvents.some(event => event.reason === "user_steering" && event.session_id === created[0].session_id))
-  console.log("ok - user steering retains the AGY session, recalls the real tool result and obeys the latest instruction")
+  console.log("ok - deferred user steering retains the AGY session, recalls earlier context and the real tool result, and obeys the latest instruction")
 
   const large = {
     model: process.env.AGY_BRIDGE_TEST_MODEL || "gemini-3.8-flash",
@@ -215,6 +221,9 @@ try {
       { role: "user", content: "Reply with exactly the text inside these tags, excluding the tags.\n<answer>RECOVERED-731</answer>" }],
   }
   await assert.rejects(runWorker(large), /prompt is too long/)
+  await assert.rejects(runWorker({ ...large, messages: [
+    { role: "user", content: "x".repeat(200_000) }, large.messages[1], large.messages[2],
+  ] }), /upstream limit/)
   const recovered = await runWorker({ ...large, messages: [
     { role: "user", content: "Client-compacted summary: The old work is complete." },
     large.messages[1], large.messages[2],

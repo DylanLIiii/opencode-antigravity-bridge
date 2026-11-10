@@ -160,7 +160,7 @@ magpie quota refresh antigravity-bridge --json
 该变量接受 1 至 1,048,576 的整数，非法值回到默认策略。
 GPT-OSS 的声明始终取配置值与 131,072 中的较小值。
 窗口声明只改变客户端收到的元数据，扩容效果仍取决于 AGY 本身。
-每次提交的 128 KiB 文本预算另由 `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` 控制。
+每次提交的 1 MiB 文本预算另由 `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` 控制。
 
 生成级用量日志 `agy_bridge_model_usage` 包含账单来源 `gen_metadata` 或 `steps`、
 实际输入、缓存读写、输出、思考量及 `context_tokens`。生成记录提供的
@@ -222,11 +222,14 @@ GPT-OSS 的声明始终取配置值与 131,072 中的较小值。
 当前轮结果和实时 MCP 传递仍保持完整；该选项不会删除活跃或恢复会话中已有的记录。
 标签是给模型的提示，不能保证模型绝不引用历史内容。
 
-每次提交的文本与会话系统指令合计默认限制为 **128 KiB UTF-8 字节**，图片的 base64
-数据单独传递。该值是 Bridge 的保守策略，可通过正数环境变量
+每次提交的文本与会话系统指令合计默认限制为 **1 MiB UTF-8 字节**，图片的 base64
+数据单独传递。可通过正数环境变量
 `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` 调整。限制作用于新增输入，正常续接或 resume
-可以继续使用更长的已有会话。超大历史重放会在替换原会话前返回 HTTP 400
+可以继续使用更长的已有会话。超出预算的历史重放会先省略历史工具结果正文（工具调用和
+当前轮保持完整）；仍然超限时，会在替换原会话前返回 HTTP 400
 `context_length_exceeded`，要求客户端先压缩历史，再提交摘要和完整当前指令。
+如果历史中已包含 Claude Code 的压缩摘要，错误改用 `prompt_budget_exceeded`，且不含
+“prompt is too long”字样，避免客户端陷入反复压缩的死循环。
 客户端是否自动执行压缩取决于其错误处理。客户端负责保留完整历史并决定如何摘要。
 `AGY_BRIDGE_EVENTS=0` 可关闭包含会话 ID、恢复原因和文本大小的限频诊断日志。
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- Fix an endless compaction loop in Claude Code after a history change (#27).
+  Raise the default `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` budget from 128 KiB to
+  1 MiB, so a typical compacted history (often 250–350 KiB of UTF-8 text) can
+  replay. A replay over budget now omits historical tool-result bodies before
+  failing. An over-budget history that already holds a Claude Code compaction
+  summary returns `prompt_budget_exceeded` without the "prompt is too long"
+  wording, so the client does not compact again.
+
 ## 0.3.0
 
 - Support multiple Antigravity accounts. Each named account is a full Gemini CLI

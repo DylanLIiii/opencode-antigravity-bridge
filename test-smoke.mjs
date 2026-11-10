@@ -2262,11 +2262,11 @@ for (const location of ["inline", "system", "developer", "user"]) {
 }
 
 {
-  let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(100_000) }], tools: [echoTool] }
+  let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(300_000) }], tools: [echoTool] }
   let events = (await readSSE(await callFetch(body))).events
   const session = inits().at(-1)
   for (let round = 0; round < 3; round++) {
-    body = nextTurn(body, events, "MEMORY " + "h".repeat(100_000))
+    body = nextTurn(body, events, "MEMORY " + "h".repeat(300_000))
     events = (await readSSE(await callFetch(body))).events
   }
   body = nextTurn(body, events, "ESCCALL large accumulated history")
@@ -2305,7 +2305,7 @@ for (const steering of [false, true]) {
   const first = { model, messages: [{ role: "user", content: `TOOL result budget ${steering}` }], tools: [echoTool] }
   const pending = (await readSSE(await callFetch(first))).events
   const session = inits().at(-1)
-  const oversized = continuation(first, pending, "z".repeat(200_000))
+  const oversized = continuation(first, pending, "z".repeat(1_200_000))
   if (steering) oversized.messages.at(-1).content.push({ type: "text", text: "Please explain this result." })
   const response = await callFetch(oversized)
   check(`oversized tool result ${steering} preserves its pending owner`, response.status === 400 &&

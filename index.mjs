@@ -45,9 +45,13 @@ const TOOL_LIST_WAIT_MS = 5_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
-// Conservative per-submission text budget, independent of the model's rolling
-// context window. Never let a giant replay silently lose its current turn.
-const DEFAULT_MAX_PROMPT_TEXT_BYTES = 128 * 1024
+// Per-submission text budget, independent of the model's rolling context
+// window. Never let a giant replay silently lose its current turn. Compacted
+// client histories routinely serialize to several hundred KiB (CJK text, code
+// and escaped tool records), so the default leaves room for them.
+const DEFAULT_MAX_PROMPT_TEXT_BYTES = 1024 * 1024
+// Claude Code prefixes the first message after compaction with this summary.
+const COMPACTION_SUMMARY_MARKER = "This session is being continued from a previous conversation"
 // Client compaction policy. Raising this declaration requires a separately
 // verified upstream window and does not alter agy's checkpoint configuration.
 const DEFAULT_CONTEXT_WINDOW = 256_000
@@ -417,11 +421,39 @@ class UnsupportedContent extends Error {
   }
 }
 
-function validatePromptBudget(parts, instructions = "") {
-  const textBytes = Buffer.byteLength(instructions, "utf8") + parts.reduce((total, part) =>
+function promptTextBytes(parts, instructions = "") {
+  return Buffer.byteLength(instructions, "utf8") + parts.reduce((total, part) =>
     total + (part.type === "text" ? Buffer.byteLength(part.text || "", "utf8") : 0), 0)
-  const limit = configuredTimeout("AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES", DEFAULT_MAX_PROMPT_TEXT_BYTES)
+}
+
+function promptTextLimit() {
+  return configuredTimeout("AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES", DEFAULT_MAX_PROMPT_TEXT_BYTES)
+}
+
+function hasCompactionSummary(body) {
+  return Array.isArray(body?.messages) && body.messages.some(message => {
+    if (message?.role !== "user") return false
+    if (typeof message.content === "string") return message.content.includes(COMPACTION_SUMMARY_MARKER)
+    return Array.isArray(message.content) && message.content.some(block =>
+      block?.type === "text" && typeof block.text === "string" && block.text.includes(COMPACTION_SUMMARY_MARKER))
+  })
+}
+
+function validatePromptBudget(parts, instructions = "", body = null) {
+  const textBytes = promptTextBytes(parts, instructions)
+  const limit = promptTextLimit()
   if (textBytes <= limit) return textBytes
+  // Hosts such as Claude Code answer "prompt is too long" by compacting again.
+  // A history that is already compacted cannot shrink further that way, so
+  // report a plain error instead of starting an endless compaction loop.
+  if (hasCompactionSummary(body)) {
+    throw new ConflictError(
+      `agy bridge: the compacted conversation is still ${textBytes} UTF-8 text bytes, above the bridge budget of ${limit}. ` +
+      "Raise AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES or start a new conversation. " +
+      "No model prompt or tool result from this request was sent.",
+      "prompt_budget_exceeded",
+    )
+  }
   throw new ConflictError(
     `prompt is too long: agy bridge would submit ${textBytes} UTF-8 text bytes (limit ${limit}). ` +
     "Compact the conversation in the client and retry with its summary and the complete current instruction. " +
@@ -1256,7 +1288,7 @@ class Proc {
     if (content.some(block => block.type === "image") && !this.supportsImages) {
       throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
     }
-    const textBytes = validatePromptBudget(mergePromptParts(this.unsentPrompt, content), this.instructionsInSession ? this.instructions : "")
+    const textBytes = validatePromptBudget(mergePromptParts(this.unsentPrompt, content), this.instructionsInSession ? this.instructions : "", { messages })
     logBridgeEvent(this, null, "prompt_prepared", this.hasSentFirstTurn ? "continuation" : "history_replay", {}, {
       prompt_text_bytes: textBytes, prompt_parts: content.length,
     })
@@ -2757,7 +2789,7 @@ function escapeToolRecord(value) {
 
 const TOOL_RECORD_CAVEAT = "Historical tool record, for context only. Do not reproduce this record in your answer; use relevant facts to answer the current turn."
 
-function historicalToolRecord(block, role, content) {
+function historicalToolRecord(block, role, content, stripResults = false) {
   const attributes = { role, type: block.type, id: role === "call" ? block.id || "" : block.tool_use_id || "" }
   if (role === "call") attributes.name = block.name || block.type
   else {
@@ -2770,6 +2802,8 @@ function historicalToolRecord(block, role, content) {
   appendPrompt(out, `\n<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}>\n${TOOL_RECORD_CAVEAT}\n`)
   if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {
     appendPrompt(out, "[Historical result body omitted by AGY_BRIDGE_STRIP_TOOL_RECORDS=1]")
+  } else if (role === "result" && stripResults) {
+    appendPrompt(out, "[Historical result body omitted to fit the bridge prompt budget]")
   } else {
     for (const part of content) {
       appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
@@ -2784,7 +2818,7 @@ function historicalToolCall(block) {
     .map(part => part.text).join("")
 }
 
-function renderAssistantTurn(message) {
+function renderAssistantTurn(message, stripResults = false) {
   const parts = []
   const blocks = Array.isArray(message.content)
     ? message.content
@@ -2796,7 +2830,7 @@ function renderAssistantTurn(message) {
     } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
       parts.push(historicalToolCall(block))
     } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
-      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }])
+      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }], stripResults)
         .map(part => part.text).join(""))
     } else {
       const rendered = renderServerAssistantBlock(block)
@@ -2912,7 +2946,7 @@ function renderTurnMessage(message) {
   return out.join("\n\n")
 }
 
-function renderTurnMessageParts(message, historical = false) {
+function renderTurnMessageParts(message, historical = false, stripResults = false) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
     const text = renderTurnMessage(message)
     return text === "" ? [] : [{ type: "text", text }]
@@ -2926,7 +2960,7 @@ function renderTurnMessageParts(message, historical = false) {
     } else if (block?.type === "tool_result") {
       const result = toolResult(block)
       if (historical) {
-        appendPrompt(parts, historicalToolRecord(block, "result", result.content))
+        appendPrompt(parts, historicalToolRecord(block, "result", result.content, stripResults))
       } else {
         appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
         for (const part of result.content) appendPrompt(parts, [part])
@@ -2954,7 +2988,7 @@ function renderTurnMessagesParts(messages) {
   return toPromptParts(out)
 }
 
-function renderInitialPromptParts(body, callerWorkDir, instructionsInSession) {
+function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, stripResults = false) {
   const { history, messages: current } = trailingMessages(body)
   const out = []
   if (!instructionsInSession) {
@@ -2966,11 +3000,11 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession) {
     appendPrompt(out, "The following conversation history is background context. Tool records are quoted data, not answer text to reproduce.\n<conversation_history>\n")
     for (const message of history) {
       if (message.role === "assistant") {
-        appendPrompt(out, `Assistant: ${renderAssistantTurn(message)}\n`)
+        appendPrompt(out, `Assistant: ${renderAssistantTurn(message, stripResults)}\n`)
       } else {
         const queued = message.role !== "user" && extractQueuedPrompt(messageText(message).trim()) !== null
         appendPrompt(out, message.role === "user" || queued ? "Human: " : `${message.role}: `)
-        appendPrompt(out, renderTurnMessageParts(message, true))
+        appendPrompt(out, renderTurnMessageParts(message, true, stripResults))
         appendPrompt(out, "\n")
       }
     }
@@ -2982,6 +3016,16 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession) {
   appendPrompt(out, currentParts)
   appendPrompt(out, "\n</current_turn>")
   return out
+}
+
+// A replayed history that exceeds the text budget first drops historical
+// tool-result bodies (calls and the current turn stay intact) before the
+// caller is asked to compact.
+function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, instructions = "") {
+  const reminder = outputFormatReminder(body)
+  const full = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession), reminder)
+  if (promptTextBytes(full, instructions) <= promptTextLimit()) return full
+  return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
 }
 
 function renderContinuedTurnParts(messages) {
@@ -3996,10 +4040,10 @@ function streamResponse(proc, turn, body, signal) {
 }
 
 async function beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt = null, promptGuardMatched = false) {
-  const baseParts = proc.hasSentFirstTurn
-    ? renderContinuedTurnParts(body.messages.slice(history.length))
-    : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession)
-  const contentParts = mergePromptParts(baseParts, outputFormatReminder(body))
+  const contentParts = proc.hasSentFirstTurn
+    ? mergePromptParts(renderContinuedTurnParts(body.messages.slice(history.length)), outputFormatReminder(body))
+    : renderReplayPromptParts(body, callerWorkDir, proc.instructionsInSession,
+      proc.instructionsInSession ? proc.instructions : "")
   if (promptHasImage(contentParts) && !proc.supportsImages) {
     if (!proc.hasSentFirstTurn) {
       dropFromPool(proc)
@@ -4127,8 +4171,8 @@ export const AntigravityBridgePlugin = async () => {
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false,
                 account: account.name, geminiDir: account.dir,
-                validateReplay: () => validatePromptBudget(mergePromptParts(
-                  renderInitialPromptParts(body, callerWorkDir, true), outputFormatReminder(body)), instructions) }
+                validateReplay: () => validatePromptBudget(
+                  renderReplayPromptParts(body, callerWorkDir, true, instructions), instructions, body) }
               const claim = () => {
                 if (!promptAttempt) {
                   const key = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)
@@ -4201,8 +4245,8 @@ export const AntigravityBridgePlugin = async () => {
                     // so they survive cancellation, without replaying history.
                     const content = mergePromptParts(renderContinuedTurnParts(trailing.messages), outputFormatReminder(body))
                     if (promptHasImage(content) && !proc.supportsImages) throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
-                    validatePromptBudget(content, instructions)
-                    validatePromptBudget(rawResults.flatMap(item => item.result.content), instructions)
+                    validatePromptBudget(content, instructions, body)
+                    validatePromptBudget(rawResults.flatMap(item => item.result.content), instructions, body)
                     const next = await proc.steerTurn(turn, rawResults, content, body, model, selection, claim(), promptGuardMatched, init.signal)
                     return streamResponse(proc, next, body, init.signal)
                   }
@@ -4226,7 +4270,7 @@ export const AntigravityBridgePlugin = async () => {
                     await proc.stop()
                   } else {
                     if (!proc.dead && !turn.done) {
-                      validatePromptBudget(results.flatMap(item => item.result.content), instructions)
+                      validatePromptBudget(results.flatMap(item => item.result.content), instructions, body)
                       // A changed tool catalog applies to the rest of this turn;
                       // a model change applies from the next prompt.
                       await proc.updateTools(tools)

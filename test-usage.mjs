@@ -180,10 +180,18 @@ if (process.platform === "win32") {
   windowsBrowser = { resolved, lookupStatus: lookup.status, lookupError: lookup.error?.code ?? null, lookupStderr: lookup.stderr }
   // Never execute the system launcher if lookup bypassed the blocker. Record
   // the lookup so the test reports a useful failure instead of opening a URL.
-  if (lookup.status === 0 && resolved?.toLowerCase() === expected.toLowerCase()) {
+  if (lookup.status === 0 && fs.realpathSync(resolved).toLowerCase() === fs.realpathSync(expected).toLowerCase()) {
     const command = agySpawnSpec(resolved, ["url.dll,FileProtocolHandler", "https://example.invalid/"], process.platform, process.env)
     const result = spawnSync(command.file, command.args, { ...command.options, windowsHide: true, encoding: "utf8", timeout: 5000 })
     Object.assign(windowsBrowser, { status: result.status, error: result.error?.code ?? null, stderr: result.stderr })
+    // Go's exec.Command starts the resolved file directly. A batch blocker
+    // must also fail at that boundary, without starting a browser process.
+    try {
+      const direct = spawnSync(resolved, ["url.dll,FileProtocolHandler", "https://example.invalid/"], { windowsHide: true, timeout: 5000 })
+      Object.assign(windowsBrowser, { directError: direct.error?.code ?? null, directPid: direct.pid })
+    } catch (error) {
+      Object.assign(windowsBrowser, { directError: error.code, directPid: 0 })
+    }
   }
 }
 const record = {
@@ -287,9 +295,11 @@ test("queries only the structured command in a private, restricted workspace and
     if (process.platform === "win32") {
       assert.equal(log.windowsBrowser.lookupStatus, 0, JSON.stringify(log.windowsBrowser))
       assert.equal(path.basename(log.windowsBrowser.resolved), "rundll32.cmd")
-      assert.equal(log.windowsBrowser.status, 1)
+      assert.equal(log.windowsBrowser.status, 1, JSON.stringify(log.windowsBrowser))
       assert.equal(log.windowsBrowser.error, null)
       assert.equal(log.windowsBrowser.stderr, "")
+      assert.ok(log.windowsBrowser.directError, JSON.stringify(log.windowsBrowser))
+      assert.ok(!log.windowsBrowser.directPid, JSON.stringify(log.windowsBrowser))
     }
     if (process.platform !== "win32") assert.equal(log.gemini.mode, 0o700)
     assert.equal(log.gemini.token, null)

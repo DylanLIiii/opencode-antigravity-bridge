@@ -37,14 +37,19 @@ if (argv.includes("--version")) {
   process.exit(0)
 }
 if (argv.includes("/usage")) {
-  log({ type: "usage", cwd: process.cwd(), args: argv })
+  log({ type: "usage", cwd: process.cwd(), args: argv, wslInterop: process.env.WSL_INTEROP ?? null })
   send({ status: "SUCCESS", command: { name: "usage", data: { groups: [{
     name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.6, reset_time: "2026-10-27T00:00:00Z" }],
   }] } } })
   process.exit(0)
 }
 if (argv.includes("models")) {
-  log({ type: "models", update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE })
+  log({
+    type: "models",
+    update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
+    geminiDir: argv.find(a => a.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length) ?? null,
+    wslInterop: process.env.WSL_INTEROP ?? null,
+  })
   process.stdout.write("gemini-test-medium\tGemini Test (Medium)\ngemini-test-high\tGemini Test (High)\ngemini-test-low\tGemini Test (Low)\nclaude-test-medium\tClaude Test (Medium)\n")
   process.stdout.write("gemini-4-argon-low\tGemini 4 Argon (Low)\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-argon-high\tGemini 4 Argon (High)\n")
   process.stdout.write("gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n")
@@ -522,6 +527,7 @@ async function handle(message) {
         cwd: process.cwd(), addDir, agentConfig, clientInfo, systemAppend: params._meta?.antigravity?.systemPrompt?.append ?? null,
         tools, idePort, mcpPid: mcp?.pid,
         geminiDir: argv.find(a => a.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length) ?? null,
+        wslInterop: process.env.WSL_INTEROP ?? null,
       })
       return { sessionId: session.id, models: { currentModelId: model, availableModels: [] }, configOptions: configOptions() }
     }
@@ -3674,6 +3680,13 @@ for (const compacted of [true, false]) {
   check("account models carry a label prefix in their display name",
     multiModels["work/gemini-test"]?.name === "[work] Gemini Test" && multiModels["gemini-test"]?.name === "Gemini Test",
     JSON.stringify([multiModels["work/gemini-test"]?.name, multiModels["gemini-test"]?.name]))
+  const accountCatalogProbe = logs().filter(event => event.type === "models" &&
+    event.geminiDir === path.join(accountsDir, "work")).at(-1)
+  const defaultCatalogProbe = logs().filter(event => event.type === "models" && event.geminiDir === null).at(-1)
+  check("named account catalog probes force file token storage", accountCatalogProbe?.wslInterop === "1",
+    JSON.stringify(accountCatalogProbe))
+  check("default account catalog probe keeps the global keyring", defaultCatalogProbe?.wslInterop == null,
+    JSON.stringify(defaultCatalogProbe))
 
   const multiLoader = await multiPlugin.auth.loader(async () => ({ key: "agy" }))
   const fetchMulti = body => multiLoader.fetch("agy://local/messages", {
@@ -3687,11 +3700,15 @@ for (const compacted of [true, false]) {
   check("prefixed account model request succeeds", stopOf(workEvents) === "end_turn", stopOf(workEvents))
   check("account process is pinned to its gemini dir",
     inits().at(-1)?.geminiDir === path.join(accountsDir, "work"), String(inits().at(-1)?.geminiDir))
+  check("account process forces file token storage", inits().at(-1)?.wslInterop === "1",
+    JSON.stringify(inits().at(-1)))
 
   const defaultBody = { ...workBody, model: "antigravity-bridge/gemini-test" }
   const defaultEvents = (await readSSE(await fetchMulti(defaultBody))).events
   check("default account request succeeds without --gemini_dir",
     stopOf(defaultEvents) === "end_turn" && inits().at(-1)?.geminiDir === null, `${stopOf(defaultEvents)} ${inits().at(-1)?.geminiDir}`)
+  check("default account process keeps the global keyring", inits().at(-1)?.wslInterop == null,
+    JSON.stringify(inits().at(-1)))
   check("same user_id on different accounts uses separate sessions",
     inits().at(-2).convId !== inits().at(-1).convId)
 
@@ -3712,6 +3729,13 @@ for (const compacted of [true, false]) {
     usageCalls.filter(call => call.args.includes(`--gemini_dir=${path.join(accountsDir, "work")}`)).length === 1 &&
     usageCalls.filter(call => call.args.includes(`--gemini_dir=${path.join(accountsDir, "personal")}`)).length === 1,
     JSON.stringify(usageCalls.map(call => call.args)))
+  const accountUsageCalls = usageCalls.filter(call => call.args.some(arg =>
+    arg === `--gemini_dir=${path.join(accountsDir, "work")}` || arg === `--gemini_dir=${path.join(accountsDir, "personal")}`))
+  const defaultUsageCalls = usageCalls.filter(call => !accountUsageCalls.includes(call))
+  check("named account usage probes force file token storage",
+    accountUsageCalls.length === 2 && accountUsageCalls.every(call => call.wslInterop === "1") &&
+    defaultUsageCalls.length === 1 && defaultUsageCalls[0].wslInterop == null,
+    JSON.stringify(usageCalls.map(call => [call.args, call.wslInterop])))
 
   // P1: a tool result addressed to another account must never reach the issuing
   // account's process; the issuing account keeps its pending call.

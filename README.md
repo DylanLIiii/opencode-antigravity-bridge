@@ -112,6 +112,36 @@ agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
  且账号使用文件 token 登录态——钥匙串/ADC 登录态是整机全局的，无法按目录隔离。
 刷新模型目录会重新扫描账号目录。
 
+**Windows 文件登录态**：原生 Windows 上 agy 把默认登录放在 Windows 凭据管理器
+（整机只有一个 `gemini:antigravity` 条目）。只跑
+`agy --gemini_dir=<目录>` 会复用这个默认账号，不会写 token 文件，桥接因此发现
+不了第二个账号。请只对这次账号登录强制使用文件登录态，原有凭据管理器条目不会
+被改动。PowerShell 示例：
+
+```powershell
+$env:WSL_INTEROP = "1"   # agy 的文件存储开关，不是真正的 WSL interop 路径
+agy --gemini_dir="$env:USERPROFILE\.config\magpie-agy-bridge\accounts\work"
+Remove-Item Env:\WSL_INTEROP
+```
+
+登录会写入
+`%USERPROFILE%\.config\magpie-agy-bridge\accounts\work\antigravity-cli\antigravity-oauth-token`。
+桥接会为命名账号进程设置同一个开关，让它们读取该文件而不是凭据管理器；默认账号
+仍然使用全局登录。在真正的 WSL 会话里 `WSL_INTEROP` 已经存在，agy 本来就会用
+文件登录态，不要覆盖它的 interop 路径；如果无法使用 `WSL_INTEROP`，可以改用
+`SSH_TTY=1`。
+
+token 文件是明文 JSON，包含 refresh token。建议登录前把账号目录限制为当前
+Windows 用户：
+
+```powershell
+icacls "$env:USERPROFILE\.config\magpie-agy-bridge\accounts\work" /inheritance:r /grant:r "$env:USERNAME:(OI)(CI)F"
+```
+
+Windows 没有受支持的按账号加密存储：凭据管理器只有整机全局条目。如果无法接受
+明文 refresh token，请只保留一个账号，或把每个账号隔离到独立的 Windows 用户
+配置或虚拟机中。
+
 **查看订阅额度**：
 
 ```sh
@@ -186,7 +216,8 @@ GPT-OSS 的声明始终取配置值与 131,072 中的较小值。
   这些路径已有自动化测试；维护者尚未完成 Windows 实机验证。
 - **账号**：默认一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
   `authenticate` 去切换登录。需要多账号时使用上方"多账号"小节的
-  `--gemini_dir` 隔离方案（模型名 `<账号>/<模型id>` 前缀路由）。
+  `--gemini_dir` 隔离方案（模型名 `<账号>/<模型id>` 前缀路由）。Windows 上
+  命名账号还需要该小节的"文件登录态"开关，否则 agy 会读取整机全局的凭据管理器。
 - **Prompt Guard**：默认开启，仅处理 system 中的独立计费元数据和已知 Agent SDK
   身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭。不会全局替换厂商名称或清洗 user 正文。
 - **错误与重试**：通用 `RESOURCE_EXHAUSTED` 不再被当作确定配额耗尽；已提交 Prompt

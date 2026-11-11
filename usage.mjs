@@ -279,6 +279,11 @@ export async function fetchUsage(agy, {
       await fs.writeFile(path.join(workDir, name + (windows ? ".cmd" : "")), windows ? "@echo off\r\nexit /b 1\r\n" : "#!/bin/sh\nexit 1\n", { mode: 0o700 })
     }
     const launchEnv = childEnv(env, platform, {})
+    // A named account must read its own file token, not the machine-global
+    // keyring. WSL detection is agy's file-storage switch.
+    if (fixedGeminiDir && !Object.keys(launchEnv).some(key => /^wsl_interop$/i.test(key))) {
+      launchEnv.WSL_INTEROP = "1"
+    }
     const pathKey = Object.keys(launchEnv).find(key => windows ? /^path$/i.test(key) : key === "PATH") || "PATH"
     launchEnv[pathKey] = workDir + (windows ? ";" : ":") + (launchEnv[pathKey] || (windows ? "" : "/usr/bin:/bin"))
     if (windows) {

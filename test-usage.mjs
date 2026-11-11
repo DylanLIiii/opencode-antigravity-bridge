@@ -170,13 +170,27 @@ if (geminiPath) {
 }
 const browser = agySpawnSpec(process.env.BROWSER, [], process.platform, process.env)
 const guard = spawnSync(browser.file, browser.args, { ...browser.options, windowsHide: true, encoding: "utf8", timeout: 5000 })
+let windowsBrowser = null
+if (process.platform === "win32") {
+  const lookup = spawnSync(path.join(process.env.SystemRoot, "System32", "where.exe"), ["rundll32"], {
+    windowsHide: true, encoding: "utf8", timeout: 5000,
+  })
+  const resolved = lookup.stdout?.trim().split(/\r?\n/)[0]
+  const expected = path.join(process.cwd(), "rundll32.cmd")
+  if (lookup.status !== 0 || resolved?.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error("Windows authentication browser command escaped the private workspace")
+  }
+  const command = agySpawnSpec(resolved, ["url.dll,FileProtocolHandler", "https://example.invalid/"], process.platform, process.env)
+  const result = spawnSync(command.file, command.args, { ...command.options, windowsHide: true, encoding: "utf8", timeout: 5000 })
+  windowsBrowser = { resolved, status: result.status, error: result.error?.code ?? null, stderr: result.stderr }
+}
 const record = {
   args, cwd: process.cwd(), pid: process.pid,
   update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE,
   path: process.env.PATH, browser: process.env.BROWSER,
   agent: fs.readFileSync(path.join(process.cwd(), ".agents/agents/magpie-usage/agent.md"), "utf8"),
   mode: fs.statSync(process.cwd()).mode & 0o777,
-  guard: guard.status, guardError: guard.error?.code ?? null, guardStderr: guard.stderr,
+  guard: guard.status, guardError: guard.error?.code ?? null, guardStderr: guard.stderr, windowsBrowser,
   gemini: geminiPath ? { path: geminiPath, mode: fs.statSync(geminiPath).mode & 0o777, token: geminiToken } : null,
 }
 fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(record) + "\n")
@@ -268,6 +282,12 @@ test("queries only the structured command in a private, restricted workspace and
     assert.equal(log.guard, 1)
     assert.equal(log.guardError, null)
     assert.equal(log.guardStderr, "")
+    if (process.platform === "win32") {
+      assert.equal(path.basename(log.windowsBrowser.resolved), "rundll32.cmd")
+      assert.equal(log.windowsBrowser.status, 1)
+      assert.equal(log.windowsBrowser.error, null)
+      assert.equal(log.windowsBrowser.stderr, "")
+    }
     if (process.platform !== "win32") assert.equal(log.gemini.mode, 0o700)
     assert.equal(log.gemini.token, null)
     // macOS process.cwd() canonicalizes /var to /private/var.
@@ -525,6 +545,7 @@ for (const extension of ["exe", "cmd", "bat"]) {
     const f = await windowsFixture(t, { onLaunch: async ({ options }) => {
       blockers.push(await fs.readFile(options.env.BROWSER, "utf8"))
       assert.equal(await fs.readFile(path.join(options.cwd, "xdg-open.cmd"), "utf8"), "@echo off\r\nexit /b 1\r\n")
+      assert.equal(await fs.readFile(path.join(options.cwd, "rundll32.cmd"), "utf8"), "@echo off\r\nexit /b 1\r\n")
     } })
     const removedAfter = []
     const fileSystem = { ...fs, rm: async (directory, options) => {

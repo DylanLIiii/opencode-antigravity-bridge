@@ -273,7 +273,9 @@ export async function fetchUsage(agy, {
       "---", "Do not run model prompts or tools.", "",
     ].join("\n"), { mode: 0o600 })
     const windows = platform === "win32"
-    for (const name of ["open", "xdg-open"]) {
+    // AGY's native Windows auth launcher invokes rundll32 directly and ignores
+    // BROWSER. Shadow that command as well as the POSIX browser launchers.
+    for (const name of windows ? ["open", "xdg-open", "rundll32"] : ["open", "xdg-open"]) {
       await fs.writeFile(path.join(workDir, name + (windows ? ".cmd" : "")), windows ? "@echo off\r\nexit /b 1\r\n" : "#!/bin/sh\nexit 1\n", { mode: 0o700 })
     }
     const launchEnv = childEnv(env, platform, {})

@@ -390,8 +390,9 @@ service problem).
 - A private temporary workspace contains the custom agent (`tools: []`,
   `mcpServers: []`, `inheritMcp: false`, `inheritCustomizations: false`,
   `excludeDefaultComponents: true`) and failing
-  `open`/`xdg-open`/`BROWSER` launchers (`.cmd` on Windows), preventing background
-  usage refreshes from opening OAuth browser login. Queries set
+  `open`/`xdg-open`/`BROWSER` launchers (`.cmd` on Windows), plus a Windows
+  `rundll32.cmd` blocker for AGY's native authentication browser command,
+  preventing background usage refreshes from opening OAuth browser login. Queries set
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` only for their child processes. They do
   not change global agy settings or the user's updater preferences.
 - On completion, failure, timeout, or cancellation, the query's owned POSIX
@@ -406,9 +407,9 @@ service problem).
 
 Quota probing supports **macOS, Linux and Windows**, including Windows `.cmd` and
 `.bat` CLI wrappers. Windows copies file-based credentials into the temporary
-profile to avoid symlink privileges and changes to the original token. Windows
-launch and cleanup paths have automated coverage; real Windows verification is
-still pending.
+profile to avoid symlink privileges and changes to the original token. Native
+quota fixtures and platform helpers run in CI on Windows, macOS and Linux;
+real Windows Antigravity account verification is still pending.
 
 References: CodexBar's
 [CLI quota parser](https://github.com/steipete/CodexBar/blob/0aa34100b7a7ea397bcbf14eaab388d3f32aa4a1/Sources/CodexBarCore/Providers/Antigravity/AntigravityQuotaSummaryParser.swift)

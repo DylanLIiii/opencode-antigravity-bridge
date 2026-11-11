@@ -18,6 +18,8 @@ process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "5000"
 process.env.AGY_BRIDGE_PING_INTERVAL_MS = "100"
 process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
+process.env.AGY_BRIDGE_MAX_PROCS = "4"
+process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
 // the real one does: by running `nc 127.0.0.1 <--ide-mcp-port>` from PATH.
@@ -92,6 +94,10 @@ function mcpRequest(method, params) {
 }
 
 async function listTools(reason) {
+  if (reason === "list_changed" && process.env.FAKE_AGY_TOOL_LIST_DELAY_MS) {
+    log({ type: "toolsListDelayed", convId: session?.id })
+    await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_AGY_TOOL_LIST_DELAY_MS)))
+  }
   if (reason === "list_changed" && toolListTimeouts > 0) {
     toolListTimeouts--
     log({ type: "toolsListTimeout", reason, convId: session?.id })
@@ -3011,6 +3017,258 @@ for (const steering of [false, true]) {
   await readSSE(evicted)
   check("an evicted sibling resumes its own snapshot without replay", evicted.status === 200 &&
     inits().at(-1).resumed && inits().at(-1).convId === owners[3] && lastOf("user").text === "MEMORY resume evicted sibling")
+}
+
+{
+  const savedEnv = Object.fromEntries(["AGY_BRIDGE_MAX_PROCS", "AGY_BRIDGE_DETACHED_EVICT_MS", "AGY_BRIDGE_TOOL_TIMEOUT_MS"]
+    .map(key => [key, process.env[key]]))
+  try {
+    process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
+    process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+    const { default: pressureDefault } = await import("./index.mjs?issue-29-pressure")
+    const pressureLoader = await (await pressureDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+    const fetchPressure = body => pressureLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
+    const requests = Array.from({ length: 4 }, (_, i) => ({ model, metadata: { user_id: `issue-29-pressure-${i}` },
+      messages: [{ role: "user", content: `ESCCALL pressure wait ${i}` }], tools: [echoTool] }))
+    const pending = []
+    const owners = []
+    const started = Date.now()
+    for (const request of requests) {
+      pending.push((await readSSE(await fetchPressure(request))).events)
+      owners.push(inits().at(-1))
+    }
+    check("pressure fixture leaves four unfinished tool turns", pending.every(events => stopOf(events) === "tool_use") &&
+      new Set(owners.map(owner => owner.convId)).size === 4)
+    const admission = { model, metadata: { user_id: "issue-29-pressure-admission" },
+      messages: [{ role: "user", content: "new request under process pressure" }] }
+    const before = inits().length
+    const blocked = await fetchPressure(admission)
+    const blockedText = await blocked.text()
+    check("pool pressure protects recent detached tool waits", blocked.status === 503 && inits().length === before &&
+      owners.every(owner => fs.existsSync(owner.cwd)) &&
+      !logs().some(event => event.type === "mcpResult" && owners.some(owner => owner.convId === event.convId)),
+      `status=${blocked.status} body=${blockedText.slice(0, 200)}`)
+
+    // The grace is read at admission time, independently of the longer tool deadline.
+    process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "100"
+    await new Promise(resolve => setTimeout(resolve, 150))
+    const admitted = await fetchPressure(admission)
+    const admittedEvents = (await readSSE(admitted)).events
+    const idle = inits().at(-1)
+    check("pressure reclaims the oldest detached tool wait before its normal timeout", admitted.status === 200 &&
+      stopOf(admittedEvents) === "end_turn" && Date.now() - started < 30000 &&
+      !fs.existsSync(owners[0].cwd) && owners.slice(1).every(owner => fs.existsSync(owner.cwd)),
+      `status=${admitted.status} elapsed=${Date.now() - started}`)
+
+    const late = continuation(requests[0], pending[0], "actual result delivered after pressure eviction")
+    const replay = await fetchPressure(late)
+    const replayEvents = (await readSSE(replay)).events
+    const replacement = inits().at(-1)
+    const prompt = lastOf("user")
+    check("a late valid tool result replays in a fresh replacement session", replay.status === 200 &&
+      stopOf(replayEvents) === "end_turn" && replacement.convId !== owners[0].convId && !replacement.resumed &&
+      prompt.convId === replacement.convId && prompt.text.includes("<conversation_history>") &&
+      prompt.text.includes("ESCCALL pressure wait 0") && prompt.text.includes(toolCall(pending[0])?.id) &&
+      prompt.text.includes("actual result delivered after pressure eviction"),
+      `status=${replay.status} stop=${stopOf(replayEvents)} prompt=${prompt.text}`)
+    check("pressure evicts an idle session before other eligible detached waits", !fs.existsSync(idle.cwd) &&
+      owners.slice(1).every(owner => fs.existsSync(owner.cwd)))
+    for (let i = 1; i < requests.length; i++) {
+      const result = `preserved pressure result ${i}`
+      const events = (await readSSE(await fetchPressure(continuation(requests[i], pending[i], result)))).events
+      check(`unreclaimed detached turn ${i} still accepts its own result`, stopOf(events) === "end_turn" &&
+        logs().some(event => event.type === "mcpResult" && event.convId === owners[i].convId && JSON.stringify(event.result).includes(result)))
+    }
+  } finally {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+{
+  const savedEnv = Object.fromEntries(["AGY_BRIDGE_MAX_PROCS", "AGY_BRIDGE_DETACHED_EVICT_MS", "AGY_BRIDGE_TOOL_TIMEOUT_MS"]
+    .map(key => [key, process.env[key]]))
+  try {
+    process.env.AGY_BRIDGE_MAX_PROCS = "2"
+    process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
+    process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+    const { default: branchPressureDefault } = await import("./index.mjs?issue-29-branch-pressure")
+    const loader = await (await branchPressureDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+    const fetchBranch = (body, headers) => loader.fetch("agy://local/messages", { method: "POST", headers, body: JSON.stringify(body) })
+    for (const [label, reclaimRoot, rename, normalizeInputs] of [
+      ["original IDs", false, false], ["normalized original IDs", false, false, true],
+      ["canonical IDs", false, true], ["root reclaimed", true, true],
+    ]) {
+      const opening = { model, metadata: { user_id: `pressure-branch-${label}` }, tools: [echoTool],
+        messages: [{ role: "user", content: `shared pressure opening ${label}` }] }
+      const base = (await readSSE(await fetchBranch(opening))).events
+      const root = nextTurn(opening, base, "BRANCHCALL branch 0")
+      const rootPending = (await readSSE(await fetchBranch(root))).events
+      const rootOwner = inits().at(-1)
+      const side = nextTurn(opening, base, "BRANCHCALL branch 1")
+      const sidePending = (await readSSE(await fetchBranch(side))).events
+      const sideOwner = inits().at(-1)
+      const survivor = reclaimRoot ? side : root
+      const survivorPending = reclaimRoot ? sidePending : rootPending
+      const survivorOwner = reclaimRoot ? sideOwner : rootOwner
+      const victim = reclaimRoot ? root : side
+      const victimPending = reclaimRoot ? rootPending : sidePending
+      const victimOwner = reclaimRoot ? rootOwner : sideOwner
+      // Recording the survivor's emitted call refreshes its client clock without
+      // supplying a result or ending its live turn.
+      await new Promise(resolve => setTimeout(resolve, 20))
+      const refresh = await fetchBranch({ ...survivor, messages: [...survivor.messages,
+        { role: "assistant", content: assistantBlocks(survivorPending) }, { role: "user", content: "still waiting" }] })
+      await refresh.text()
+      process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "10"
+      await new Promise(resolve => setTimeout(resolve, 30))
+      const admitted = await fetchBranch({ model, messages: [{ role: "user", content: `pressure admission ${label}` }] })
+      await readSSE(admitted)
+      check(`${label}: pressure removes only the older branch`, admitted.status === 200 &&
+        !fs.existsSync(victimOwner.cwd) && fs.existsSync(survivorOwner.cwd))
+
+      const late = continuation(victim, victimPending, `late branch result ${label}`)
+      if (normalizeInputs) {
+        const call = late.messages.at(-2).content.find(block => block.type === "tool_use")
+        call.input = { ...call.input, replace_all: false }
+      }
+      if (rename) {
+        for (const block of late.messages.at(-2).content) if (block.type === "tool_use") block.id = `renamed-${block.id}`
+        for (const block of late.messages.at(-1).content) block.tool_use_id = `renamed-${block.tool_use_id}`
+      }
+      if (!reclaimRoot) {
+        for (const change of ["history", "tool name", "renamed inputs", "work directory", "incomplete"]) {
+          const unrelated = structuredClone(late)
+          if (change === "history") unrelated.messages.at(-3).content += " changed historical text"
+          if (change === "tool name") unrelated.messages.at(-2).content.find(block => block.type === "tool_use").name = "unrelated_tool"
+          if (change === "renamed inputs") {
+            for (const block of unrelated.messages.at(-2).content) if (block.type === "tool_use") {
+              block.id = `different-${block.id}`
+              block.input = { text: "unrelated" }
+            }
+            for (const block of unrelated.messages.at(-1).content) block.tool_use_id = `different-${block.tool_use_id}`
+          }
+          if (change === "incomplete") unrelated.messages.at(-1).content.push({ type: "tool_result", tool_use_id: "unknown", content: "unrelated" })
+          const rejected = await fetchBranch(unrelated, change === "work directory" ? { "x-magpie-work-dir": stateDir } : undefined)
+          check(`${label}: reclaimed routing rejects ${change} mismatch`, rejected.status === 409 && fs.existsSync(survivorOwner.cwd))
+          await rejected.text()
+        }
+      }
+      process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+      process.env.AGY_BRIDGE_MAX_PROCS = "1"
+      const blockedReplay = await fetchBranch(late)
+      check(`${label}: failed replay admission preserves the surviving branch`, blockedReplay.status === 503 && fs.existsSync(survivorOwner.cwd))
+      await blockedReplay.text()
+      process.env.AGY_BRIDGE_MAX_PROCS = "2"
+      const replay = await fetchBranch(late)
+      const replayEvents = replay.status === 200 ? (await readSSE(replay)).events : []
+      if (replay.status !== 200) await replay.text()
+      const prompt = lastOf("user")
+      check(`${label}: complete results alone replay the reclaimed branch`, replay.status === 200 &&
+        stopOf(replayEvents) === "end_turn" && prompt.convId !== survivorOwner.convId &&
+        prompt.text.includes(`late branch result ${label}`) && fs.existsSync(survivorOwner.cwd) &&
+        !logs().some(event => event.type === "mcpResult" && event.convId === survivorOwner.convId),
+        `status=${replay.status} stop=${stopOf(replayEvents)}`)
+      const result = `surviving branch result ${label}`
+      const done = (await readSSE(await fetchBranch(continuation(survivor, survivorPending, result)))).events
+      check(`${label}: surviving branch completes in its original process`, stopOf(done) === "end_turn" &&
+        logs().some(event => event.type === "mcpResult" && event.convId === survivorOwner.convId && event.result?.content?.[0]?.text === result))
+      process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+    }
+  } finally {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+{
+  const keys = ["AGY_BRIDGE_MAX_PROCS", "AGY_BRIDGE_DETACHED_EVICT_MS", "AGY_BRIDGE_TOOL_TIMEOUT_MS",
+    "FAKE_AGY_TOOL_LIST_DELAY_MS", "AGY_BRIDGE_TOOL_LIST_WAIT_MS"]
+  const savedEnv = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+  try {
+    process.env.AGY_BRIDGE_MAX_PROCS = "1"
+    process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "10"
+    process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
+    process.env.FAKE_AGY_TOOL_LIST_DELAY_MS = "500"
+    process.env.AGY_BRIDGE_TOOL_LIST_WAIT_MS = "2000"
+    const { default: acceptingDefault } = await import("./index.mjs?issue-29-accepting-results")
+    const loader = await (await acceptingDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+    const fetchAccepting = body => loader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
+    const first = { model, tools: [echoTool], messages: [{ role: "user", content: "ESCCALL accepting renamed results" }] }
+    const pending = (await readSSE(await fetchAccepting(first))).events
+    const owner = inits().at(-1)
+    const continued = continuation(first, pending, "accepted result survives catalog wait")
+    continued.tools = [echoTool, { name: "delayed_other", input_schema: { type: "object" } }]
+    for (const block of continued.messages.at(-2).content) if (block.type === "tool_use") block.id = `renamed-${block.id}`
+    for (const block of continued.messages.at(-1).content) block.tool_use_id = `renamed-${block.tool_use_id}`
+    const accepting = fetchAccepting(continued)
+    for (let attempt = 0; attempt < 100 && !logs().some(event => event.type === "toolsListDelayed" && event.convId === owner.convId); attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    await new Promise(resolve => setTimeout(resolve, 30))
+    const blocked = await fetchAccepting({ model, messages: [{ role: "user", content: "concurrent admission during catalog ACK" }] })
+    check("accepted renamed results protect their process while catalog ACK waits", blocked.status === 503 &&
+      fs.existsSync(owner.cwd) && logs().some(event => event.type === "toolsListDelayed" && event.convId === owner.convId) &&
+      !logs().some(event => event.type === "toolsList" && event.reason === "list_changed" && event.convId === owner.convId))
+    await blocked.text()
+    const response = await accepting
+    const events = response.status === 200 ? (await readSSE(response)).events : []
+    if (response.status !== 200) await response.text()
+    check("accepted renamed continuation succeeds after delayed catalog ACK", response.status === 200 && stopOf(events) === "end_turn" &&
+      logs().some(event => event.type === "mcpResult" && event.convId === owner.convId && event.result?.content?.[0]?.text === "accepted result survives catalog wait"))
+  } finally {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+{
+  const savedEnv = Object.fromEntries(["AGY_BRIDGE_MAX_PROCS", "AGY_BRIDGE_DETACHED_EVICT_MS", "AGY_BRIDGE_TOOL_TIMEOUT_MS"]
+    .map(key => [key, process.env[key]]))
+  try {
+    process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
+    process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+    const { default: capacityDefault } = await import("./index.mjs?issue-29-capacity")
+    const capacityLoader = await (await capacityDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+    const fetchCapacity = body => capacityLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
+    // Change the limit after import to cover dynamic configuration as well.
+    delete process.env.AGY_BRIDGE_MAX_PROCS
+    const requests = Array.from({ length: 7 }, (_, i) => ({ model, metadata: { user_id: `issue-29-capacity-${i}` },
+      messages: [{ role: "user", content: `ESCCALL capacity wait ${i}` }], tools: [echoTool] }))
+    const pending = []
+    const owners = []
+    for (let i = 0; i < 6; i++) {
+      if (i === 5) process.env.AGY_BRIDGE_MAX_PROCS = "6"
+      const response = await fetchCapacity(requests[i])
+      pending.push((await readSSE(response)).events)
+      owners.push(inits().at(-1))
+      if (i >= 4) check(`${i === 4 ? "default" : "configured"} process capacity accepts ${i + 1} unfinished tool turns`,
+        response.status === 200 && pending.every(events => stopOf(events) === "tool_use") &&
+        new Set(owners.map(owner => owner.convId)).size === i + 1 && owners.every(owner => fs.existsSync(owner.cwd)) &&
+        !logs().some(event => event.type === "mcpResult" && owners.some(owner => owner.convId === event.convId)))
+    }
+    const before = inits().length
+    const blocked = await fetchCapacity(requests[6])
+    await blocked.text()
+    check("configured capacity still rejects an extra request while all six waits are recent", blocked.status === 503 && inits().length === before)
+    for (let i = 0; i < pending.length; i++) {
+      const result = `capacity result ${i}`
+      const events = (await readSSE(await fetchCapacity(continuation(requests[i], pending[i], result)))).events
+      check(`concurrent capacity turn ${i} retains its original tool owner`, stopOf(events) === "end_turn" &&
+        logs().some(event => event.type === "mcpResult" && event.convId === owners[i].convId && JSON.stringify(event.result).includes(result)))
+    }
+  } finally {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
 }
 
 {

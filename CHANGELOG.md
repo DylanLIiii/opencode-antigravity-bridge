@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.3
+
+- Fix process-pool starvation with parallel subagents and abandoned tool waits
+  (#29). Raise the default pool and Magpie concurrency limits to 16, with a
+  positive-integer `AGY_BRIDGE_MAX_PROCS` override. Under pool pressure, prefer
+  idle processes, then reclaim stale detached turns or detached tool waits with
+  no client progress for `AGY_BRIDGE_DETACHED_EVICT_MS` (default 30 seconds).
+  Protect attached, cancelling and steering turns, plus tool-result continuations
+  awaiting catalog acknowledgment. Complete late tool-result history can replay
+  in a replacement process, including reclaimed forks with a still-active root.
+
 ## 0.3.2
 
 - Prefer AGY 1.5.0+ native steering by sending another prompt in the running

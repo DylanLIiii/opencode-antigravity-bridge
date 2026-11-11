@@ -57,6 +57,20 @@ if (argv.includes("models")) {
   process.stdout.write("gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n")
   process.exit(0)
 }
+if (argv.includes("--login")) {
+  const geminiDir = argv.find(a => a.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
+  log({ type: "login", geminiDir, wslInterop: process.env.WSL_INTEROP, update: process.env.AGY_CLI_DISABLE_AUTO_UPDATE })
+  const q = new URLSearchParams({ client_id: "synthetic", response_type: "code", state: "smoke-login-state",
+    redirect_uri: "https://antigravity.google/oauth-callback", code_challenge: "synthetic", code_challenge_method: "S256" })
+  process.stdout.write("https://accounts.google.com/o/oauth2/auth?" + q + "\n")
+  readline.createInterface({ input: process.stdin }).once("line", code => {
+    if (code !== "4/smoke-login-code") process.exit(3)
+    fs.mkdirSync(path.join(geminiDir, "antigravity-cli"), { recursive: true })
+    fs.writeFileSync(path.join(geminiDir, "antigravity-cli", "antigravity-oauth-token"), JSON.stringify({ refresh_token: "SYNTHETIC_LOGIN_FIXTURE_ONLY" }))
+    process.exit(0)
+  })
+  await new Promise(() => {})
+}
 if (argv[0] !== "acp") {
   process.stderr.write("unknown subcommand\n")
   process.exit(2)
@@ -4276,11 +4290,19 @@ for (const compacted of [true, false]) {
   const methods = importPlugin.auth.methods
   check("default agy login stays first and single:true sentinel identity is kept",
     importPlugin.auth.single === true && methods[0].keyless === true && /agy CLI/.test(methods[0].label) && methods[0].prompts === undefined)
-  const forms = methods.slice(1)
+  const forms = methods.filter(m => m.type === "api" && m.prompts)
   check("import forms are native keyless api methods with bilingual labels and text prompts",
     forms.length === 2 && forms.every(m => m.type === "api" && m.keyless === true && typeof m.authorize === "function" &&
       /[\u4e00-\u9fff]/.test(m.label) && /[A-Za-z]/.test(m.label) && m.prompts.every(p => p.type === "text" && p.key && p.message)))
   const [single, batch] = forms
+  const browserLogin = methods.find(m => m.type === "oauth")
+  check("browser login is a native oauth method asking only for the isolated account name",
+    browserLogin && /Google/.test(browserLogin.label) && browserLogin.prompts.length === 1 &&
+    browserLogin.prompts[0].key === "name" && browserLogin.prompts[0].validate("../bad") &&
+    !browserLogin.prompts[0].validate("browser-account"))
+  const badBrowserLogin = await browserLogin.authorize({ name: "../bad" })
+  check("browser login rejects a bad account name before launching agy",
+    badBrowserLogin.type === "failed" && !fs.existsSync(importRoot))
   check("prompt validators reject bad names and empty paths", single.prompts[0].validate("../x") && single.prompts[0].validate("antigravity-bridge") &&
     !single.prompts[0].validate("work") && single.prompts[1].validate("  ") && batch.prompts[0].validate(""))
   const bad = await single.authorize({ name: "../x", source: srcDir })
@@ -4304,6 +4326,28 @@ for (const compacted of [true, false]) {
   fs.writeFileSync(manifestFile, JSON.stringify([{ name: "batch-c", source: srcDir }, { name: "imported", source: srcDir }]))
   const rolled = await batch.authorize({ manifest: manifestFile })
   check("a colliding manifest fails before any write", rolled.type === "failed" && !fs.existsSync(path.join(importRoot, "batch-c")))
+
+  const ticket = await browserLogin.authorize({ name: "browser-account" })
+  check("browser login returns the official authorization URL and a native paste callback",
+    ticket.method === "code" && new URL(ticket.url).hostname === "accounts.google.com" && typeof ticket.callback === "function")
+  check("a pending browser login is hidden from model discovery",
+    !Object.keys(await importPlugin.provider.models()).some(id => id.startsWith("browser-account/")))
+  const signedIn = await ticket.callback("https://antigravity.google/oauth-callback?code=4%2Fsmoke-login-code&state=smoke-login-state")
+  check("browser callback publishes a credential and returns only the host sentinel",
+    signedIn.type === "success" && signedIn.key === "agy" &&
+    fs.existsSync(path.join(importRoot, "browser-account", "antigravity-cli", "antigravity-oauth-token")))
+  check("browser account models become visible in the same plugin instance",
+    Object.keys(await importPlugin.provider.models()).some(id => id.startsWith("browser-account/")))
+  const browserFetch = (await importPlugin.auth.loader()).fetch
+  const browserEvents = (await readSSE(await browserFetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", body: JSON.stringify({ model: "browser-account/gemini-test", stream: true,
+      metadata: { user_id: "browser-account-routing" }, messages: [{ role: "user", content: "browser login routing probe" }] }),
+  }))).events
+  check("a browser account request uses its published profile for the ACP process",
+    stopOf(browserEvents) === "end_turn" && inits().at(-1)?.geminiDir === path.join(importRoot, "browser-account") && inits().at(-1)?.wslInterop)
+  const browserUsage = await importPlugin.auth.usage()
+  check("browser account usage joins the named quota windows",
+    browserUsage.windows.some(window => window.name.startsWith("[browser-account]")))
   delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
   fs.rmSync(path.dirname(importRoot), { recursive: true, force: true })
   fs.rmSync(srcDir, { recursive: true, force: true })

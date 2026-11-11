@@ -13,7 +13,7 @@ import { importAccounts, ImportError, readManifest, validateAccountName } from "
 import { selectAgy } from "./context-unlock.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
-import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
+import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 
@@ -3968,6 +3968,19 @@ function responseUsage(proc, turn, step, content, result) {
 // latest call's, which is how full the context is; output adds up all of them.
 // Returns null, keeping the estimate, when the store has no new completed call
 // in time or, at the end of a prompt, its calls don't yet add up to ACP's total.
+function isCausalSiblingSubstep(file, cursor) {
+  if (!file || !cursor) return false
+  const checkSteps = cursor.modelStep != null
+  const checkGen = cursor.generationIdx != null || cursor.source === "gen_metadata"
+  if (!checkSteps && !checkGen) return false
+  if (checkSteps && latestModelStep(file) !== cursor.modelStep) return false
+  if (checkGen) {
+    const expectedGen = cursor.generationIdx ?? cursor.idx
+    if (latestGenerationIdx(file) !== expectedGen) return false
+  }
+  return true
+}
+
 async function measuredUsage(turn, step, result) {
   if (step.settled || !turn.stepsFile || turn.stepCursor == null) return null
   const final = result !== undefined
@@ -3985,6 +3998,30 @@ async function measuredUsage(turn, step, result) {
   if (!fs.existsSync(turn.stepsFile)) return null
   // A read can also fail while agy is writing; that is retried too.
   let batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+  // Staggered parallel MCP tool calls from an already-settled model generation
+  // produce no new model step or generation row. Confirm after one poll grace
+  // tick so WAL commits settle, then emit 0 incremental usage without clearing
+  // turn.stepCursor or stalling 1000ms per sibling call.
+  if (!final && turn.measured && Array.isArray(batch?.steps) && batch.steps.length === 0 &&
+      isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
+    await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
+    batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+    if (Array.isArray(batch?.steps) && batch.steps.length === 0 &&
+        isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
+      step.usageKind = "agy_sibling"
+      step.modelCalls = 0
+      logBridgeEvent(turn.proc, turn, "agy_sibling", turn.stepCursor.source || "unknown", {}, {
+        model: turn.proc.currentModel, effort: turn.proc.currentEffort,
+        cursor_idx: turn.stepCursor.idx, cursor_model_step: turn.stepCursor.modelStep,
+      })
+      return {
+        input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        output_tokens: 0,
+      }
+    }
+  }
   while (!complete(batch?.steps) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
     batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
@@ -3999,7 +4036,12 @@ async function measuredUsage(turn, step, result) {
   const last = steps.at(-1)
   const output = steps.reduce((sum, item) => sum + item.output + item.thinking, 0)
   const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
-  turn.stepCursor = { source: batch.source, idx: last.idx }
+  turn.stepCursor = {
+    source: batch.source,
+    idx: last.idx,
+    generationIdx: latestGenerationIdx(turn.stepsFile),
+    modelStep: latestModelStep(turn.stepsFile),
+  }
   turn.measured = { prompt }
   step.usageKind = "agy_model_call"
   step.modelCalls = steps.length

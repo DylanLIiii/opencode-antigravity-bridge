@@ -178,6 +178,27 @@ export function lastModelStep(file) {
   return Number.isSafeInteger(idx) ? idx : null
 }
 
+// Highest model-call step index regardless of status, -1 for an empty or
+// missing store, null when the store exists without `steps` or cannot be read.
+export function latestModelStep(file) {
+  if (!file) return null
+  if (!fs.existsSync(file)) return -1
+  const rows = query(file,
+    `SELECT COALESCE(MAX(idx), -1) AS idx FROM steps WHERE step_type = ${MODEL_STEP}`)
+  const idx = Number(rows?.[0]?.idx)
+  return Number.isSafeInteger(idx) ? idx : null
+}
+
+// Highest generation record index, -1 for an empty or missing store, null when
+// `gen_metadata` is absent or cannot be read.
+export function latestGenerationIdx(file) {
+  if (!file) return null
+  if (!fs.existsSync(file)) return -1
+  const rows = query(file, "SELECT COALESCE(MAX(idx), -1) AS idx FROM gen_metadata")
+  const idx = Number(rows?.[0]?.idx)
+  return Number.isSafeInteger(idx) ? idx : null
+}
+
 // Completed model calls after `afterIdx`, oldest first: [{ idx, input, output, write, read, thinking }].
 export function modelStepsAfter(file, afterIdx) {
   const rows = query(file,
@@ -198,15 +219,15 @@ export function modelStepsAfter(file, afterIdx) {
 // generation twice. A new store is discovered after its first generation.
 export function modelUsageCursor(file) {
   if (!file) return null
-  if (!fs.existsSync(file)) return { source: null, idx: -1, generationIdx: -1 }
-  const rows = query(file, "SELECT COALESCE(MAX(idx), -1) AS idx FROM gen_metadata")
-  const generationIdx = Number(rows?.[0]?.idx)
+  if (!fs.existsSync(file)) return { source: null, idx: -1, generationIdx: -1, modelStep: -1 }
+  const generationIdx = latestGenerationIdx(file)
   const step = lastModelStep(file)
-  if (Number.isSafeInteger(generationIdx)) {
-    return step === null ? { source: "gen_metadata", idx: generationIdx }
-      : { source: null, idx: step, generationIdx }
+  const modelStep = latestModelStep(file)
+  if (generationIdx !== null) {
+    return step === null ? { source: "gen_metadata", idx: generationIdx, modelStep }
+      : { source: null, idx: step, generationIdx, modelStep }
   }
-  return step === null ? null : { source: "steps", idx: step }
+  return step === null ? null : { source: "steps", idx: step, modelStep }
 }
 
 export function modelUsageAfter(file, cursor) {

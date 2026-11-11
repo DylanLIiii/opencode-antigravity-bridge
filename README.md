@@ -297,7 +297,7 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
 - **用量**：ACP 一轮只给一次累计值、agy 不推 `usage_update`；插件从 agy 本地会话库
   （`~/.gemini/antigravity-cli/conversations/<sessionId>.db`）优先读 `gen_metadata`，
   生成结束即能读取，工具等待期间也可得到真实用量。旧版或未使用该表的会话使用完成的
-  `steps` 记录，同一回合固定一个来源。每个响应报自己覆盖的调用（含缓存读），最终与
+  `steps` 记录，同一回合固定一个来源。每个响应报自己覆盖的调用（含缓存读），同一模型生成拆出的后续并行工具子步报 `0` 增量用量并保留游标，最终与
   ACP 累计输入核对。运行时无 `node:sqlite` / `bun:sqlite` 或读不到完整记录时回落估算；
   `AGY_BRIDGE_STEP_USAGE=0` 可完全关闭会话库读取。
 - **长输出续写**：撞 `max_tokens` 时在同一会话、同一响应里自动续写，最多 3 次

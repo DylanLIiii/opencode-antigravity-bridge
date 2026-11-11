@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 import { DEFAULT_ACCOUNT, invalidateAccounts, listAccounts, splitModelAccount } from "./accounts.mjs"
 import { importAccounts, ImportError, readManifest, validateAccountName } from "./accounts-import.mjs"
+import { createAccountLoginMethod } from "./accounts-login.mjs"
 import { selectAgy } from "./context-unlock.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
@@ -4578,6 +4579,11 @@ function expandHome(value) {
 
 export const AntigravityBridgePlugin = async () => {
   const readUsage = createUsageReader(findAgy, { resolveAccounts: agy => getAccounts(agy) })
+  const accountLogin = createAccountLoginMethod(findAgy, { onImport: () => {
+    accountsCache = null
+    invalidateAccounts()
+    catalogCache.clear()
+  } })
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -4611,6 +4617,7 @@ export const AntigravityBridgePlugin = async () => {
           },
         },
         ...ACCOUNT_IMPORT_METHODS,
+        accountLogin,
       ],
       loader: async () => {
         return {

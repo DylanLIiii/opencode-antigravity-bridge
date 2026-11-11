@@ -32,8 +32,10 @@ Google Code Assist backend
 
 ## Requirements
 
-- Antigravity CLI (`agy`) with the `acp` subcommand, signed in interactively at
-  least once. Text/tool transport was verified with **1.4.12** and **1.5.0**;
+- Antigravity CLI (`agy`) with the `acp` subcommand. Add a separate Google login
+  in Magpie or reuse an existing CLI login. UI sign-in requires `agy acp --login`
+  (authorization-link and input behavior checked with **1.5.4**).
+  Text/tool transport was verified with **1.4.12** and **1.5.0**;
   user image input requires an image-capable ACP server (verified with **1.5.0**).
 - magpie with OpenCode-style provider plugin support.
 - No global MCP configuration is required, and none is used: the plugin creates
@@ -49,16 +51,43 @@ magpie plugin add ./opencode-antigravity-bridge
 
 ## Use
 
-1. Run `agy` interactively once and sign in to your Google account.
-2. In magpie, choose Providers → Antigravity Bridge → Sign in. This verifies
-   the CLI with `agy models`; agy owns the actual Google credentials.
-3. Pick a model and, when offered, a thinking level. Effort-specific IDs from
+1. In Magpie, choose Providers → Antigravity Bridge → Sign in →
+   **Sign in a new agy account with Google**, and name the account, e.g. `work`.
+2. Follow the browser link, sign in with Google, then paste the full address of
+   the final callback page (recommended), or its authorization code, into Magpie.
+3. Pick `work/<model>` and, when offered, a thinking level. Effort-specific IDs from
    `agy models` are grouped into one model with variants, then mapped back to
    the corresponding agy ID for each request.
 
-**Multiple accounts**: put each extra account in
+To reuse agy's existing default sign-in, choose **Sign in with the agy CLI**.
+That method verifies `agy models`; it does not start a new Google login.
+
+**Browser sign-in.** The new method starts the official `agy acp --login` in a
+hidden staging profile. The CLI sends the browser to
+`https://antigravity.google/oauth-callback`, so the current flow needs a paste;
+it does not finish automatically through localhost. Remote Magpie uses the same
+flow. A full callback URL must match the original redirect origin, path and state.
+The bridge sends its code to the waiting CLI over stdin. agy owns PKCE, token
+exchange, credential format and subsequent refresh.
+
+The account is published through the import backend only after the CLI exits
+successfully, writes a file credential containing a refresh token, and an isolated
+`agy models` check succeeds. Its model caches are invalidated. Credentials stay in
+the bridge's named-account directory; Magpie's auth store receives only the `agy`
+sentinel. The login forces file storage, and existing accounts are never overwritten.
+On POSIX, directories are `0700` and published tokens `0600`; see the Windows
+permission requirements below.
+
+Sign-ins expire after 10 minutes. Starting another sign-in cleans the previous
+one up. Cancellation during the start or completion step also cleans up. Closing
+the UI while it waits for a paste leaves no RPC signal for the plugin to observe;
+the hidden profile and child process are removed on expiry or the next sign-in.
+After a failed attempt, start again and use a fresh callback or code.
+
+**Multiple accounts**: UI sign-in prepares each account in
 `~/.config/magpie-agy-bridge/accounts/<name>/` (override the root with
-`AGY_BRIDGE_ACCOUNTS_DIR`) as a full Gemini directory, and sign in once inside it:
+`AGY_BRIDGE_ACCOUNTS_DIR`). Alternatively, prepare a full Gemini directory and
+sign in once inside it:
 
 ```sh
 agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work

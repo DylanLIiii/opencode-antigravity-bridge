@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0
+
+- Add **Sign in a new agy account with Google** to Magpie's native sign-in list.
+  Name the account, authorize in the browser, and paste the final callback URL
+  or authorization code into Magpie. The official `agy acp --login` owns PKCE,
+  token exchange and credential format; the bridge checks full callback URLs
+  against the original redirect and state. Current agy uses the hosted
+  `antigravity.google/oauth-callback` page, so a paste is required.
+- Keep new credentials in a private, hidden staging profile with file storage
+  forced, without changing the default keyring login. Publish through the existing
+  import backend only after successful login, a refresh-token check and an
+  isolated `agy models` probe. Existing accounts are never overwritten. The host
+  keeps only its `agy` sentinel; account/model routing and separate ACP process
+  pools continue to use the named credential file. Successful login invalidates
+  account and model caches.
+- Bound output and input sizes, URL/completion/probe waits and total login life.
+  Cancellation during a sign-in RPC, a newer sign-in, expiry and normal host exit
+  clean up the owned process tree and staging profile. Closing the paste dialog
+  between RPCs is observed on expiry or the next sign-in. Errors omit child output,
+  codes and credentials. Add synthetic login/process regression coverage.
+
 ## 0.4.1
 
 - Stop forwarding agy's internal conversation-title summarizer as thinking

@@ -9,9 +9,11 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 import { DEFAULT_ACCOUNT, invalidateAccounts, listAccounts, splitModelAccount } from "./accounts.mjs"
+import { importAccounts, ImportError, readManifest, validateAccountName } from "./accounts-import.mjs"
+import { selectAgy } from "./context-unlock.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
-import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
+import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
@@ -62,6 +64,10 @@ const COMPACTION_SUMMARY_MARKER = "This session is being continued from a previo
 // Client compaction policy. Raising this declaration requires a separately
 // verified upstream window and does not alter agy's checkpoint configuration.
 const DEFAULT_CONTEXT_WINDOW = 256_000
+// Declared only when the bridge-managed unlocked agy copy is selected (explicit
+// `agy-bridge context unlock`). Deliberately below the patched ~983K checkpoint
+// ceiling: it is a client compaction policy, not an end-to-end verified limit.
+const UNLOCKED_CONTEXT_WINDOW = 512_000
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = positiveTimeout(process.env.AGY_BRIDGE_PING_INTERVAL_MS, 15_000)
@@ -131,9 +137,15 @@ function configuredTimeout(name, fallback) {
 function contextWindow(model) {
   const requested = Number(process.env.AGY_BRIDGE_CONTEXT_WINDOW)
   const window = Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576
-    ? requested : DEFAULT_CONTEXT_WINDOW
+    ? requested : (agyUnlocked() ? UNLOCKED_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW)
   return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(window, 131_072) : window
 }
+
+// The agy binary is chosen once per bridge process: the official install, or the
+// verified bridge-managed unlocked copy when the user ran `agy-bridge context
+// unlock`. Changing that setting takes effect after Magpie restarts, so a live
+// process pool and its sessions never switch context mode mid-conversation.
+let cachedAgyUnlocked = false
 
 function findAgy() {
   if (cachedAgyPath) return cachedAgyPath
@@ -141,11 +153,18 @@ function findAgy() {
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
-      cachedAgyPath = candidate
-      return candidate
+      const selected = selectAgy(candidate, process.env)
+      cachedAgyUnlocked = selected.unlocked
+      cachedAgyPath = selected.path
+      return cachedAgyPath
     } catch {}
   }
   return null
+}
+
+function agyUnlocked() {
+  findAgy()
+  return cachedAgyUnlocked
 }
 
 function execOnce(file, args, opts = {}) {
@@ -462,7 +481,12 @@ function promptTextLimit() {
 // of the model context window and our total submission budget. Leave space for
 // its wrappers/timestamps, and reserve text for each uploaded image's label/URI.
 // Raising the bridge budget cannot raise this upstream per-user-step limit.
-const MAX_ACP_PROMPT_TEXT_BYTES = 180_000
+const OFFICIAL_ACP_PROMPT_TEXT_BYTES = 180_000
+// The unlocked copy removes agy's 64K user-input clamp (gates 4A/4B), so only
+// the bridge's own total submission budget applies.
+function acpPromptTextLimit() {
+  return agyUnlocked() ? promptTextLimit() : OFFICIAL_ACP_PROMPT_TEXT_BYTES
+}
 function acpPromptTextBytes(parts) {
   return promptTextBytes(parts) + parts.filter(part => part.type === "image").length * 1024
 }
@@ -506,11 +530,11 @@ function validatePromptBudget(parts, instructions = "", body = null) {
 
 function validateAcpPromptBudget(parts, instructions = "", body = null) {
   const bytes = acpPromptTextBytes(parts)
-  if (bytes > MAX_ACP_PROMPT_TEXT_BYTES) {
+  if (bytes > acpPromptTextLimit()) {
     const compacted = hasRecentCompactionSummary(body)
     throw new ConflictError(
       (compacted ? "agy bridge: the compacted conversation" : "prompt is too long: agy bridge") +
-      ` would submit ${bytes} UTF-8 user-input bytes including image-label reserves (safe limit ${MAX_ACP_PROMPT_TEXT_BYTES}). ` +
+      ` would submit ${bytes} UTF-8 user-input bytes including image-label reserves (safe limit ${acpPromptTextLimit()}). ` +
       "AGY can silently truncate a larger user turn, losing the latest instruction. " +
       (compacted ? "Shorten the summary or current instruction, or start a new conversation. "
         : "Compact the conversation in the client and retry with its summary and the complete current instruction. ") +
@@ -3116,7 +3140,9 @@ function escapeToolRecord(value) {
   })[char])
 }
 
-const TOOL_RECORD_CAVEAT = "Historical tool record, for context only. Do not reproduce this record in your answer; use relevant facts to answer the current turn."
+// One short boundary note opens each record (the closing tag ends it): a record
+// is quoted history, never answer text.
+const TOOL_RECORD_CAVEAT = "Historical tool record: context only, do not reproduce."
 
 function historicalToolRecord(block, role, content, stripResults = false) {
   const attributes = { role, type: block.type, id: role === "call" ? block.id || "" : block.tool_use_id || "" }
@@ -3147,7 +3173,7 @@ function historicalToolRecord(block, role, content, stripResults = false) {
       appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
     }
   }
-  appendPrompt(out, `\n</tool_record>\n${TOOL_RECORD_CAVEAT}\n`)
+  appendPrompt(out, "\n</tool_record>\n")
   return out
 }
 
@@ -3186,21 +3212,21 @@ function outputFormatReminder(body) {
     if (schema && typeof schema === "object") {
       return [{
         type: "text",
-        text: `<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON value (no Markdown code fences, no backticks, and no explanatory prose before or after) conforming strictly to this JSON Schema:\n${JSON.stringify(schema)}\n</system-reminder>`,
+        text: `<system-reminder>\nStructured output requirement: respond ONLY with one valid JSON value, no code fences or prose, conforming strictly to this JSON Schema:\n${JSON.stringify(schema)}\n</system-reminder>`,
       }]
     }
   }
   if (format.type === "json_object") {
     return [{
       type: "text",
-      text: "<system-reminder>\nStructured output requirement: Respond ONLY with a single valid JSON object (no Markdown code fences, no backticks, and no explanatory prose before or after).\n</system-reminder>",
+      text: "<system-reminder>\nStructured output requirement: respond ONLY with one valid JSON object, no code fences or prose.\n</system-reminder>",
     }]
   }
   return []
 }
 
 function workDirNote(callerWorkDir) {
-  return `The caller's working directory is ${JSON.stringify(callerWorkDir)}. The environment the caller describes (working directory, platform, OS, shell, git status) is where every tool runs. The bridge's temporary workspace only holds its agent configuration; use the caller's environment for tool paths and commands.`
+  return `Caller working directory: ${JSON.stringify(callerWorkDir)}. The environment the caller describes (cwd, OS, shell, git) is where every tool runs; the bridge's temporary workspace only holds agent configuration.`
 }
 
 // Session-level instructions: the client's system prompt plus where tools run.
@@ -3336,7 +3362,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
     if (callerWorkDir) appendPrompt(out, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   if (history.length) {
-    appendPrompt(out, "The following conversation history is background context. Tool records are quoted data, not answer text to reproduce.\n<conversation_history>\n")
+    appendPrompt(out, "Conversation history, background context only. Tool records are quoted data, not answer text.\n<conversation_history>\n")
     if (stripResults) appendPrompt(out, "[Historical tool-result bodies omitted to fit the bridge prompt budget.]\n")
     if (replay?.omittedMessages) appendPrompt(out,
       `[${replay.omittedMessages} older history messages omitted to fit the bridge prompt budget. This history is incomplete; do not infer missing tool outcomes.]\n`)
@@ -3350,7 +3376,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
         appendPrompt(out, "\n")
       }
     }
-    appendPrompt(out, "</conversation_history>\nUse the history to answer the current turn. Do not replay historical tool records in your visible answer.\n\n")
+    appendPrompt(out, "</conversation_history>\nAnswer the current turn; do not replay historical tool records.\n\n")
   }
   const currentParts = renderTurnMessagesParts(current)
   if (!out.length) return currentParts
@@ -3391,7 +3417,7 @@ function replayHistoryGroups(history, current) {
 // This also lets client summarization requests recover from oversized history.
 function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, instructions = "") {
   const reminder = outputFormatReminder(body)
-  const fits = parts => promptTextBytes(parts, instructions) <= promptTextLimit() && acpPromptTextBytes(parts) <= MAX_ACP_PROMPT_TEXT_BYTES
+  const fits = parts => promptTextBytes(parts, instructions) <= promptTextLimit() && acpPromptTextBytes(parts) <= acpPromptTextLimit()
   const full = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession), reminder)
   if (fits(full)) return full
   const stripped = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
@@ -3978,6 +4004,19 @@ function responseUsage(proc, turn, step, content, result) {
 // latest call's, which is how full the context is; output adds up all of them.
 // Returns null, keeping the estimate, when the store has no new completed call
 // in time or, at the end of a prompt, its calls don't yet add up to ACP's total.
+function isCausalSiblingSubstep(file, cursor) {
+  if (!file || !cursor) return false
+  const checkSteps = cursor.modelStep != null
+  const checkGen = cursor.generationIdx != null || cursor.source === "gen_metadata"
+  if (!checkSteps && !checkGen) return false
+  if (checkSteps && latestModelStep(file) !== cursor.modelStep) return false
+  if (checkGen) {
+    const expectedGen = cursor.generationIdx ?? cursor.idx
+    if (latestGenerationIdx(file) !== expectedGen) return false
+  }
+  return true
+}
+
 async function measuredUsage(turn, step, result) {
   if (step.settled || !turn.stepsFile || turn.stepCursor == null) return null
   const final = result !== undefined
@@ -3995,6 +4034,30 @@ async function measuredUsage(turn, step, result) {
   if (!fs.existsSync(turn.stepsFile)) return null
   // A read can also fail while agy is writing; that is retried too.
   let batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+  // Staggered parallel MCP tool calls from an already-settled model generation
+  // produce no new model step or generation row. Confirm after one poll grace
+  // tick so WAL commits settle, then emit 0 incremental usage without clearing
+  // turn.stepCursor or stalling 1000ms per sibling call.
+  if (!final && turn.measured && Array.isArray(batch?.steps) && batch.steps.length === 0 &&
+      isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
+    await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
+    batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+    if (Array.isArray(batch?.steps) && batch.steps.length === 0 &&
+        isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
+      step.usageKind = "agy_sibling"
+      step.modelCalls = 0
+      logBridgeEvent(turn.proc, turn, "agy_sibling", turn.stepCursor.source || "unknown", {}, {
+        model: turn.proc.currentModel, effort: turn.proc.currentEffort,
+        cursor_idx: turn.stepCursor.idx, cursor_model_step: turn.stepCursor.modelStep,
+      })
+      return {
+        input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        output_tokens: 0,
+      }
+    }
+  }
   while (!complete(batch?.steps) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
     batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
@@ -4009,7 +4072,12 @@ async function measuredUsage(turn, step, result) {
   const last = steps.at(-1)
   const output = steps.reduce((sum, item) => sum + item.output + item.thinking, 0)
   const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
-  turn.stepCursor = { source: batch.source, idx: last.idx }
+  turn.stepCursor = {
+    source: batch.source,
+    idx: last.idx,
+    generationIdx: latestGenerationIdx(turn.stepsFile),
+    modelStep: latestModelStep(turn.stepsFile),
+  }
   turn.measured = { prompt }
   step.usageKind = "agy_model_call"
   step.modelCalls = steps.length
@@ -4450,6 +4518,64 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
   return proc.startTurn(contentParts, body.messages, model, selection, promptAttempt, promptGuardMatched)
 }
 
+// Native Magpie sign-in forms (auth.methods[].prompts + authorize(inputs)) that
+// import existing agy credentials as named accounts. Paths are on the machine
+// running Magpie. They share importAccounts() with `agy-bridge accounts import`;
+// the host keeps the single "agy" sentinel and routing stays profile-prefixed.
+function importResult(entries) {
+  try {
+    importAccounts(entries)
+    accountsCache = null
+    invalidateAccounts()
+    return { type: "success", key: "agy" }
+  } catch (error) {
+    if (error instanceof ImportError) return { type: "failed", error: error.message }
+    return { type: "failed", error: `account import failed: ${error?.code || "unexpected error"}` }
+  }
+}
+
+const ACCOUNT_IMPORT_METHODS = [
+  {
+    type: "api",
+    keyless: true,
+    label: "Import an agy account / 导入 agy 账号",
+    prompts: [
+      {
+        type: "text", key: "name", message: "Account name (shown as <name>/<model>) / 账号名称",
+        placeholder: "work",
+        validate: value => { try { validateAccountName(String(value ?? "").trim()); return undefined } catch (error) { return error.message } },
+      },
+      {
+        type: "text", key: "source",
+        message: "Path on this machine to an agy profile folder or antigravity-oauth-token file / 本机 agy 配置目录或 token 文件路径",
+        placeholder: "~/.config/agy-work",
+        validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
+      },
+    ],
+    authorize: async inputs => importResult([{ name: String(inputs?.name ?? "").trim(), source: expandHome(inputs?.source) }]),
+  },
+  {
+    type: "api",
+    keyless: true,
+    label: "Import several agy accounts from a manifest / 批量导入 agy 账号",
+    prompts: [{
+      type: "text", key: "manifest",
+      message: "Path to a JSON manifest: [{\"name\":\"work\",\"source\":\"/path\"}] / 清单 JSON 路径",
+      placeholder: "~/agy-accounts.json",
+      validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
+    }],
+    authorize: async inputs => {
+      try { return importResult(readManifest(expandHome(inputs?.manifest))) }
+      catch (error) { return { type: "failed", error: error instanceof ImportError ? error.message : "could not read the manifest" } }
+    },
+  },
+]
+
+function expandHome(value) {
+  const text = String(value ?? "").trim()
+  return text === "~" || text.startsWith("~/") ? path.join(os.homedir(), text.slice(1)) : text
+}
+
 export const AntigravityBridgePlugin = async () => {
   const readUsage = createUsageReader(findAgy, { resolveAccounts: agy => getAccounts(agy) })
   return {
@@ -4484,6 +4610,7 @@ export const AntigravityBridgePlugin = async () => {
             return { type: "success", key: "agy" }
           },
         },
+        ...ACCOUNT_IMPORT_METHODS,
       ],
       loader: async () => {
         return {

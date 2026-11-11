@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.5
+## 0.4.1
 
 - Stop forwarding agy's internal conversation-title summarizer as thinking
   (#39). agy 1.5.5 reports that helper's reasoning as ordinary
@@ -21,6 +21,50 @@
   arrives mid-word, or without one of the prompt's distinguishing phrases, can
   still reach the client. A legitimate thought echoing the same signature can be
   suppressed; use the diagnostic override to inspect the unfiltered stream.
+
+## 0.4.0
+
+- Add native account import. Magpie's sign-in list now has "Import an agy
+  account" and "Import several agy accounts from a manifest" forms (text prompts
+  and `authorize(inputs)`), and the packaged `agy-bridge accounts import` CLI
+  calls the same backend. Sources are an existing agy profile directory or an
+  `antigravity-oauth-token` file on the Magpie host; a manifest is
+  `[{"name","source"}]`. Everything is validated before the first write, imports
+  are all-or-nothing, existing accounts are never overwritten, names reject
+  traversal/reserved/colliding values, tokens are written `0600` in `0700`
+  directories, and credentials are never printed. Keyring-wrapped
+  (`go-keyring-base64:`) sources are unwrapped to native JSON. The accounts
+  cache is now per accounts root.
+- Add an optional, default-off context unlock: `agy-bridge context
+  status|unlock|disable`. `unlock` copies the official agy into a bridge-managed
+  directory and applies the pinned, SHA-256-checked
+  [dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle/tree/0a90ec37c69430608084e33ebc2f891e328c9e89/agy-context-unlock)
+  patch (MIT, see `vendor/agy-context-unlock`) to the copy only, re-checks all six
+  gates, and records source/patcher/patched SHA-256, version and architecture.
+  Selection verifies both source and copy hashes; the cache also tracks ctime.
+  Published copies are immutable and reused by hash, failed manifest publication
+  preserves the previous selection, and old copies remain until explicit purge.
+  The official install is never modified; unknown or failing builds keep the
+  default. Only while a verified copy is selected does the bridge declare a 512K
+  client window and lift its own 180,000-byte ACP submission clamp
+  (GPT-OSS stays at 131,072). The selection is made when Magpie starts. Upstream
+  verified the patch only up to agy 1.5.3; no end-to-end long-context run was done
+  here for 1.5.4 or any platform.
+- Shorten bridge-owned prompt scaffolding without touching user, system, tool
+  result, image or schema content: the historical tool-record caveat is stated
+  once per record instead of twice (per call/result pair 755 -> 331 UTF-8 bytes),
+  and the history preamble, working-directory note and structured-output
+  reminders are shorter (before/after UTF-8 bytes in
+  `docs/plans/2026-11-11-import-context-prompt.md`).
+
+## 0.3.5
+
+- Preserve per-step SQLite usage cursors across staggered parallel MCP tool
+  calls from an already-measured model generation. Confirm after one poll tick
+  that neither `steps` (`step_type = 15`) nor `gen_metadata` has advanced, then
+  report zero incremental usage (`agy_sibling`) without waiting out the 1-second
+  store timeout, recalibrating token ratios on zeros, or dropping
+  `turn.stepCursor` before subsequent generations and `end_turn` reconciliation.
 
 ## 0.3.4
 

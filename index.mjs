@@ -13,6 +13,7 @@ import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
+import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 
 const PROVIDER_ID = "antigravity-bridge"
@@ -82,6 +83,11 @@ const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim()
 // Only the minimal agent costs ~500 input tokens; the default agy agent costs ~8,400.
 const MINIMAL_AGENT = process.env.AGY_BRIDGE_MINIMAL_AGENT !== "0"
 const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
+// agy's internal conversation-title summarizer streams its own reasoning as
+// thought chunks in the same ACP turn as the user's request (#39). Drop the
+// ones that echo its prompt; the primary turn's reasoning stays intact. Set
+// AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS=1 to forward them for diagnosis.
+const FILTER_SUMMARY_THOUGHTS = process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS !== "1"
 
 const FALLBACK_MODELS = [
   { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
@@ -719,6 +725,8 @@ class Turn {
     this.agentError = false
     this.heldText = ""
     this.outputLimit = new OutputLimitFilter()
+    // agy's title summarizer shares this session's thought stream (#39).
+    this.summaryThoughts = FILTER_SUMMARY_THOUGHTS ? new SummaryThoughtFilter() : null
     this.continuations = 0
     // Cursor of the last model call in agy's conversation store already
     // reported; null when the store can't be read and usage is estimated.
@@ -863,8 +871,27 @@ class Turn {
 
   pushText(chunk) {
     if (this.done || this.agentError) return
+    // Thinking blocks must stay ahead of the answer text that follows them.
+    this.flushThoughts()
     const text = this.outputLimit.push(chunk)
     if (text) this.#pushVisible(text)
+  }
+
+  // A thought chunk is forwarded as a thinking block unless it is agy's own
+  // title-summary reasoning (#39). The caller has already renewed the progress
+  // clock, so suppressing a chunk never makes the turn look idle.
+  pushThought(chunk) {
+    if (this.done || this.finalized) return
+    const text = this.summaryThoughts ? this.summaryThoughts.push(chunk) : chunk
+    if (text) this.push({ type: "thinking", text })
+  }
+
+  // Any held thought prefix is real reasoning only when it never completed the
+  // summarizer signature; release it rather than lose output.
+  flushThoughts() {
+    if (!this.summaryThoughts) return
+    const text = this.summaryThoughts.flush()
+    if (text && !this.done && !this.finalized) this.push({ type: "thinking", text })
   }
 
   // Withholds a possible prefix of agy's error marker until it can be classified.
@@ -890,6 +917,9 @@ class Turn {
 
   flushText() {
     if (this.agentError) return
+    // Buffered thought text belongs to this response and must precede the text
+    // or tool call that ended the burst.
+    this.flushThoughts()
     const rest = this.outputLimit.flush()
     if (rest) this.#pushVisible(rest)
     if (!this.heldText || this.agentError) return
@@ -900,6 +930,9 @@ class Turn {
 
   complete(result) {
     if (this.done) return
+    // Pending thought text is real reasoning unless the summarizer signature
+    // completed; release it before the stream closes.
+    this.flushThoughts()
     this.done = true
     for (const attempt of [this.promptAttempt, ...this.steeringAttempts].filter(Boolean)) {
       if (!attempt.submitted) releasePromptAttempt(attempt)
@@ -1345,7 +1378,7 @@ class Proc {
       const text = update.content?.type === "text" ? update.content.text : ""
       if (typeof text === "string" && text.length) {
         turn.arm()
-        turn.push({ type: "thinking", text })
+        turn.pushThought(text)
       }
     }
   }
@@ -1829,6 +1862,9 @@ class Proc {
         turn.events = turn.events.filter(event => !["text", "thinking"].includes(event.type))
         turn.heldText = ""
         turn.outputLimit = new OutputLimitFilter()
+        // Buffered thought text predates the steering prompt too, and its
+        // summarizer probe no longer continues from what was held.
+        turn.summaryThoughts?.flush()
         const number = turn.beginPrompt(parts, late)
         pending.promise = this.conn.request("session/prompt", {
           sessionId: this.sessionId,

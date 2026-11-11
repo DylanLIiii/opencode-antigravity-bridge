@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.5
+
+- Stop forwarding agy's internal conversation-title summarizer as thinking
+  (#39). agy 1.5.5 reports that helper's reasoning as ordinary
+  `agent_thought_chunk` updates in the user's own turn, so one turn could carry
+  dozens of multi-kilobyte chunks that all began with the same summarizer prompt
+  echo, flooding the transcript and collapsing prefix-keyed reasoning in clients.
+  The bridge now suppresses a thought only when it both opens with the
+  summarizer's `Thinking Process:` header and echoes its own step, goal and length
+  instruction within the opening window, plus a bounded continuation region for
+  the recognizable fields of that prompt when they arrive in a later chunk.
+  Unrelated reasoning, including summary tasks without that signature, passes
+  through.
+  Streaming, thought signatures and the turn's activity timeout are preserved:
+  suppressed chunks still count as agy output. `AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS=1`
+  forwards them again for diagnosis.
+- Known limits: the filter is a content heuristic, because no native ACP source
+  discriminator has been verified for these updates; a summary continuation that
+  arrives mid-word, or without one of the prompt's distinguishing phrases, can
+  still reach the client. A legitimate thought echoing the same signature can be
+  suppressed; use the diagnostic override to inspect the unfiltered stream.
+
 ## 0.3.4
 
 - Fix named accounts on Windows reusing the default sign-in. agy prefers the

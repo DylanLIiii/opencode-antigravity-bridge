@@ -110,6 +110,23 @@ agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
 选择器里，选哪个就走哪个账号；会话、进程、快照和额度都按账号隔离。默认账号
 （agy 自己的全局登录态，模型不带前缀）始终保留。要求 agy 支持 `--gemini_dir`
  且账号使用文件 token 登录态——钥匙串/ADC 登录态是整机全局的，无法按目录隔离。
+
+**导入账号**：除了在配置目录里登录，也可以导入已有的 agy 登录——在 Magpie 登录列表选
+"Import an agy account / 导入 agy 账号"（或批量导入），或用随包 CLI。路径是运行
+Magpie 那台机器上的路径，两者调用同一个后端：
+
+```sh
+agy-bridge accounts import work ~/.config/agy-work             # 配置目录
+agy-bridge accounts import work ~/token/antigravity-oauth-token   # token 文件
+agy-bridge accounts import --manifest accounts.json             # [{"name","source"}]
+agy-bridge accounts list
+```
+
+导入只复制 `antigravity-cli/antigravity-oauth-token`（`0600`，目录 `0700`）到
+`<账号根目录>/<名称>/`，之后仍由 agy 自己刷新。已存在的账号绝不覆盖（换个名称即可）；
+清单会先整体校验再写入，批量导入要么全成功要么全不变；token 不会被打印。导入后刷新
+模型目录。Magpie 自带的 `magpie accounts import antigravity` 是另一套内置账号存储，
+不会流入本插件。
 刷新模型目录会重新扫描账号目录。
 
 **Windows 文件登录态**：原生 Windows 上 agy 把默认登录放在 Windows 凭据管理器
@@ -202,6 +219,35 @@ Magpie 另有插件并发上限 16。池满时优先淘汰空闲进程，然后�
 GPT-OSS 的声明始终取配置值与 131,072 中的较小值。
 窗口声明只改变客户端收到的元数据，扩容效果仍取决于 AGY 本身。
 每次提交的 1 MiB 文本预算另由 `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` 控制。
+
+#### 可选上下文解锁（默认关闭）
+
+agy 没有原生参数可以放大上下文窗口或解除单条消息 64K 截断，唯一已知办法是与版本、
+架构绑定的机器码补丁，因此它是显式、可恢复的可选项，绝不会自动运行：
+
+```sh
+agy-bridge context status
+agy-bridge context unlock     # 需要 Python 3.8+；复制 agy，只补丁副本
+agy-bridge context disable [--purge]
+```
+
+`unlock` 把官方 `agy` 复制到 `~/.config/magpie-agy-bridge/context-unlock/`
+（`AGY_BRIDGE_CONTEXT_DIR`），用固定且校验 SHA-256 的
+[`agy-patch.py`](https://github.com/lili-luo/dsh-plugin-bundle/tree/0a90ec37c69430608084e33ebc2f891e328c9e89/agy-context-unlock)
+（MIT，Copyright (c) 2026 lili-luo，见 `vendor/agy-context-unlock`）**只补丁副本**，
+复查全部六个 gate，并把来源/补丁脚本/补丁后三者的 SHA-256、版本和架构写入 manifest。
+官方安装从不被修改。若构建未知、gate 不匹配，或官方 agy 之后变化（如 `agy update`），
+桥继续使用官方 agy 和默认 256K；更新后请重新 `unlock`。`unlock`/`disable` 后重启
+Magpie：agy 二进制在启动时选定，运行中的会话不会切换上下文模式。只有选中已校验的副本
+时，桥才向客户端声明 512K（仍可用 `AGY_BRIDGE_CONTEXT_WINDOW` 覆盖，GPT-OSS 仍为
+131,072），并只应用 `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`，不再套用官方 agy 的
+180,000 字节上限。该声明只是客户端压缩策略，不是已验证的上限。**限制：**上游仅验证
+agy 1.4.12–1.5.3；对 1.5.4（macOS arm64）副本的 dry-run 命中全部六个 gate，但
+1.5.4 及其他平台均未做端到端长上下文运行。
+
+选择副本时会校验官方源文件和副本的 SHA-256。已发布副本按哈希复用，发布失败保留旧的
+manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `disable` 仅关闭选择。
+使用 `--purge` 前请停止仍使用副本的 Magpie 进程。
 
 生成级用量日志 `agy_bridge_model_usage` 包含账单来源 `gen_metadata` 或 `steps`、
 实际输入、缓存读写、输出、思考量及 `context_tokens`。生成记录提供的

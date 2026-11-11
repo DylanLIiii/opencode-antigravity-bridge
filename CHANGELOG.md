@@ -2,6 +2,13 @@
 
 ## 0.3.3
 
+- Enable Windows quota queries with batch-file launch support, isolated account
+  tokens, browser blockers, process-tree cleanup and temporary-directory retries
+  (#30).
+- Isolate background summaries that fork from an already answered tool step,
+  preserving the primary session and its newer pending calls. Ignore answered
+  calls when routing later requests, and allow complete results from a superseded
+  sibling to replay independently without a new user instruction (#31).
 - Fix post-compaction replay deadlocks in long tool-heavy sessions (#34). When
   full replay exceeds a budget, use compact, escaped tool records without
   repeated per-record caveats and with explicit omitted-result markers.

@@ -361,18 +361,18 @@ required; the hook was verified with the **0.1.1599** host.
 The plugin queries `agy --version`, then runs
 `agy -p /usage --output-format json` with a restricted custom agent and a
 bounded print timeout. It reads the **current agy sign-in**, not a Google
-account separately added to Magpie. It does not read, copy, or save Google
-tokens, impersonate the IDE, scrape the TUI, or send a model prompt. `agy`
-remains responsible for authentication and quota requests. An unrecognized
+account separately added to Magpie. `agy` remains responsible for authentication
+and quota requests. The bridge prepares an isolated profile from the CLI's
+file-based sign-in when present and reads its structured usage report. An unrecognized
 version, or one older than **1.1.11**, is rejected before print mode because
 older slash-command implementations could treat `/usage` as a model prompt.
 
 Quota probes use a private `--gemini_dir` profile. Print-mode startup therefore
 discovers only that empty profile instead of the user's global
 `~/.gemini/config` skills, rules, plugins, MCP servers and settings. A
-file-based agy sign-in is linked into the profile when present; otherwise the
-probe relies on the same keyring/ADC credentials as the CLI. The link is
-removed with the workspace and the token contents are never copied. Hidden
+file-based agy sign-in is linked into the profile on POSIX and copied on Windows;
+otherwise the probe relies on the same keyring/ADC credentials as the CLI. The
+temporary profile is removed with the workspace. Hidden
 `--gemini_dir` support is probed with the version call; older CLIs fall back to
 the normal Gemini directory. Set `AGY_BRIDGE_USAGE=0` to skip automatic quota
 probes entirely (for example while investigating a CLI or macOS approval
@@ -397,19 +397,26 @@ service problem).
 - A private temporary workspace contains the custom agent (`tools: []`,
   `mcpServers: []`, `inheritMcp: false`, `inheritCustomizations: false`,
   `excludeDefaultComponents: true`) and failing
-  `open`/`xdg-open`/`BROWSER` launchers, preventing background usage refreshes
-  from opening OAuth browser login. Queries set
+  `open`/`xdg-open`/`BROWSER` launchers (`.cmd` on Windows), plus a Windows
+  `rundll32.cmd` blocker for AGY's native authentication browser command,
+  preventing background usage refreshes from opening OAuth browser login. Queries set
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` only for their child processes. They do
   not change global agy settings or the user's updater preferences.
 - On completion, failure, timeout, or cancellation, the query's owned POSIX
-  process group is stopped and its workspace removed. Processes that detach
-  into a different process group are outside this cleanup guarantee. Errors
+  process group is stopped; Windows uses bounded `taskkill /T /F` with a direct
+  child fallback. Workspace removal waits for cleanup and retries transient
+  file locks. Processes that detach into a different process group, and Windows
+  descendants whose parent already exited or whose `taskkill` fails, are outside
+  this cleanup guarantee. Errors
   show sanitized diagnostics, not raw stderr, tokens, or account URLs, and do
   not mark the bridge's sentinel login as revoked. Run `agy` interactively to
   repair an expired CLI sign-in.
 
-Quota probing currently supports **macOS and Linux**. Windows returns an
-explicit unsupported error rather than querying without browser/process guards.
+Quota probing supports **macOS, Linux and Windows**, including Windows `.cmd` and
+`.bat` CLI wrappers. Windows copies file-based credentials into the temporary
+profile to avoid symlink privileges and changes to the original token. Native
+quota fixtures and platform helpers run in CI on Windows, macOS and Linux;
+real Windows Antigravity account verification is still pending.
 
 References: CodexBar's
 [CLI quota parser](https://github.com/steipete/CodexBar/blob/0aa34100b7a7ea397bcbf14eaab388d3f32aa4a1/Sources/CodexBarCore/Providers/Antigravity/AntigravityQuotaSummaryParser.swift)

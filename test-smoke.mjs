@@ -330,6 +330,11 @@ async function prompt(params, recorded = false) {
     chunk("After parallel.\n")
     return finish("Before parallel.\nAfter parallel.\n")
   }
+  if (text.includes("BACKGROUND_SUMMARY")) {
+    if (text.includes("SUMMARY_PENDING")) await invoke("echo", { text: "summary side request" })
+    chunk("Background summary.")
+    return finish("Background summary.")
+  }
   if (text.includes("TWOSTEP")) {
     chunk("Before two-step.\n")
     await invoke("echo", { text: "first" })
@@ -1179,6 +1184,68 @@ let nativeConv
   const thirdBody = continuation(secondBody, secondEvents, "step-two")
   const thirdEvents = (await readSSE(await callFetch(thirdBody))).events
   check("conflict does not corrupt pending turn", stopOf(thirdEvents) === "end_turn")
+}
+
+// A summary can fork from an answered step while the same ACP turn is waiting
+// for a newer call. Both a text response and a summary that asks for a tool must
+// leave the main branch's process, pending call and later session reuse intact.
+for (const [summaryTool, withNotice] of [[false, false], [true, false], [false, true], [true, true]]) {
+  const { default: summaryDefault } = await import("./index.mjs?historical-summary")
+  const summaryPlugin = await summaryDefault.server({ client: null, directory: os.tmpdir() }, {})
+  const summaryLoader = await summaryPlugin.auth.loader(async () => ({ key: "agy" }))
+  const callFetch = body => summaryLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
+  const label = (summaryTool ? "summary with tool" : "text summary") + (withNotice ? " and context notice" : "")
+  const first = { model, metadata: { user_id: `historical-${label}` }, tools: [echoTool],
+    messages: [{ role: "user", content: `TWOSTEP historical ${label}` }] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const primary = inits().at(-1)
+  const second = continuation(first, firstEvents, "historical step A result")
+  if (withNotice) second.messages.at(-1).content.push({ type: "text", text: "<system-reminder>Keep the original context.</system-reminder>" })
+  const secondEvents = (await readSSE(await callFetch(second))).events
+  check(`${label}: the primary has advanced to a newer pending call`, stopOf(secondEvents) === "tool_use" &&
+    toolCall(secondEvents)?.id !== toolCall(firstEvents)?.id)
+
+  const summary = structuredClone(second)
+  summary.messages.push({ role: "user", content: "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools. " +
+    "BACKGROUND_SUMMARY: Summarize the conversation so far." + (summaryTool ? " SUMMARY_PENDING" : "") })
+  const before = inits().length
+  const summaryResponse = await callFetch(summary)
+  const summaryEvents = (await readSSE(summaryResponse)).events
+  const side = inits().at(-1)
+  check(`${label}: the historical result starts an isolated session`, summaryResponse.status === 200 &&
+    inits().length === before + 1 && side.convId !== primary.convId &&
+    stopOf(summaryEvents) === (summaryTool ? "tool_use" : "end_turn"))
+  check(`${label}: isolation preserves the primary process and pending call`, fs.existsSync(primary.cwd) &&
+    logs().filter(event => event.type === "mcpResult" && event.convId === primary.convId).length === 1)
+  if (withNotice) {
+    const changed = structuredClone(summary)
+    changed.messages.at(-2).content[0].content = "conflicting historical result"
+    check(`${label}: a changed historical result remains a conflict`, (await callFetch(changed)).status === 409 &&
+      fs.existsSync(primary.cwd))
+  }
+
+  const completed = { body: summary, events: summaryEvents }
+  if (summaryTool) {
+    completed.body = continuation(summary, summaryEvents, "summary tool result")
+    completed.events = (await readSSE(await callFetch(completed.body))).events
+  }
+  check(`${label}: the summary completes independently`, stopOf(completed.events) === "end_turn")
+  const beforeFollow = inits().length
+  const summaryFollow = nextTurn(completed.body, completed.events, "MEMORY summary follow-up")
+  const followed = (await readSSE(await callFetch(summaryFollow))).events
+  check(`${label}: answered historical IDs do not redirect the summary follow-up`, stopOf(followed) === "end_turn" &&
+    inits().length === beforeFollow && lastOf("user").convId === side.convId && fs.existsSync(primary.cwd))
+
+  const mainResult = continuation(second, secondEvents, "primary step B result")
+  const mainResponse = await callFetch(mainResult)
+  const mainDone = (await readSSE(mainResponse)).events
+  const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === primary.convId)
+  check(`${label}: the newer tool result completes in its original session`, mainResponse.status === 200 &&
+    stopOf(mainDone) === "end_turn" && inits().length === beforeFollow &&
+    delivered.map(event => event.result.content[0].text).join(",") === "historical step A result,primary step B result")
+  const mainFollow = (await readSSE(await callFetch(nextTurn(mainResult, mainDone, "MEMORY primary follow-up")))).events
+  check(`${label}: the main follow-up retains its original session`, stopOf(mainFollow) === "end_turn" &&
+    inits().length === beforeFollow && lastOf("user").convId === primary.convId)
 }
 
 {
@@ -3233,6 +3300,7 @@ for (const steering of [false, true]) {
   const body = { model, metadata: { user_id: "pending-lineage-conflict" },
     messages: [{ role: "user", content: "TOOL pending ownership" }], tools: [echoTool] }
   const pending = (await readSSE(await callFetch(body))).events
+  const owner = inits().at(-1)
   const before = inits().length
   const partial = continuation(body, pending, "known result")
   partial.messages.at(-1).content.push({ type: "tool_result", tool_use_id: "toolu_partial_unknown", content: "unknown" })
@@ -3245,14 +3313,18 @@ for (const steering of [false, true]) {
     { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_unmatched_lineage", content: "unmatched" }] },
   ] }
   const live = await callFetch(unmatched)
-  check("unmatched results alone cannot supersede an unexpired tool owner", live.status === 409 && live.headers.get("x-should-retry") === null && inits().length === before)
-  await live.text()
+  const sibling = (await readSSE(live)).events
+  check("self-consistent unmatched results replay independently of an unexpired owner", live.status === 200 &&
+    inits().length === before + 1 && lastOf("user").convId !== owner.convId && fs.existsSync(owner.cwd) &&
+    !logs().some(event => event.type === "mcpResult" && event.convId === owner.convId))
+  await drive(unmatched, sibling, "finish unmatched sibling")
+  const afterSibling = inits().length
   const conflict = nextTurn(body, pending, "no result for this pending call")
   const response = await callFetch(conflict)
   const error = await response.json()
   check("a request carrying the pending call without its result is terminal", response.status === 400 && response.headers.get("x-should-retry") === "false" && error.error?.code === "tool_state_conflict")
   const done = await drive(body, pending, "real result after conflict")
-  check("terminal lineage conflicts leave the original tool turn usable", inits().length === before && stopOf(done.events) === "end_turn")
+  check("terminal lineage conflicts leave the original tool turn usable", inits().length === afterSibling && stopOf(done.events) === "end_turn")
 }
 
 {
@@ -3519,6 +3591,7 @@ for (const compacted of [true, false]) {
     lastOf("user").convId === replayPrompt.convId && !lastOf("user").text.includes("<conversation_history>"))
 
   for (const [label, steering] of [
+    ["results only", null],
     ["interruption marker", "[Request interrupted by user]"],
     ["ordinary queued text", "Use the completed fork result and finish this side request."],
   ]) {
@@ -3552,21 +3625,17 @@ for (const compacted of [true, false]) {
     const actualResult = `actual reclaimed fork result for ${label}`
     const late = continuation(side, sidePending, actualResult)
     const beforeReplay = inits().length
-    const unsteered = await fetchCombined(late)
-    check(`${label}: unmatched fork results without steering remain 409`, unsteered.status === 409 &&
-      inits().length === beforeReplay && fs.existsSync(rootOwner.cwd))
-    await unsteered.text()
-    late.messages.at(-1).content.push({ type: "text", text: steering })
+    if (steering) late.messages.at(-1).content.push({ type: "text", text: steering })
     const recovered = await fetchCombined(late)
     let recoveredEvents = recovered.status === 200 ? (await readSSE(recovered)).events : []
     if (recovered.status !== 200) await recovered.text()
     const recoveredPrompt = lastOf("user")
-    check(`${label}: steered fork results replay while the root still waits`, recovered.status === 200 &&
+    check(`${label}: fork results replay while the root still waits`, recovered.status === 200 &&
       inits().length === beforeReplay + 1 && recoveredPrompt.convId !== rootOwner.convId &&
       recoveredPrompt.convId !== sideOwner.convId && fs.existsSync(rootOwner.cwd) &&
       !logs().some(event => event.type === "mcpResult" && event.convId === rootOwner.convId))
     check(`${label}: fork replay preserves the real result and steering once`, recovered.status === 200 &&
-      recoveredPrompt.text.split(actualResult).length === 2 && recoveredPrompt.text.split(steering).length === 2)
+      recoveredPrompt.text.split(actualResult).length === 2 && (!steering || recoveredPrompt.text.split(steering).length === 2))
     // The LONGTOOL fake asks for a new tool even when its trigger is in replayed
     // history. Complete that round before checking the independent root owner.
     let recoveredBody = late

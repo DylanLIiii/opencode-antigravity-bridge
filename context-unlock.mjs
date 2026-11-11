@@ -16,7 +16,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { agyCandidates, agySpawnSpec, childEnv } from "./platform.mjs"
+import { agyCandidates, agySpawnSpec, childEnv, wslDistro } from "./platform.mjs"
 
 export const PATCHER = {
   path: fileURLToPath(new URL("./vendor/agy-context-unlock/agy-patch.py", import.meta.url)),
@@ -86,6 +86,7 @@ function writeManifest(dir, manifest) {
 
 // Locate the official install, never one of our own managed copies.
 export function findOfficialAgy(env = process.env, home = os.homedir(), platform = process.platform) {
+  if (wslDistro(env, platform)) return null
   const managed = contextStateDir(env) + path.sep
   for (const candidate of agyCandidates(env, home, platform)) {
     try {
@@ -138,6 +139,7 @@ function describeFailure(result) {
 // Create (or reuse) the managed unlocked copy. The official install is only
 // read. Every failure leaves any previous manifest and the official agy as is.
 export function unlockContext({ env = process.env, agyPath, run = runCommand, patcher = PATCHER, platform = process.platform } = {}) {
+  if (wslDistro(env, platform)) throw new ContextError("Context unlock is unavailable in Windows-to-WSL mode")
   const source = agyPath || findOfficialAgy(env, os.homedir(), platform)
   if (!source) throw new ContextError("official agy CLI not found; install it first (nothing was changed)", "not_found")
   const sourceStat = (() => { try { return fs.statSync(source) } catch { return null } })()
@@ -233,6 +235,7 @@ export function disableContext({ env = process.env, purge = false } = {}) {
 
 // Describe the current state. `full` bypasses the verified-file hash cache.
 export function contextStatus({ env = process.env, official = findOfficialAgy(env), full = false } = {}) {
+  if (wslDistro(env)) return { enabled: false, active: false, state: "unsupported", reason: "Context unlock is unavailable in Windows-to-WSL mode" }
   const dir = contextStateDir(env)
   const manifest = readContextManifest(dir)
   const base = { enabled: false, active: false, state: "default", reason: "context unlock is off; the official agy and default context are used", dir }

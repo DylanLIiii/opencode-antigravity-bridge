@@ -1,10 +1,15 @@
 import { spawn } from "node:child_process"
 import path from "node:path"
 
+export function windowsEnv(env, name) {
+  const key = Object.keys(env).find(key => key.toUpperCase() === name.toUpperCase())
+  return key === undefined ? undefined : env[key]
+}
+
 // Explicit opt-in: a Windows host launches agy inside this WSL distribution.
 // The setting is never inferred, and a failure never falls back to a native agy.
 export function wslDistro(env = process.env, platform = process.platform) {
-  const distro = env.AGY_BRIDGE_WSL_DISTRO?.trim()
+  const distro = windowsEnv(env, "AGY_BRIDGE_WSL_DISTRO")?.trim()
   return platform === "win32" && distro ? distro : null
 }
 
@@ -12,10 +17,11 @@ export function wslDistro(env = process.env, platform = process.platform) {
 // absolute Linux path inside the distro. It is never interpreted as shell text.
 export function wslAgyPath(env = process.env, platform = process.platform) {
   if (!wslDistro(env, platform)) return null
-  const executable = env.AGY_PATH?.trim() || "agy"
+  const executable = windowsEnv(env, "AGY_PATH")?.trim() || "agy"
   if (/[\0\r\n\\]/.test(executable) || /^[a-zA-Z]:/.test(executable) || (executable.includes("/") && !executable.startsWith("/"))) {
     throw new Error("with AGY_BRIDGE_WSL_DISTRO, AGY_PATH must be a bare command or an absolute Linux path inside the distribution (for example /home/me/.local/bin/agy), not a Windows path")
   }
+  if (!executable.startsWith("/") && !/^[a-zA-Z0-9_.+-]+$/.test(executable)) throw new Error("WSL AGY_PATH must be one executable, not a shell command")
   if (executable.startsWith("/mnt/")) {
     throw new Error("with AGY_BRIDGE_WSL_DISTRO, AGY_PATH must be installed inside the distribution, not on a /mnt Windows drive")
   }
@@ -25,7 +31,9 @@ export function wslAgyPath(env = process.env, platform = process.platform) {
 // Only the standard /mnt/<drive> automount is supported; there is no wslpath
 // probe, so a customised [automount] root is an explicit limitation.
 export function wslPath(file, distro, platform = process.platform) {
-  if (!distro || platform !== "win32" || typeof file !== "string" || file.startsWith("/")) return file
+  if (!distro || platform !== "win32" || typeof file !== "string") return file
+  if (file.startsWith("//") || /[\0\r\n]/.test(file)) throw new Error("Unsupported WSL path: UNC paths and line breaks are unavailable")
+  if (file.startsWith("/")) return file
   const match = /^([a-zA-Z]):[\\/](.*)$/.exec(file)
   if (!match) throw new Error(`WSL mode needs a Windows drive path (C:\\...) to map to /mnt/<drive>: ${file}`)
   return `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`
@@ -46,11 +54,16 @@ export function wslMcpShim(executable, server, distro) {
 const WSL_FORWARDED = ["AGY_CLI_DISABLE_AUTO_UPDATE", "AGY_BRIDGE_CONTROL_PORT", "AGY_BRIDGE_TOKEN"]
 
 // WSLENV is case-sensitive and unflagged entries are shared in both directions.
-function wslForwardedEnv(env) {
-  const names = (env.WSLENV || "").split(":").filter(Boolean)
-  const known = new Set(names.map(name => name.split("/")[0]))
-  for (const name of WSL_FORWARDED) if (env[name] != null && !known.has(name)) names.push(name)
-  return { ...env, WSLENV: names.join(":") }
+export function wslForwardedEnv(env) {
+  const result = { ...env }
+  const controlled = new Set([...WSL_FORWARDED, "WSLENV"])
+  for (const key of Object.keys(result)) if (controlled.has(key.toUpperCase())) delete result[key]
+  const names = (windowsEnv(env, "WSLENV") || "").split(":").filter(name => name && !WSL_FORWARDED.includes(name.split("/")[0].toUpperCase()))
+  for (const name of WSL_FORWARDED) {
+    const value = windowsEnv(env, name)
+    if (value != null) { result[name] = value; names.push(name) }
+  }
+  return { ...result, WSLENV: names.join(":") }
 }
 
 // Fixed script + positional arguments: nothing user-controlled is interpolated
@@ -59,9 +72,9 @@ function wslForwardedEnv(env) {
 const WSL_PATH_SCRIPT = 'PATH="$1:$PATH"; shift; exec "$@"'
 
 export function wslSpawnSpec(file, args, distro, env = process.env, guestCwd = null) {
-  const guestBin = env.AGY_BRIDGE_WSL_BIN
+  const guestBin = windowsEnv(env, "AGY_BRIDGE_WSL_BIN")
   return {
-    file: env.AGY_BRIDGE_WSL_EXE || "wsl.exe",
+    file: windowsEnv(env, "AGY_BRIDGE_WSL_EXE") || "wsl.exe",
     args: [
       "-d", distro, ...(guestCwd ? ["--cd", guestCwd] : []), "--exec",
       ...(guestBin ? ["/bin/sh", "-c", WSL_PATH_SCRIPT, "sh", guestBin, file, ...args] : [file, ...args]),

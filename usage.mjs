@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { agySpawnSpec, childEnv } from "./platform.mjs"
+import { agySpawnSpec, childEnv, wslDistro } from "./platform.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
@@ -242,6 +242,7 @@ export async function fetchUsage(agy, {
   spawn: spawnProcess = spawn,
   fs: fileSystem = fs,
 } = {}) {
+  if (wslDistro(env, platform)) throw new UsageError("Quota queries are unavailable in Windows-to-WSL mode; check usage inside the configured distro.")
   if (!agy) throw new UsageError("agy CLI not found. Install it and run `agy` once to sign in.")
   const fs = fileSystem
   const deadline = Date.now() + timeout(timeoutMs)

@@ -156,3 +156,47 @@ for (const extension of ["cmd", "bat"]) {
     })
   })
 }
+
+test("WSL opt-in resolves Windows env aliases and replaces directional control rules", () => {
+  captureSpawn("win32", {}, calls => {
+    const args = ["models", "space ; $(touch nope) & %NAME%"]
+    spawnAgy("/home/me/agy", args, { cwd: "C:\\work dir", env: {
+      agy_bridge_wsl_distro: "Ubuntu", Agy_Bridge_Wsl_Exe: "D:\\WSL tools\\wsl.exe",
+      WsLeNv: "OTHER/p:AGY_BRIDGE_TOKEN/u:agy_bridge_control_port/w",
+      agy_bridge_token: "fixture", agy_bridge_control_port: "1234",
+    } })
+    const call = calls[0]
+    assert.equal(call.file, "D:\\WSL tools\\wsl.exe")
+    assert.deepEqual(call.args, ["-d", "Ubuntu", "--cd", "/mnt/c/work dir", "--exec", "/home/me/agy", ...args])
+    assert.equal(call.options.cwd, "C:\\work dir")
+    assert.equal(call.options.env.WSLENV, "OTHER/p:AGY_CLI_DISABLE_AUTO_UPDATE:AGY_BRIDGE_CONTROL_PORT:AGY_BRIDGE_TOKEN")
+    assert.equal(call.options.env.AGY_BRIDGE_TOKEN, "fixture")
+    assert.equal(call.options.env.agy_bridge_token, undefined)
+    assert.ok(!call.args.includes("fixture"))
+  })
+})
+
+test("WSL paths and positional shell preserve literal user arguments without native fallback", async () => {
+  const { wslPath, wslAgyPath, wslSpawnSpec, wslMcpShim } = await import("./platform.mjs")
+  assert.equal(wslPath("/home/a b/project", "Ubuntu", "win32"), "/home/a b/project")
+  assert.equal(wslPath("D:\\a b\\x&y", "Ubuntu", "win32"), "/mnt/d/a b/x&y")
+  assert.throws(() => wslPath("\\\\server\\share", "Ubuntu", "win32"), /drive path/)
+  assert.throws(() => wslAgyPath({ AGY_BRIDGE_WSL_DISTRO: "Ubuntu", AGY_PATH: "C:\\agy.exe" }, "win32"), /Linux path/)
+  const spec = wslSpawnSpec("/home/a b/agy", ["prompt", "$(touch nope); &"], "Ubuntu", { AGY_BRIDGE_WSL_BIN: "/mnt/c/shim dir" })
+  assert.equal(spec.file, "wsl.exe")
+  assert.deepEqual(spec.args.slice(-4), ["/mnt/c/shim dir", "/home/a b/agy", "prompt", "$(touch nope); &"])
+  assert.equal(spec.args[5], 'PATH="$1:$PATH"; shift; exec "$@"')
+  assert.match(wslMcpShim("C:\\Program Files\\node.exe", "C:\\a'b\\mcp.mjs", "Ubuntu"), /\/mnt\/c\/Program Files\/node.exe/)
+})
+
+test("WSL quota and context unlock reject before touching host credentials or launching", async () => {
+  const { fetchUsage } = await import("./usage.mjs")
+  const { unlockContext, findOfficialAgy } = await import("./context-unlock.mjs")
+  const env = { agy_bridge_wsl_distro: "Ubuntu" }
+  await assert.rejects(fetchUsage("agy", { env, platform: "win32", spawn: () => assert.fail("must not spawn quota") }), /Quota queries are unavailable/)
+  assert.throws(() => unlockContext({ env, platform: "win32", run: () => assert.fail("must not patch") }), /Context unlock is unavailable/)
+  assert.equal(findOfficialAgy(env, "C:\\Users\\test", "win32"), null)
+  const { wslPath, wslAgyPath } = await import("./platform.mjs")
+  assert.throws(() => wslPath("//server/share", "Ubuntu", "win32"), /UNC/)
+  assert.throws(() => wslAgyPath({ ...env, AGY_PATH: "agy --foo; echo bad" }, "win32"), /one executable/)
+})

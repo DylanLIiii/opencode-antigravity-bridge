@@ -73,6 +73,26 @@ Accounts require an agy that accepts `--gemini_dir` and a file-based token;
 keyring/ADC sign-in is machine-global and cannot be isolated per directory.
 Refreshing the model catalog re-scans the accounts directory.
 
+**Importing accounts.** Instead of signing in inside a profile directory, you can
+import an agy login you already have, from Magpie's sign-in list ("Import an agy
+account" / "Import several agy accounts from a manifest") or the packaged CLI.
+Paths are on the machine running Magpie; both call the same backend:
+
+```sh
+agy-bridge accounts import work ~/.config/agy-work            # profile dir
+agy-bridge accounts import work ~/token/antigravity-oauth-token  # token file
+agy-bridge accounts import --manifest accounts.json            # [{"name","source"}]
+agy-bridge accounts list
+```
+
+An import copies only `antigravity-cli/antigravity-oauth-token` (written `0600`
+in a `0700` directory) into `<accounts root>/<name>/`; agy keeps refreshing it.
+Existing accounts are never overwritten (pick another name), all manifest entries
+are validated before anything is written and a batch is all-or-nothing. Tokens are
+never printed. Refresh the model catalog afterwards. Magpie's own
+`magpie accounts import antigravity` is a different, built-in account store and
+does not feed this bridge.
+
 **Windows file-backed logins.** On native Windows, agy keeps the default
 sign-in in Windows Credential Manager (one machine-global `gemini:antigravity`
 entry). `agy --gemini_dir=<dir>` therefore reuses that account and writes no
@@ -588,6 +608,37 @@ are integers from 1 to 1,048,576. Invalid values use the default policy.
 GPT-OSS remains capped at 131,072 tokens. This setting changes the client-facing
 metadata. Usable capacity still depends on AGY. The 1 MiB per-submission text
 budget is configured separately with `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`.
+
+#### Optional context unlock (off by default)
+
+agy has no native flag for a larger context window or for its 64K per-message
+clamp. The only known mechanism is a version- and architecture-bound machine-code
+patch, so it is an explicit, reversible opt-in and never runs automatically:
+
+```sh
+agy-bridge context status
+agy-bridge context unlock     # needs Python 3.8+; copies agy, patches only the copy
+agy-bridge context disable [--purge]
+```
+
+`unlock` copies the official `agy` into `~/.config/magpie-agy-bridge/context-unlock/`
+(`AGY_BRIDGE_CONTEXT_DIR`), applies the pinned, SHA-256-checked
+[`agy-patch.py`](https://github.com/lili-luo/dsh-plugin-bundle/tree/0a90ec37c69430608084e33ebc2f891e328c9e89/agy-context-unlock)
+(MIT, Copyright (c) 2026 lili-luo; `vendor/agy-context-unlock`) to the **copy**,
+re-checks all six gates and records source, patcher and patched SHA-256, version
+and architecture in a manifest. The official install is never modified. If the
+build is unknown, a gate does not match, or the official agy later changes (for
+example `agy update`), the bridge keeps using the official agy and the default
+256K behaviour; run `unlock` again after an update. Restart Magpie after
+`unlock`/`disable`: the agy binary is chosen at start, so running sessions never
+change context mode. Only while a verified copy is selected does the bridge
+declare 512K to the client (still overridable with `AGY_BRIDGE_CONTEXT_WINDOW`;
+GPT-OSS stays at 131,072) and apply only `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`
+instead of the 180,000-byte official-agy clamp. The declared window is a client
+compaction policy, not a verified limit. **Limits:** upstream verified the patch
+on agy 1.4.12-1.5.3 only; a dry-run of the pinned script on a copy of 1.5.4
+(macOS arm64) matched all six gates, but no end-to-end long-context run has been
+done for 1.5.4 or on any other platform.
 
 Content-free `agy_bridge_model_usage` events identify the billing source
 (`gen_metadata` or `steps`) and record actual input, cache reads/writes, output,

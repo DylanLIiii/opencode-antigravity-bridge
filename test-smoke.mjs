@@ -4030,6 +4030,98 @@ for (const compacted of [true, false]) {
   fs.rmSync(accountsDir, { recursive: true, force: true })
 }
 
+// Native sign-in forms: the real auth.methods / prompts / authorize(inputs)
+// contract Magpie drives, backed by the same backend as the CLI. Synthetic only.
+{
+  const importRoot = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "fake-import-")), "accounts")
+  const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-import-src-"))
+  fs.mkdirSync(path.join(srcDir, "antigravity-cli"), { recursive: true })
+  fs.writeFileSync(path.join(srcDir, "antigravity-cli", "antigravity-oauth-token"), JSON.stringify({ refresh_token: "SYNTHETIC_FIXTURE_ONLY" }))
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = importRoot
+  const { default: importDefault } = await import("./index.mjs?import-forms")
+  const importPlugin = await importDefault.server({ client: null, directory: os.tmpdir() }, {})
+  const methods = importPlugin.auth.methods
+  check("default agy login stays first and single:true sentinel identity is kept",
+    importPlugin.auth.single === true && methods[0].keyless === true && /agy CLI/.test(methods[0].label) && methods[0].prompts === undefined)
+  const forms = methods.slice(1)
+  check("import forms are native keyless api methods with bilingual labels and text prompts",
+    forms.length === 2 && forms.every(m => m.type === "api" && m.keyless === true && typeof m.authorize === "function" &&
+      /[\u4e00-\u9fff]/.test(m.label) && /[A-Za-z]/.test(m.label) && m.prompts.every(p => p.type === "text" && p.key && p.message)))
+  const [single, batch] = forms
+  check("prompt validators reject bad names and empty paths", single.prompts[0].validate("../x") && single.prompts[0].validate("antigravity-bridge") &&
+    !single.prompts[0].validate("work") && single.prompts[1].validate("  ") && batch.prompts[0].validate(""))
+  const bad = await single.authorize({ name: "../x", source: srcDir })
+  check("authorize reports invalid names as a failed result without leaking credentials",
+    bad.type === "failed" && !JSON.stringify(bad).includes("SYNTHETIC_FIXTURE_ONLY") && !fs.existsSync(importRoot))
+  const before = (await importPlugin.provider.models())
+  check("no imported account before import", !Object.keys(before).some(id => id.startsWith("imported/")))
+  const ok = await single.authorize({ name: "imported", source: srcDir })
+  check("single import returns the host sentinel key", ok.type === "success" && ok.key === "agy", JSON.stringify(ok))
+  const after = await importPlugin.provider.models()
+  check("imported account appears in the model list with the account prefix",
+    Object.keys(after).some(id => id.startsWith("imported/")) && Object.keys(after).some(id => !id.includes("/")))
+  const dup = await single.authorize({ name: "imported", source: srcDir })
+  check("repeating an import is refused, never overwritten", dup.type === "failed" && /already exists/.test(dup.error))
+  const manifestFile = path.join(srcDir, "manifest.json")
+  fs.writeFileSync(manifestFile, JSON.stringify([{ name: "batch-a", source: srcDir }, { name: "batch-b", source: srcDir }]))
+  const batched = await batch.authorize({ manifest: manifestFile })
+  const afterBatch = await importPlugin.provider.models()
+  check("manifest import adds every account", batched.type === "success" &&
+    ["batch-a/", "batch-b/"].every(prefix => Object.keys(afterBatch).some(id => id.startsWith(prefix))), JSON.stringify(batched))
+  fs.writeFileSync(manifestFile, JSON.stringify([{ name: "batch-c", source: srcDir }, { name: "imported", source: srcDir }]))
+  const rolled = await batch.authorize({ manifest: manifestFile })
+  check("a colliding manifest fails before any write", rolled.type === "failed" && !fs.existsSync(path.join(importRoot, "batch-c")))
+  delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
+  fs.rmSync(path.dirname(importRoot), { recursive: true, force: true })
+  fs.rmSync(srcDir, { recursive: true, force: true })
+}
+
+// Context declaration follows the *selected* agy binary: default stays 256K and
+// gpt-oss keeps its own cap; only a verified managed copy raises the client
+// declaration and the per-submission ACP clamp.
+{
+  const ctxRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fake-ctx-"))
+  const run = async (tag, setup) => {
+    const saved = { ...process.env }
+    const state = path.join(ctxRoot, tag)
+    process.env.AGY_BRIDGE_CONTEXT_DIR = state
+    delete process.env.AGY_BRIDGE_CONTEXT_WINDOW
+    const { default: mod } = await import(`./index.mjs?context-${tag}`)
+    setup?.(state)
+    return { mod, restore: () => { for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]; Object.assign(process.env, saved) } }
+  }
+  const limits = async mod => {
+    const models = await (await mod.server({ client: null, directory: os.tmpdir() }, {})).provider.models()
+    return { gemini: models["gemini-4-argon-high"]?.limit.context ?? Object.values(models).find(m => /gemini/.test(m.id))?.limit.context,
+      oss: Object.values(models).find(m => /gpt-oss/.test(m.id))?.limit.context }
+  }
+  const off = await run("off")
+  const offLimits = await limits(off.mod)
+  check("default (no unlock) declares 256K and keeps gpt-oss at 131072", offLimits.gemini === 256_000 && offLimits.oss === 131_072, JSON.stringify(offLimits))
+  off.restore()
+
+  const { unlockContext } = await import("./context-unlock.mjs")
+  const gate = mark => ["1", "2", "3A", "3B", "4A", "4B"].map(g => `[${mark}] [Gate ${g}] fake`).join("\n")
+  const fakeRunner = (file, args) => {
+    if (args[0] === "-c") return { code: 0, stdout: "", stderr: "" }
+    if (args.includes("--version")) return { code: 0, stdout: "1.5.4\n", stderr: "" }
+    const binary = args[args.indexOf("--binary") + 1]
+    if (args.includes("--in-place")) { fs.appendFileSync(binary, "\n# patched copy"); return { code: 0, stdout: "", stderr: "" } }
+    return { code: 0, stdout: gate(fs.readFileSync(binary, "utf8").includes("# patched copy") ? "=" : "*").replace(/\[=\] (\[Gate \w+\]) fake/g, "[=] $1 already patched"), stderr: "" }
+  }
+  const on = await run("on", state => {
+    process.env.AGY_BRIDGE_CONTEXT_DIR = state
+    unlockContext({ env: process.env, agyPath: wrapper, run: fakeRunner })
+  })
+  const onLimits = await limits(on.mod)
+  check("a verified managed copy raises the client declaration but gpt-oss keeps its cap",
+    onLimits.gemini === 512_000 && onLimits.oss === 131_072, JSON.stringify(onLimits))
+  check("explicit AGY_BRIDGE_CONTEXT_WINDOW still applies on top of either mode",
+    (process.env.AGY_BRIDGE_CONTEXT_WINDOW = "300000", (await limits(on.mod)).gemini === 300_000))
+  on.restore()
+  fs.rmSync(ctxRoot, { recursive: true, force: true })
+}
+
 check("all ACP children disable auto update despite the parent false value", inits().length > 0 && inits().every(event => event.update === "true"))
 check("child launches never mutate the parent's update setting", process.env.AGY_CLI_DISABLE_AUTO_UPDATE === "false")
 if (originalAutoUpdate === undefined) delete process.env.AGY_CLI_DISABLE_AUTO_UPDATE

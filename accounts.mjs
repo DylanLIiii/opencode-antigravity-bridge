@@ -18,6 +18,8 @@ export function accountsRootDir(env = process.env) {
     path.join(env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "magpie-agy-bridge", "accounts"))
 }
 
+// The cache is keyed by the resolved accounts root, so a changed
+// AGY_BRIDGE_ACCOUNTS_DIR (or a second root in tests) never serves stale accounts.
 let cache = null
 
 export function invalidateAccounts() {
@@ -25,10 +27,10 @@ export function invalidateAccounts() {
 }
 
 export function listAccounts(env = process.env, { refresh = false } = {}) {
-  if (cache && !refresh) return cache
+  const root = accountsRootDir(env)
+  if (cache && cache.root === root && !refresh) return cache.accounts
   const accounts = [DEFAULT_ACCOUNT]
   try {
-    const root = accountsRootDir(env)
     for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith(".")) continue
       if (entry.name === PROVIDER_ID) continue // would collide with the provider prefix
@@ -38,7 +40,7 @@ export function listAccounts(env = process.env, { refresh = false } = {}) {
       accounts.push({ name: entry.name, dir, key: `dir:${dir}` })
     }
   } catch {}
-  cache = accounts
+  cache = { root, accounts }
   return accounts
 }
 

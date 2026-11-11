@@ -21,7 +21,14 @@ const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.ur
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
-const MAX_PROCS = 4
+function maxProcs() {
+  const value = Number(process.env.AGY_BRIDGE_MAX_PROCS)
+  return Number.isSafeInteger(value) && value > 0 ? value : 16
+}
+
+function detachedEvictMs() {
+  return positiveTimeout(process.env.AGY_BRIDGE_DETACHED_EVICT_MS, 30_000)
+}
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
@@ -689,6 +696,7 @@ class Turn {
     this.awaitCalls = []
     this.lateWaiters = []
     this.attached = false
+    this.acceptingResults = 0
     this.done = false
     this.finalized = false
     this.cancelRequested = false
@@ -2281,14 +2289,96 @@ async function evictIdle() {
   for (const [key, proc] of victims) await retire(key, proc)
 }
 
+// Pressure reclamation releases the process and tool IDs, but late results
+// still need to find their branch. Retain only a bounded, expiring routing hash;
+// this is not a resumable session or permission to replay unrelated history.
+const reclaimedRoutes = new Map()
+const MAX_RECLAIMED_ROUTES = 128
+
+// Mirror matchesPendingTurnHistory's original-ID allowance: only inputs in
+// the trailing assistant run may change. Keep its exact call IDs/names beside
+// historyKey, which otherwise deliberately canonicalizes those IDs.
+function originalIdHistoryKey(history) {
+  let split = history.length
+  while (split > 0 && history[split - 1].role === "assistant") split--
+  const assistant = history.slice(split)
+  const calls = lastAssistantCalls(assistant)
+  if (!calls.length || calls.some(call => !call.id)) return null
+  const stripped = assistant.map(message => ({ ...message,
+    content: Array.isArray(message.content) ? message.content.map(block => block?.type === "tool_use"
+      ? { type: "tool_use", id: block.id, name: block.name, input: {} } : block) : message.content,
+  }))
+  return stableJSON({ base: historyKey(history.slice(0, split)),
+    calls: calls.map(call => ({ id: call.id, name: call.name })), assistant: historyKey(stripped) })
+}
+
+function reclaimedRouteHash(convKey, opts, history = opts.history, originalIds = false) {
+  const identity = originalIds ? originalIdHistoryKey(history) : historyKey(history)
+  if (identity === null) return null
+  return digest(stableJSON({
+    family: convKey.split(":fork:")[0], account: opts.account ?? null,
+    workDir: opts.workDir ?? null, instructions: compactIdentity(opts.instructions),
+    history: identity,
+  }))
+}
+
+function pruneReclaimedRoutes() {
+  const cutoff = Date.now() - RESUME_TTL_MS
+  for (const [hash, entry] of reclaimedRoutes) {
+    if (entry.at < cutoff) reclaimedRoutes.delete(hash)
+  }
+}
+
+function rememberReclaimedRoute(proc) {
+  if (proc.historyInvalid || !Array.isArray(proc.expectedMessages)) return
+  pruneReclaimedRoutes()
+  const hash = reclaimedRouteHash(proc.convKey, proc, proc.expectedMessages)
+  const originalIdHash = reclaimedRouteHash(proc.convKey, proc, proc.expectedMessages, true)
+  const routeId = `${hash}:${originalIdHash}:${proc.convKey}`
+  reclaimedRoutes.delete(routeId)
+  reclaimedRoutes.set(routeId, { hash, originalIdHash, key: proc.convKey, at: Date.now() })
+  while (reclaimedRoutes.size > MAX_RECLAIMED_ROUTES) reclaimedRoutes.delete(reclaimedRoutes.keys().next().value)
+}
+
+function matchingReclaimedRoute(convKey, opts) {
+  pruneReclaimedRoutes()
+  const hash = reclaimedRouteHash(convKey, opts)
+  const originalIdHash = reclaimedRouteHash(convKey, opts, opts.history, true)
+  const matches = [...reclaimedRoutes.values()].filter(entry => entry.hash === hash ||
+    (originalIdHash !== null && entry.originalIdHash === originalIdHash))
+  if (matches.length > 1) throw new ConflictError("agy bridge: history matches more than one reclaimed conversation branch", "tool_state_conflict")
+  return matches[0]
+}
+
 async function evictLRU() {
   let oldest = null
   for (const [key, proc] of pool) {
     if (proc.turn || proc.retiring || proc.steering) continue
     if (!oldest || proc.lastUsed < oldest.proc.lastUsed) oldest = { key, proc }
   }
+  if (oldest) {
+    await retire(oldest.key, oldest.proc)
+    return true
+  }
+
+  // Only under pool pressure, release abandoned tool waits before their much
+  // longer tool timeout. Internal agy traffic must not renew the client clock.
+  const now = Date.now()
+  const grace = detachedEvictMs()
+  for (const proc of pool.values()) {
+    const turn = proc.turn
+    if (proc.retiring || proc.steering || !turn || turn.attached || turn.cancelRequested || turn.acceptingResults) continue
+    const progressAt = turn.clientProgressAt ?? turn.lastProgressAt
+    const verdict = staleTurnVerdict(proc, turn, now)
+    if (!verdict.stale && !(turn.hasPendingMcp() && now - progressAt >= grace)) continue
+    if (!oldest || progressAt < oldest.progressAt) {
+      oldest = { proc, turn, progressAt, reason: verdict.stale ? verdict.reason : "detached_pool_pressure" }
+    }
+  }
   if (!oldest) return false
-  await retire(oldest.key, oldest.proc)
+  logBridgeEvent(oldest.proc, oldest.turn, "reclaim", oldest.reason)
+  rememberReclaimedRoute(oldest.proc)
+  await reclaimStaleTurn(oldest.proc, oldest.turn, "agy bridge: detached tool turn closed to free process capacity; resume with complete tool-result history")
   return true
 }
 
@@ -2318,6 +2408,13 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
 // Fork slots retain their own pool/persistence keys; exact history routes later
 // prompts (including after parking/restart) back to the appropriate session.
 function conversationSlot(convKey, opts, forceNew) {
+  if (opts.reclaimedKey) {
+    // Recheck under the family acquire lock: the original slot may have been
+    // reused since reclamation, including a root whose siblings still wait.
+    loadParked()
+    return pool.has(opts.reclaimedKey) || parked.has(opts.reclaimedKey)
+      ? `${convKey}:fork:${randomUUID()}` : opts.reclaimedKey
+  }
   if (opts.ownerKey) return opts.ownerKey
   const inFamily = (key) => key === convKey || key.startsWith(`${convKey}:fork:`)
   const owners = new Set()
@@ -2402,9 +2499,10 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     dropFromPool(existing)
     await existing.stop().catch(() => {})
   }
-  while (allProcs.size >= MAX_PROCS) {
+  const limit = maxProcs()
+  while (allProcs.size >= limit) {
     if (!(await evictLRU())) {
-      throw new BusyError(`agy bridge: ${MAX_PROCS} agy processes are running and all have unfinished responses`)
+      throw new BusyError(`agy bridge: ${limit} agy processes are running and all have unfinished responses`)
     }
   }
   const resume = forceNew || isFreshConversation ? null : reserveParked(convKey, opts)
@@ -4533,7 +4631,16 @@ export const AntigravityBridgePlugin = async () => {
                       proc.validateContinuationBudget(results, body)
                       // A changed tool catalog applies to the rest of this turn;
                       // a model change applies from the next prompt.
-                      await proc.updateTools(tools)
+                      // A validated result is client progress even when its IDs
+                      // were renamed. Reserve its owner while catalog ACK yields
+                      // so pool pressure cannot reclaim an accepted continuation.
+                      turn.touchClient()
+                      turn.acceptingResults++
+                      try {
+                        await proc.updateTools(tools)
+                      } finally {
+                        turn.acceptingResults--
+                      }
                       // Catalog acknowledgement yields to timeouts and competing
                       // continuations. Only the still-live, unattached owner may
                       // consume this batch after that await.
@@ -4549,7 +4656,10 @@ export const AntigravityBridgePlugin = async () => {
                     return streamResponse(proc, turn, body, init.signal)
                   }
                 }
-                if (!acquireOpts.ownerKey && pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
+                if (!acquireOpts.ownerKey && !replayHistoryProblem(body, resultBlocks)) {
+                  acquireOpts.reclaimedKey = matchingReclaimedRoute(convKey, acquireOpts)?.key
+                }
+                if (!acquireOpts.ownerKey && !acquireOpts.reclaimedKey && pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
                   const proc = pool.get(convKey)
                   if (!canReplayUnmatchedFork(proc, body, resultBlocks, acquireOpts)) {
                     const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,

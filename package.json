@@ -40,7 +40,7 @@
       "zh": "通过官方 agy CLI 接入 Antigravity，旨在降低模拟客户端带来的封号风险；精简提示词、复用会话，减少重复上下文与 Token 消耗。支持多账号：每个账号独立 agy 配置目录，在模型选择器里选 `<账号>/<模型>` 即可切换。"
     },
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
-    "maxConcurrency": 4
+    "maxConcurrency": 16
   },
   "engines": {
     "bun": ">=1.0.0"

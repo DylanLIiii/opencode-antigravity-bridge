@@ -252,8 +252,9 @@ Refreshing the model catalog re-scans the accounts directory.
   `output_config.effort` / `thinking.budget_tokens`, Windows `.cmd` / `.bat` and
   WSL `/mnt/<drive>` working-directory translation, and same-family model alias
   fallback. Claude Haiku never silently routes to Gemini Flash.
-- **Conversation pooling**: at most four agy processes, idle reaping, LRU
-  eviction, and HTTP 503 for conflicting concurrent responses.
+- **Conversation pooling**: up to 16 agy processes by default (configure with
+  `AGY_BRIDGE_MAX_PROCS`), idle reaping, LRU eviction, and HTTP 503 for
+  conflicting concurrent responses.
 - **Isolation without a permission bypass.** The agent is defined with
   `tools: []`, `inheritMcp: false`, `inheritCustomizations: false` and
   `excludeDefaultComponents: true`, so the user's global MCP servers, skills and
@@ -443,10 +444,18 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   these blocks to a real Anthropic model after switching providers.
 - **Requests sharing an opening message** can fork while tools are pending.
   A sibling request gets its own pooled session and leaves the original tool
-  calls live. All branches count toward the four-process limit; when all four
-  are busy, another request receives 503. Later prompts select a branch by its
-  history, and completed branches have separate snapshots for resume after
-  eviction or restart. Ambiguous history matches are not guessed.
+  calls live. All branches count toward the process limit (default 16). At
+  capacity, idle processes are evicted first, then the oldest detached tool wait
+  with no client progress for 30 seconds (`AGY_BRIDGE_DETACHED_EVICT_MS`), or a
+  stale detached turn. Attached responses, accepted tool-result continuations,
+  cancellation and steering are protected. If no process can be reclaimed,
+  another request receives 503. A reclaimed conversation can replay complete
+  tool-result history in a new process. Raise
+  the grace period to preserve longer tool waits under pool pressure; ordinary
+  tool waits still use `AGY_BRIDGE_TOOL_TIMEOUT_MS` when capacity is available.
+  Later prompts select a branch by its history, and completed branches have
+  separate snapshots for resume after eviction or restart. Ambiguous history
+  matches are not guessed.
 - **Queued user text beside a live `tool_result`**, before or after the result
   in the same message, uses native steering when supported, including complete
   deferred results. The next choice is cancel/settle/prompt in the same session.
@@ -454,7 +463,10 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   batches are rejected before closing the live owner.
   If a sibling was already reclaimed, its complete late results plus user
   steering can replay while the main branch still waits on its own tools.
-  Unmatched results without steering retain the conservative 409 response.
+  Results without steering can also replay a recognized branch reclaimed under
+  pool pressure. These routing hashes stay in memory for up to
+  `AGY_BRIDGE_RESUME_TTL_MS`, with at most 128 records. Other unmatched results
+  retain the conservative 409 response.
   Complete `<system-update>` elements, task/channel/teammate
   notifications, recognized Claude Code hook notices, and tool companions are
   forwarded on the live MCP turn; explicit Claude Code mid-turn
@@ -573,7 +585,9 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
-| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume and submitted-prompt dedupe retention |
+| `AGY_BRIDGE_MAX_PROCS` | 16 | maximum pooled agy processes across conversations and accounts; positive safe integer; Magpie also applies the plugin's concurrency limit of 16 |
+| `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | client inactivity before a detached tool wait can be reclaimed under pool pressure; positive milliseconds |
+| `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume, submitted-prompt dedupe, and in-memory reclaimed-branch routing retention |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
 | `AGY_BRIDGE_ACCOUNTS_DIR` | `~/.config/magpie-agy-bridge/accounts` | root of named account profiles; each subdirectory with its own `antigravity-cli/antigravity-oauth-token` becomes a `<name>/<model-id>` account |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60000 / 120000 / 1800000 | startup, meaningful agy inactivity, client tool result; positive milliseconds |

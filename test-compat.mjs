@@ -16,9 +16,147 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
+source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute };\n"
 fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts };\n")
 const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
+
+const { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+
+test("reclaimed routing is bounded, expires and rejects ambiguous or incompatible owners", () => {
+  const history = [{ role: "user", content: "opening" }, { role: "assistant", content: [
+    { type: "tool_use", id: "toolu_original", name: "Read", input: { path: "a.txt" } },
+  ] }]
+  const opts = { account: "work", instructions: "instructions", workDir: "/work", history }
+  const remember = key => rememberReclaimedRoute({ ...opts, convKey: key, expectedMessages: history })
+  try {
+    remember("family:fork:one")
+    assert.equal(matchingReclaimedRoute("family", opts)?.key, "family:fork:one")
+    for (const changed of [{ account: "personal" }, { instructions: "other" }, { workDir: "/other" }]) {
+      assert.equal(matchingReclaimedRoute("family", { ...opts, ...changed }), undefined)
+    }
+    assert.equal(matchingReclaimedRoute("other-family", opts), undefined)
+    remember("family:fork:two")
+    assert.throws(() => matchingReclaimedRoute("family", opts), error => error.code === "tool_state_conflict")
+    for (const entry of reclaimedRoutes.values()) entry.at = 0
+    assert.equal(matchingReclaimedRoute("family", opts), undefined)
+    assert.equal(reclaimedRoutes.size, 0)
+    for (let i = 0; i < 129; i++) remember(`family-${i}`)
+    assert.equal(reclaimedRoutes.size, 128)
+    assert.equal(matchingReclaimedRoute("family-0", opts), undefined)
+    assert.equal(matchingReclaimedRoute("family-128", opts)?.key, "family-128")
+  } finally { reclaimedRoutes.clear() }
+})
+
+test("process capacity and detached grace use defaults for invalid overrides", () => {
+  const previous = { ...process.env }
+  try {
+    delete process.env.AGY_BRIDGE_MAX_PROCS
+    delete process.env.AGY_BRIDGE_DETACHED_EVICT_MS
+    assert.equal(maxProcs(), 16)
+    assert.equal(detachedEvictMs(), 30_000)
+    for (const value of ["", "0", "-1", "NaN", "Infinity", "1.5", "9007199254740992"]) {
+      process.env.AGY_BRIDGE_MAX_PROCS = value
+      assert.equal(maxProcs(), 16, value)
+    }
+    process.env.AGY_BRIDGE_MAX_PROCS = "24"
+    assert.equal(maxProcs(), 24)
+    process.env.AGY_BRIDGE_MAX_PROCS = "1"
+    assert.equal(maxProcs(), 1)
+    for (const value of ["", "0", "-1", "NaN", "Infinity"]) {
+      process.env.AGY_BRIDGE_DETACHED_EVICT_MS = value
+      assert.equal(detachedEvictMs(), 30_000, value)
+    }
+    process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "60000"
+    assert.equal(detachedEvictMs(), 60_000)
+  } finally {
+    for (const key of ["AGY_BRIDGE_MAX_PROCS", "AGY_BRIDGE_DETACHED_EVICT_MS"]) {
+      if (previous[key] === undefined) delete process.env[key]
+      else process.env[key] = previous[key]
+    }
+  }
+})
+
+test("pool pressure protects attached responses, accepted results, cancellation, steering and recent tool waits", async () => {
+  const now = Date.now()
+  const previous = process.env.AGY_BRIDGE_DETACHED_EVICT_MS
+  process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+  const waiting = { attached: false, cancelRequested: false, clientProgressAt: now - 60_000,
+    lastProgressAt: now, hasPendingMcp: () => true }
+  const protectedProcs = [
+    { turn: { ...waiting, attached: true, deadlineAt: now - 1 } },
+    { turn: { ...waiting, cancelRequested: true, deadlineAt: now - 1 } },
+    { turn: { ...waiting, acceptingResults: 1 } },
+    { turn: { ...waiting }, steering: true },
+    { turn: { ...waiting }, retiring: true },
+    { turn: { ...waiting, clientProgressAt: now, lastProgressAt: now - 60_000 } },
+    { turn: { ...waiting, hasPendingMcp: () => false } },
+  ]
+  try {
+    protectedProcs.forEach((proc, i) => pool.set(`protected-${i}`, proc))
+    assert.equal(await evictLRU(), false)
+    assert.equal(pool.size, protectedProcs.length)
+    for (const proc of protectedProcs) assert.equal(proc.historyInvalid, undefined)
+  } finally {
+    pool.clear()
+    if (previous === undefined) delete process.env.AGY_BRIDGE_DETACHED_EVICT_MS
+    else process.env.AGY_BRIDGE_DETACHED_EVICT_MS = previous
+  }
+})
+
+test("pool pressure evicts the least recently used idle process before detached turns", async () => {
+  const stopped = []
+  const idle = (key, lastUsed) => ({ lastUsed, canPark: () => false,
+    stop: async () => { stopped.push(key) } })
+  try {
+    pool.set("detached", { turn: { clientProgressAt: 0, hasPendingMcp: () => true } })
+    pool.set("newer", idle("newer", 2))
+    pool.set("oldest", idle("oldest", 1))
+    assert.equal(await evictLRU(), true)
+    assert.deepEqual(stopped, ["oldest"])
+    assert.deepEqual([...pool.keys()], ["detached", "newer"])
+  } finally { pool.clear() }
+})
+
+test("detached eviction uses client progress despite fresh upstream traffic and also reclaims expired turns", async () => {
+  const keys = ["AGY_BRIDGE_STATE_FILE", "AGY_BRIDGE_EVENTS", "AGY_BRIDGE_DETACHED_EVICT_MS"]
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+  const now = Date.now()
+  const stopped = []
+  const waiting = (key, clientProgressAt, extra = {}) => {
+    const turn = { clientProgressAt, lastProgressAt: now, calls: [], hasPendingMcp: () => true,
+      fail(error) { this.error = error }, ...extra }
+    const proc = { convKey: key, turn,
+      abandonTurn(value) { assert.equal(value, turn); this.turn = null },
+      async stop() { stopped.push(key) } }
+    pool.set(key, proc)
+    return proc
+  }
+  process.env.AGY_BRIDGE_STATE_FILE = path.join(workspace, "eviction-state.json")
+  process.env.AGY_BRIDGE_EVENTS = "0"
+  process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+  try {
+    const newer = waiting("newer-tool", now - 40_000)
+    const older = waiting("older-tool", now - 60_000)
+    assert.equal(await evictLRU(), true)
+    assert.deepEqual(stopped, ["older-tool"])
+    assert.equal(older.historyInvalid, true)
+    assert.equal(older.turn, null)
+    assert.equal(pool.get("newer-tool"), newer)
+    pool.clear()
+    const expired = waiting("expired-turn", now, { deadlineAt: now - 1, hasPendingMcp: () => false })
+    assert.equal(await evictLRU(), true)
+    assert.deepEqual(stopped, ["older-tool", "expired-turn"])
+    assert.equal(expired.historyInvalid, true)
+    assert.equal(pool.size, 0)
+  } finally {
+    pool.clear()
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
 
 const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2VB" } }
 const result = (id, name, text) => ({

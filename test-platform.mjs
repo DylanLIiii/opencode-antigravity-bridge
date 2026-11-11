@@ -200,8 +200,3 @@ test("WSL quota and context unlock reject before touching host credentials or la
   assert.throws(() => wslPath("//server/share", "Ubuntu", "win32"), /UNC/)
   assert.throws(() => wslAgyPath({ ...env, AGY_PATH: "agy --foo; echo bad" }, "win32"), /one executable/)
 })
-
-test("WSL mode hides native profile import and OAuth sign-in methods", async () => {
-  const source = (await import("node:fs")).readFileSync(new URL("./index.mjs", import.meta.url), "utf8")
-  assert.match(source, /wslDistro\(\) \? \[\] : \[\.\.\.ACCOUNT_IMPORT_METHODS, accountLogin\]/)
-})

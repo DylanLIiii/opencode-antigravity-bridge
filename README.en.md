@@ -640,6 +640,11 @@ on agy 1.4.12-1.5.3 only; a dry-run of the pinned script on a copy of 1.5.4
 (macOS arm64) matched all six gates, but no end-to-end long-context run has been
 done for 1.5.4 or on any other platform.
 
+Selection verifies the SHA-256 of both the official source and the managed copy.
+Published copies are reused by hash; failed publication preserves the previous
+manifest. Old copies remain until `context disable --purge`; ordinary `disable`
+only turns selection off. Stop Magpie processes using those copies before purging.
+
 Content-free `agy_bridge_model_usage` events identify the billing source
 (`gen_metadata` or `steps`) and record actual input, cache reads/writes, output,
 thinking and `context_tokens`. Generation records can also supply

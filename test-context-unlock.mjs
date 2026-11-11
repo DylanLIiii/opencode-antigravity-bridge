@@ -134,6 +134,63 @@ test("a corrupted managed copy is detected by SHA-256 on first use in a fresh pr
   assert.equal(result.state, "corrupt")
 })
 
+test("ordinary selection checks the source hash even when its size and mtime are preserved", () => {
+  const { agy, env } = setup()
+  const stamp = new Date("2026-01-01T00:00:00Z")
+  fs.utimesSync(agy, stamp, stamp)
+  unlockContext({ env, agyPath: agy, run: fakeRun().run })
+  assert.equal(contextStatus({ env, official: agy }).active, true)
+  const before = fs.statSync(agy)
+  fs.writeFileSync(agy, "OFFICIAL-AGY-v2")
+  fs.utimesSync(agy, stamp, stamp)
+  assert.equal(fs.statSync(agy).size, before.size)
+  assert.equal(fs.statSync(agy).mtimeMs, before.mtimeMs)
+  assert.equal(contextStatus({ env, official: agy }).state, "stale")
+  assert.deepEqual(selectAgy(agy, env), { path: agy, unlocked: false })
+})
+
+test("repeated unlock reuses the published executable without replacing it", () => {
+  const { agy, env } = setup()
+  const first = unlockContext({ env, agyPath: agy, run: fakeRun().run })
+  const before = fs.statSync(first.path)
+  const second = unlockContext({ env, agyPath: agy, run: fakeRun().run })
+  assert.equal(second.path, first.path)
+  assert.equal(second.active, true)
+  assert.equal(fs.statSync(second.path).ino, before.ino)
+  assert.equal(fs.statSync(second.path).mtimeMs, before.mtimeMs)
+})
+
+test("manifest publication failure preserves the previous manifest and executable", () => {
+  const { agy, env } = setup()
+  const first = unlockContext({ env, agyPath: agy, run: fakeRun().run })
+  const manifest = path.join(env.AGY_BRIDGE_CONTEXT_DIR, "manifest.json")
+  const previous = fs.readFileSync(manifest, "utf8")
+  const inode = fs.statSync(first.path).ino
+  const rename = fs.renameSync
+  fs.renameSync = (from, to) => {
+    if (to === manifest) throw Object.assign(new Error("publication denied"), { code: "EACCES" })
+    return rename(from, to)
+  }
+  try {
+    assert.throws(() => unlockContext({ env, agyPath: agy, run: fakeRun().run }), /publication denied/)
+  } finally { fs.renameSync = rename }
+  assert.equal(fs.readFileSync(manifest, "utf8"), previous)
+  assert.equal(fs.statSync(first.path).ino, inode)
+  assert.equal(contextStatus({ env, official: agy }).active, true)
+  assert.deepEqual(fs.readdirSync(env.AGY_BRIDGE_CONTEXT_DIR).filter(name => name.startsWith(".") || name.endsWith(".tmp")), [])
+})
+
+test("a new unlock keeps the old binary available until an explicit purge", () => {
+  const { agy, env } = setup()
+  const first = unlockContext({ env, agyPath: agy, run: fakeRun().run })
+  const previous = fs.readFileSync(first.path)
+  fs.writeFileSync(agy, "OFFICIAL-AGY-v2")
+  const second = unlockContext({ env, agyPath: agy, run: fakeRun().run })
+  assert.equal(second.active, true)
+  assert.notEqual(second.path, first.path)
+  assert.deepEqual(fs.readFileSync(first.path), previous)
+})
+
 test("disable returns to the official default; purge removes only bridge-owned entries", () => {
   const { home, agy, env } = setup()
   unlockContext({ env, agyPath: agy, run: fakeRun().run })

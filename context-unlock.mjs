@@ -55,11 +55,11 @@ export function sha256File(file) {
 }
 
 // A hash is a full integrity check the first time; afterwards the verified
-// file is trusted for as long as its (path, size, mtime, inode) are unchanged.
+// file is trusted for as long as its (path, size, mtime, ctime, inode) are unchanged.
 const verified = new Map()
 function verifiedSha(file) {
   const stat = fs.statSync(file)
-  const key = `${file}\0${stat.size}\0${stat.mtimeMs}\0${stat.ino}`
+  const key = `${file}\0${stat.size}\0${stat.mtimeMs}\0${stat.ctimeMs}\0${stat.ino}`
   const hit = verified.get(file)
   if (hit?.key === key) return hit.sha
   const sha = sha256File(file)
@@ -76,8 +76,12 @@ export function readContextManifest(dir) {
 
 function writeManifest(dir, manifest) {
   const tmp = `${manifestPath(dir)}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + "\n", { mode: 0o600 })
-  fs.renameSync(tmp, manifestPath(dir))
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + "\n", { mode: 0o600 })
+    fs.renameSync(tmp, manifestPath(dir))
+  } finally {
+    try { fs.rmSync(tmp, { force: true }) } catch {}
+  }
 }
 
 // Locate the official install, never one of our own managed copies.
@@ -131,7 +135,7 @@ function describeFailure(result) {
   return text.slice(0, 300)
 }
 
-// Create (or replace) the managed unlocked copy. The official install is only
+// Create (or reuse) the managed unlocked copy. The official install is only
 // read. Every failure leaves any previous manifest and the official agy as is.
 export function unlockContext({ env = process.env, agyPath, run = runCommand, patcher = PATCHER, platform = process.platform } = {}) {
   const source = agyPath || findOfficialAgy(env, os.homedir(), platform)
@@ -175,13 +179,21 @@ export function unlockContext({ env = process.env, agyPath, run = runCommand, pa
     }
 
     const finalDir = path.join(dir, patchedSha.slice(0, 16))
-    fs.rmSync(finalDir, { recursive: true, force: true })
-    fs.renameSync(staging, finalDir)
-    // staging was renamed; the finally below becomes a no-op.
     const patchedFile = path.join(finalDir, exeName(platform))
+    if (fs.existsSync(finalDir)) {
+      // Published binaries are immutable: repeating an unlock must not replace
+      // an executable another process may still be using.
+      const directory = fs.lstatSync(finalDir)
+      const binary = fs.existsSync(patchedFile) ? fs.lstatSync(patchedFile) : null
+      if (!directory.isDirectory() || directory.isSymbolicLink() ||
+          !binary?.isFile() || binary.isSymbolicLink() || sha256File(patchedFile) !== patchedSha) {
+        throw new ContextError("an existing managed copy does not match its hash; disable with --purge before trying again (the previous selection was not changed)", "integrity")
+      }
+    } else {
+      fs.renameSync(staging, finalDir)
+    }
     const patchedStat = fs.statSync(patchedFile)
     const sourceNow = fs.statSync(source)
-    const previous = readContextManifest(dir)
     writeManifest(dir, {
       version: MANIFEST_VERSION,
       enabled: true,
@@ -193,10 +205,8 @@ export function unlockContext({ env = process.env, agyPath, run = runCommand, pa
       patcher: { sha256: patcher.sha256, commit: patcher.commit, verifiedAgy: patcher.verifiedAgy },
       patched: { file: path.relative(dir, patchedFile), sha256: patchedSha, size: patchedStat.size },
     })
-    if (previous?.patched?.file) {
-      const old = path.dirname(path.join(dir, previous.patched.file))
-      if (old !== finalDir && path.dirname(old) === dir) fs.rmSync(old, { recursive: true, force: true })
-    }
+    // Keep previous binaries until an explicit purge: an existing plugin host
+    // can still have their paths cached even after this manifest is switched.
     return contextStatus({ env, full: true })
   } finally {
     fs.rmSync(staging, { recursive: true, force: true })
@@ -221,7 +231,7 @@ export function disableContext({ env = process.env, purge = false } = {}) {
   return contextStatus({ env })
 }
 
-// Describe the current state. `full` also re-hashes the official agy.
+// Describe the current state. `full` bypasses the verified-file hash cache.
 export function contextStatus({ env = process.env, official = findOfficialAgy(env), full = false } = {}) {
   const dir = contextStateDir(env)
   const manifest = readContextManifest(dir)
@@ -235,13 +245,13 @@ export function contextStatus({ env = process.env, official = findOfficialAgy(en
   }
   const patched = path.resolve(dir, manifest.patched?.file || "")
   if (!patched.startsWith(dir + path.sep) || !fs.existsSync(patched)) return fail("missing", "the managed agy copy is missing")
+  const hashFile = full ? sha256File : verifiedSha
   let sha
-  try { sha = verifiedSha(patched) } catch { return fail("corrupt", "the managed agy copy is unreadable") }
+  try { sha = hashFile(patched) } catch { return fail("corrupt", "the managed agy copy is unreadable") }
   if (sha !== manifest.patched.sha256) return fail("corrupt", "the managed agy copy does not match its recorded SHA-256")
   if (!official || path.resolve(official) !== manifest.source?.path) return fail("stale", "the official agy path changed")
   try {
-    const stat = fs.statSync(official)
-    if (full ? verifiedSha(official) !== manifest.source.sha256 : (stat.size !== manifest.source.size || stat.mtimeMs !== manifest.source.mtimeMs)) {
+    if (hashFile(official) !== manifest.source.sha256) {
       return fail("stale", "the official agy changed since the unlock (for example after `agy update`); run `context unlock` again")
     }
   } catch { return fail("stale", "the official agy is unreadable") }

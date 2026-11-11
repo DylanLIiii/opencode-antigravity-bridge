@@ -19,6 +19,9 @@
   [dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle/tree/0a90ec37c69430608084e33ebc2f891e328c9e89/agy-context-unlock)
   patch (MIT, see `vendor/agy-context-unlock`) to the copy only, re-checks all six
   gates, and records source/patcher/patched SHA-256, version and architecture.
+  Selection verifies both source and copy hashes; the cache also tracks ctime.
+  Published copies are immutable and reused by hash, failed manifest publication
+  preserves the previous selection, and old copies remain until explicit purge.
   The official install is never modified; unknown or failing builds keep the
   default. Only while a verified copy is selected does the bridge declare a 512K
   client window and lift its own 180,000-byte ACP submission clamp

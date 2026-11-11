@@ -245,6 +245,10 @@ Magpie：agy 二进制在启动时选定，运行中的会话不会切换上下�
 agy 1.4.12–1.5.3；对 1.5.4（macOS arm64）副本的 dry-run 命中全部六个 gate，但
 1.5.4 及其他平台均未做端到端长上下文运行。
 
+选择副本时会校验官方源文件和副本的 SHA-256。已发布副本按哈希复用，发布失败保留旧的
+manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `disable` 仅关闭选择。
+使用 `--purge` 前请停止仍使用副本的 Magpie 进程。
+
 生成级用量日志 `agy_bridge_model_usage` 包含账单来源 `gen_metadata` 或 `steps`、
 实际输入、缓存读写、输出、思考量及 `context_tokens`。生成记录提供的
 `local_context_estimate` 是发送前的本地估算，可与实际输入对照排查上下文变化。

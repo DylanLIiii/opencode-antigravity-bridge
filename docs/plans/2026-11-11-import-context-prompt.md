@@ -11,7 +11,10 @@
   with live pooled sessions bound to the old credential).
 - **Context unlock** is CLI-only and explicit. A copy of agy is patched, never the
   install; the plugin picks the copy at process start only while the manifest is
-  enabled and its SHA-256s verify (size/mtime only cache an already-hashed file).
+  enabled and both source and copy SHA-256s verify. Cached hashes are reused only
+  while path, size, mtime, ctime and inode match a previous full hash check.
+  Published copies are immutable and reused by hash; manifest publication failure
+  leaves the previous selection intact. Old copies remain until explicit purge.
   Anything unexpected falls back to the official binary. Selecting the binary once
   per process is the whole lifecycle: no hot switching, so an active session, a
   pending tool result or native steering never changes context mode mid-flight.

@@ -2402,6 +2402,144 @@ for (const mode of ["ack-first", "original-first", "reject", "auth-error"]) {
     lastOf("user").text.includes("ABORTED-STEERING-731"))
 }
 
+// Issue #34: a fresh process must recover long client histories without losing
+// the orphan result that prompted the replay or changing the client's lineage.
+{
+  const summary = "This session is being continued from a previous conversation. issue34-skeleton-summary"
+  const messages = [{ role: "user", content: summary }]
+  const ids = Array.from({ length: 177 }, (_, index) => `issue34-skeleton-${index}`)
+  const currentResult = "issue34-skeleton-current-result 中文 " + "r".repeat(2000)
+  const instruction = "Use the completed result and reply with issue34-skeleton-current-instruction."
+  for (const [index, id] of ids.entries()) {
+    messages.push({ role: "assistant", content: [
+      { type: "tool_use", id, name: "echo", input: { text: `lookup ${index} ` + "q".repeat(400) } },
+    ] })
+    messages.push({ role: "user", content: [
+      { type: "tool_result", tool_use_id: id, content: index === ids.length - 1
+        ? currentResult : `issue34-skeleton-old-result-${index} ` + "r".repeat(1500) },
+      ...(index === ids.length - 1 ? [{ type: "text", text: instruction }] : []),
+    ] })
+  }
+  const body = { model, metadata: { user_id: "issue34-skeleton-replay" }, tools: [echoTool], messages }
+  const before = inits().length
+  const response = await callFetch(body)
+  const events = response.status === 200 ? (await readSSE(response)).events : []
+  const error = response.status === 200 ? "" : await response.text()
+  const replay = inits().length > before ? lastOf("user") : null
+  const text = replay?.text || ""
+  const callIds = [...text.matchAll(/<tool_record role="call" type="tool_use" id="([^"]+)"/g)].map(match => match[1])
+  const resultIds = [...text.matchAll(/<tool_record role="result" type="tool_result" id="([^"]+)"/g)].map(match => match[1])
+  check("177 tools after a summary replay with an orphan final result", response.status === 200 &&
+    stopOf(events) === "end_turn" && inits().length === before + 1 && !inits().at(-1).resumed, error)
+  check("177-tool skeleton fits the ACP byte limit without dropping any call IDs", Buffer.byteLength(text, "utf8") <= 180_000 &&
+    JSON.stringify(callIds) === JSON.stringify(ids) && JSON.stringify(resultIds) === JSON.stringify(ids.slice(0, -1)))
+  check("177-tool replay retains the summary and complete current result and instruction", text.includes(summary) &&
+    text.includes(`[tool result id=${ids.at(-1)}]\n${currentResult}\n[end of tool result]`) && text.includes(instruction))
+  check("177-tool replay discloses omitted result bodies without dropping history groups",
+    text.includes("Historical tool-result bodies omitted") && !text.includes("issue34-skeleton-old-result-") &&
+    !text.includes("older history messages omitted"))
+  const followupText = "Continue with issue34-skeleton-followup."
+  const followup = await callFetch(nextTurn(body, events, followupText))
+  const final = (await readSSE(followup)).events
+  check("177-tool follow-up matches the full client history and keeps its session", stopOf(final) === "end_turn" &&
+    lastOf("user").convId === replay?.convId && lastOf("user").text === followupText && inits().length === before + 1)
+}
+
+for (const oversizedPart of ["arguments", "assistant-text"]) {
+  const prefix = `issue34-window-${oversizedPart}`
+  const opening = `${prefix}-opening: keep the original task constraints.`
+  const summary = `This session is being continued from a previous conversation. ${prefix}-summary: preserve the decisions.`
+  const summaryCallId = `${prefix}-summary-call`
+  const latestCallId = `${prefix}-latest-call`
+  const latestAssistant = `${prefix}-latest-assistant: use the pending result to finish.`
+  const currentResult = `${prefix}-current-result ` + "完整结果".repeat(500)
+  const history = [{ role: "user", content: opening }]
+  const oldGroups = Array.from({ length: 10 }, (_, index) => ({
+    id: `${prefix}-old-${index}`,
+    payload: `${prefix}-payload-${index} ` + "x".repeat(32_000),
+  }))
+  for (const [index, group] of oldGroups.entries()) {
+    history.push({ role: "assistant", content: [
+      ...(oversizedPart === "assistant-text" ? [{ type: "text", text: group.payload }] : []),
+      { type: "tool_use", id: group.id, name: "echo", input: { text: oversizedPart === "arguments" ? group.payload : "small argument" } },
+    ] }, { role: "user", content: [
+      { type: "tool_result", tool_use_id: group.id, content: `${prefix}-old-result-${index} ` + "r".repeat(1000) },
+    ] })
+    // The summary lives in an otherwise removable exchange, between old groups
+    // that must be dropped. Its associated call and result must survive too.
+    if (index === 1) history.push({ role: "assistant", content: [
+      { type: "tool_use", id: summaryCallId, name: "echo", input: { text: "summary context" } },
+    ] }, { role: "user", content: [
+      { type: "tool_result", tool_use_id: summaryCallId, content: "summary exchange completed" },
+      { type: "text", text: summary },
+    ] })
+  }
+  history.push({ role: "assistant", content: [
+    { type: "text", text: latestAssistant },
+    { type: "tool_use", id: latestCallId, name: "echo", input: { text: "latest argument" } },
+  ] })
+  for (const summarizing of [false, true]) {
+    const label = `${oversizedPart} ${summarizing ? "client summarization" : "orphan result"}`
+    const instruction = summarizing
+      ? `Summarize the conversation so far for continuation, preserving decisions and outstanding work. ${prefix}-summarize-current.`
+      : `Use the retained context and completed result to answer ${prefix}-current-instruction.`
+    const body = { model, metadata: { user_id: `${prefix}-${summarizing ? "summarize" : "replay"}` }, tools: [echoTool], messages: [
+      ...history,
+      { role: "user", content: [{ type: "tool_result", tool_use_id: latestCallId, content: currentResult }] },
+      { role: "user", content: instruction },
+    ] }
+    const before = inits().length
+    const response = await callFetch(body)
+    const events = response.status === 200 ? (await readSSE(response)).events : []
+    const error = response.status === 200 ? "" : await response.text()
+    const replay = inits().length > before ? lastOf("user") : null
+    const text = replay?.text || ""
+    const calls = new Set([...text.matchAll(/<tool_record role="call" type="tool_use" id="([^"]+)"/g)].map(match => match[1]))
+    const results = new Set([...text.matchAll(/<tool_record role="result" type="tool_result" id="([^"]+)"/g)].map(match => match[1]))
+    check(`window fallback accepts oversized ${label} in a fresh session`, response.status === 200 &&
+      stopOf(events) === "end_turn" && inits().length === before + 1 && !inits().at(-1).resumed, error)
+    check(`window fallback for ${label} respects the ACP byte limit and discloses omitted history`, text.length > 0 &&
+      Buffer.byteLength(text, "utf8") <= 180_000 && text.includes("older history messages omitted") &&
+      text.includes("This history is incomplete; do not infer missing tool outcomes."))
+    check(`window fallback for ${label} retains opening, summary exchange and last assistant`, text.includes(opening) &&
+      text.includes(summary) && calls.has(summaryCallId) && results.has(summaryCallId) &&
+      text.includes(latestAssistant) && calls.has(latestCallId))
+    check(`window fallback for ${label} preserves the entire current turn`,
+      text.includes(`<current_turn>\n[tool result id=${latestCallId}]\n${currentResult}\n[end of tool result]`) &&
+      text.includes(instruction) && text.endsWith("\n</current_turn>"))
+    const firstRetained = oldGroups.findIndex(group => calls.has(group.id))
+    check(`window fallback for ${label} drops oldest complete exchanges and keeps full retained content`, firstRetained > 0 &&
+      oldGroups.every((group, index) => calls.has(group.id) === (index >= firstRetained) &&
+        results.has(group.id) === calls.has(group.id) && text.includes(group.payload) === calls.has(group.id)))
+    const followupText = `${prefix}-${summarizing ? "summarize" : "replay"}-followup: continue from here.`
+    const followup = await callFetch(nextTurn(body, events, followupText))
+    const final = (await readSSE(followup)).events
+    check(`windowed ${label} follow-up matches full client history and keeps its session`, stopOf(final) === "end_turn" &&
+      lastOf("user").convId === replay?.convId && lastOf("user").text === followupText && inits().length === before + 1)
+  }
+}
+
+for (const recent of [true, false]) {
+  const messages = [{ role: "user", content:
+    "This session is being continued from a previous conversation. issue34-protected-summary " + "p".repeat(190_000) }]
+  if (!recent) for (let index = 0; index < 5; index++) messages.push(
+    { role: "assistant", content: `issue34-summary-age-answer-${index}` },
+    { role: "user", content: `issue34-summary-age-request-${index}` },
+  )
+  messages.push({ role: "assistant", content: "The opening summary remains required." },
+    { role: "user", content: "Keep issue34-summary-age-current complete." })
+  const before = inits().length
+  const beforePrompts = logs().filter(event => event.type === "user").length
+  const response = await callFetch({ model, metadata: { user_id: `issue34-summary-age-${recent}` }, messages })
+  const payload = response.status === 200 ? (await readSSE(response), null) : await response.json()
+  check(`${recent ? "recent" : "old"} summary preserves oversized-opening rejection with the correct compaction latch`,
+    response.status === 400 && payload?.error?.code === (recent ? "prompt_budget_exceeded" : "context_length_exceeded") &&
+    /prompt is too long/.test(payload?.error?.message || "") === !recent && response.headers.get("x-should-retry") === "false",
+    JSON.stringify(payload))
+  check(`${recent ? "recent" : "old"} oversized protected summary sends no ACP input`, inits().length === before &&
+    logs().filter(event => event.type === "user").length === beforePrompts)
+}
+
 {
   const before = inits().length
   const oversized = { model, system: "Keep the complete latest instruction.", tools: [echoTool], messages: [
@@ -2447,9 +2585,12 @@ for (const mode of ["ack-first", "original-first", "reject", "auth-error"]) {
     lastOf("user").convId === session.convId && lastOf("user").text.includes("LATEST-942") && lastOf("user").text.length < 1000 &&
     !assistantBlocks(final).some(block => block.type === "tool_use"))
 
-  // An incompatible replay must be rejected before discarding the live session.
+  // Protected opening + current input exceed the ceiling even after history
+  // windowing. Reject this incompatible replay before discarding the live session.
   const next = nextTurn(steered, final, "MEMORY after rejected replay")
-  const incompatible = { ...next, system: "Different session instructions" }
+  const incompatible = { ...next, system: "Different session instructions", messages: [
+    ...next.messages.slice(0, -1), { role: "user", content: "MEMORY " + "x".repeat(50_000) },
+  ] }
   const response = await callFetch(incompatible)
   check("oversized incompatible replay preserves the existing process", response.status === 400 &&
     (await response.json()).error?.code === "context_length_exceeded" && fs.existsSync(session.cwd))

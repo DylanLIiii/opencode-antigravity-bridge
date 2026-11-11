@@ -169,16 +169,23 @@ Refreshing the model catalog re-scans the accounts directory.
   installed through ACP metadata count toward the total budget, but not the user
   prompt ceiling. Image base64 travels separately. Existing
   session history can exceed this per-submission budget during continuation or
-  resume. A replay over either limit first omits historical tool-result bodies (calls
-  and the current turn stay complete). If it is still too large, the bridge
-  returns HTTP 400 `context_length_exceeded` before
-  replacing the existing session. The client must compact its history and submit
-  the summary with the complete current instruction. Automatic client compaction
-  depends on the client's error handling. When the history already carries a
-  Claude Code compaction summary, the error uses code `prompt_budget_exceeded`
-  without the "prompt is too long" wording, so the client does not compact in a
-  loop; shorten that summary or the current input to proceed. The bridge leaves summarization to the
-  client. Bounded, content-free events record session IDs, replay reasons and
+  resume. A replay over either limit first switches to compact tool records:
+  complete escaped call arguments, IDs and error status, self-closing omitted
+  results, and one history-level notice instead of repeated per-record caveats.
+  If it is still too large, the bridge omits the oldest complete exchanges until
+  it fits, keeping the opening context, compaction summaries, latest exchange and
+  complete current turn. Calls and their results stay together. An explicit
+  notice tells the model that history is incomplete; this trades older recall
+  for recovery and also applies to client summarization requests. The client's
+  transcript is unchanged, so subsequent turns can reuse the recovered session.
+  If this protected content alone cannot fit, the bridge returns HTTP 400
+  `context_length_exceeded` before submitting it or replacing the existing session.
+  Automatic client compaction depends on the client's error handling. A Claude
+  Code summary in the final eight messages instead produces `prompt_budget_exceeded`
+  without "prompt is too long", avoiding immediate compaction loops; shorten the
+  summary or current input to proceed. Older summaries do not prevent a later
+  compaction. The bridge leaves summarization to the client. Bounded, content-free
+  events record session IDs, replay reasons and
   prompt sizes; `AGY_BRIDGE_EVENTS=0` disables them.
 - **Upstream errors without retry amplification.** agy reports API failures as
   an in-band `⚠ Agent execution terminated due to error.` message and
@@ -553,7 +560,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
-| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | total UTF-8 text budget per submission plus session instructions; does not override the separate 180,000-byte ACP user-input ceiling (including image-label reserves); oversized replay first omits historical tool-result bodies, then returns `context_length_exceeded` (`prompt_budget_exceeded` for an already compacted history) |
+| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | total UTF-8 text budget per submission plus session instructions; does not override the separate 180,000-byte ACP ceiling (including image-label reserves); oversized replay tries compact tool records, then omits oldest complete exchanges; irreducible input returns `context_length_exceeded` (`prompt_budget_exceeded` for a summary in the final eight messages) |
 | `AGY_BRIDGE_CONTEXT_WINDOW` | 256000 | client context declaration, integer 1–1048576; GPT-OSS capped at 131072; requires separately verified upstream capacity |
 | `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session, tool and model usage diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |

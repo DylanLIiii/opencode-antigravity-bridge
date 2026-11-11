@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.3
+
+- Fix post-compaction replay deadlocks in long tool-heavy sessions (#34). When
+  full replay exceeds a budget, use compact, escaped tool records without
+  repeated per-record caveats and with explicit omitted-result markers.
+- If compact records still exceed a budget, omit the oldest complete exchanges
+  with an explicit notice. Preserve opening context, compaction summaries, the
+  latest exchange and the complete current turn, including pending tool results.
+  This also lets client summarization requests proceed with bounded history.
+  Both the 180,000-byte ACP ceiling (including image-label reserves) and total
+  submission budget still apply; protected content that cannot fit is rejected.
+- Limit compaction-loop suppression to summaries in the final eight messages,
+  allowing sessions with older summaries to request client compaction again.
+
 ## 0.3.2
 
 - Prefer AGY 1.5.0+ native steering by sending another prompt in the running

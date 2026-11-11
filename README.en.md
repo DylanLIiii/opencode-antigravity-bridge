@@ -73,6 +73,39 @@ Accounts require an agy that accepts `--gemini_dir` and a file-based token;
 keyring/ADC sign-in is machine-global and cannot be isolated per directory.
 Refreshing the model catalog re-scans the accounts directory.
 
+**Windows file-backed logins.** On native Windows, agy keeps the default
+sign-in in Windows Credential Manager (one machine-global `gemini:antigravity`
+entry). `agy --gemini_dir=<dir>` therefore reuses that account and writes no
+token file, so the bridge cannot discover a second account. Force file-backed
+storage for the account login only; the existing Credential Manager entry is
+left untouched. In PowerShell:
+
+```powershell
+$env:WSL_INTEROP = "1"   # agy's file-storage switch; not a real WSL interop path
+agy --gemini_dir="$env:USERPROFILE\.config\magpie-agy-bridge\accounts\work"
+Remove-Item Env:\WSL_INTEROP
+```
+
+The login writes
+`%USERPROFILE%\.config\magpie-agy-bridge\accounts\work\antigravity-cli\antigravity-oauth-token`.
+The bridge sets the same switch for named-account processes, so they read that
+file instead of Credential Manager; the default account still uses the global
+sign-in. Inside a real WSL session `WSL_INTEROP` is already set and agy already
+uses file storage; do not replace its interop path. `SSH_TTY=1` is an
+alternative switch if `WSL_INTEROP` cannot be used.
+
+The token file is plaintext JSON and includes a refresh token. Restrict the
+account directory to your Windows user before signing in, for example:
+
+```powershell
+icacls "$env:USERPROFILE\.config\magpie-agy-bridge\accounts\work" /inheritance:r /grant:r "$env:USERNAME:(OI)(CI)F"
+```
+
+There is no supported encrypted per-account store on Windows: Credential
+Manager has only the machine-global entry. If plaintext refresh tokens are
+unacceptable, keep one account, or isolate each account in a separate Windows
+user profile or VM.
+
 ## What works
 
 - **Streaming responses** from ACP `agent_message_chunk` updates, with
@@ -481,6 +514,8 @@ The bridge uses the CLI path, not Magpie's remote OAuth implementation.
   and relies on the CLI's existing login. Multiple accounts are supported via
   the `--gemini_dir` isolation described under Use (model IDs get an
   `<account>/` prefix); ACP `authenticate` is still never used to switch.
+  On Windows, named accounts also need the file-storage switch described
+  there, because agy otherwise reads the machine-global Credential Manager.
 - **The IDE tool connection uses a private `nc`.** agy runs `nc host port` for
   `--ide-mcp-port`; the bridge puts its own `nc` (and `nc.cmd` on Windows) first
   in agy's PATH, which runs `mcp-server.mjs` authenticated by a per-process

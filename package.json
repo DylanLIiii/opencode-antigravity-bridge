@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage. Multiple Google accounts supported via per-account agy profiles (`<account>/<model>` in the picker).",
   "type": "module",
   "main": "./index.mjs",

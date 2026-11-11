@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.4
+
+- Fix named accounts on Windows reusing the default sign-in. agy prefers the
+  machine-global Windows Credential Manager over a `--gemini_dir` token file, so
+  account processes, model catalog probes, and named-account usage probes now
+  set agy's file-storage switch (`WSL_INTEROP`) and read the account's own
+  `antigravity-oauth-token` (#33). A real WSL interop path is left untouched,
+  and the default account keeps the global keyring.
+- Document the Windows file-backed login flow, including the plaintext refresh
+  token caveat, NTFS ACL guidance, and the separate-user/VM alternative when
+  plaintext storage is unacceptable.
+
 ## 0.3.3
 
 - Fix process-pool starvation with parallel subagents and abandoned tool waits

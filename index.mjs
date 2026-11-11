@@ -176,8 +176,21 @@ function execOnce(file, args, opts = {}) {
   })
 }
 
+// agy normally prefers the machine-global OS keyring, which every account
+// shares. Named accounts must read their own file token instead. WSL detection
+// is the CLI's file-storage switch, so pin it for account children; a real WSL
+// session already sets WSL_INTEROP and is left untouched.
+function accountEnv(env, geminiDir) {
+  if (!geminiDir || env.WSL_INTEROP) return env
+  return { ...env, WSL_INTEROP: "1" }
+}
+
 async function listAgyModels(agyPath, extraArgs = []) {
-  const { err, stdout, code } = await execOnce(agyPath, [...extraArgs, "models"], { timeoutMs: 15_000 })
+  const geminiDir = extraArgs.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
+  const { err, stdout, code } = await execOnce(agyPath, [...extraArgs, "models"], {
+    timeoutMs: 15_000,
+    env: accountEnv(process.env, geminiDir),
+  })
   if (err || code !== 0) return FALLBACK_MODELS
   const out = []
   for (const raw of stdout.split("\n")) {
@@ -209,7 +222,10 @@ async function getAccounts(agy, { refresh = false } = {}) {
   const usable = [DEFAULT_ACCOUNT]
   await Promise.all(accounts.slice(1).map(async account => {
     if (!agy) return
-    const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "--version"], { timeoutMs: 3_000 })
+    const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "--version"], {
+      timeoutMs: 3_000,
+      env: accountEnv(process.env, account.dir),
+    })
     if (!probe.err && probe.code === 0) usable.push(account)
   }))
   accountsCache = usable
@@ -1058,7 +1074,7 @@ class Proc {
     if (this.geminiDir) args.push(`--gemini_dir=${this.geminiDir}`)
     if (this.workDir) args.push("--add-dir", this.workDir)
     try {
-      const childEnv = { ...process.env }
+      const childEnv = accountEnv({ ...process.env }, this.geminiDir)
       const inheritedPath = process.env.PATH || childEnv.Path || ""
       for (const key of Object.keys(childEnv)) {
         if (/^path$/i.test(key) && key !== "PATH") delete childEnv[key]

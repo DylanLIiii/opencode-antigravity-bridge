@@ -141,7 +141,11 @@ user profile or VM.
   ACP stream exposes no model signature, so the bridge issues one: `agyb1.` plus
   an HMAC-SHA256 over the session and the block text under a per-process key.
   Send `thinking: { "type": "disabled" }` or set `AGY_BRIDGE_THINKING=0` to
-  suppress them.
+  suppress them. agy's own conversation-title summarizer shares that stream;
+  its recognized prompt echo is suppressed (see `AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS`).
+  This is a content heuristic: no native source marker has been verified. Some
+  chunk splits can leak through, and legitimate reasoning echoing the same
+  signature can also be suppressed.
 - **All account models.** The ACP client identifies as `zed / 0.0.0`, the
   allowlisted compatibility identity used by T3 Code, which is how agy offers
   Claude and GPT-OSS models besides Gemini. Changing the model, or the effort
@@ -668,6 +672,7 @@ community observations and depend on the current account and CLI.
 |---|---|---|
 | `AGY_PATH` | PATH lookup | agy executable |
 | `AGY_BRIDGE_THINKING` | on | `0` stops forwarding thought summaries |
+| `AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS` | off | `1` forwards agy's internal title-summarizer thought chunks, which are otherwise suppressed by their prompt echo; diagnostic only, they can dominate the transcript |
 | `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |

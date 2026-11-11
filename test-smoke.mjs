@@ -375,6 +375,46 @@ async function prompt(params, recorded = false) {
     chunk("Answer after thinking.")
     return finish("Answer after thinking.", { thought: 12 })
   }
+  if (text.includes("SUMMARY_LEAK")) {
+    // agy's title summarizer shares the turn's thought stream (#39): the same
+    // prompt echo arrives in several chunks per call, for several calls, split
+    // across the header and at a field boundary so the bridge must decide per
+    // stream, not per chunk.
+    const summary = "Thinking Process: 1. **Analyze the Request:** * **Goal:** Summarize the provided thoughts in " +
+      "the first person (\"I\"). * **Length:** Maximum 50 words for the preview."
+    const split = summary.indexOf("* **Length:**")
+    for (let call = 0; call < 3; call++) {
+      thought(summary.slice(0, 9))
+      thought(summary.slice(9, split))
+      thought(summary.slice(split) + " ".repeat(2800))
+    }
+    thought("User asks: keep the real reasoning. Key insight: only the summary echo is dropped.")
+    chunk("Answer after summaries.")
+    return finish("Answer after summaries.", { thought: 9 })
+  }
+  if (text.includes("SUMMARY_TOOL")) {
+    // A tool call ends the thought burst: held or echoed thought text must be
+    // flushed ahead of the tool block, not only at the answer or end of turn.
+    const summary = "Thinking Process: 1. **Analyze the Request:** * **Goal:** Summarize the provided thoughts " +
+      "in the first person (\"I\"). * **Length:** Maximum 50 words for the preview."
+    thought(summary)
+    thought(" * **Length:** Maximum 50 words for the preview. INTERNAL_SUMMARY_REMAINDER")
+    thought("Think")
+    await invoke("echo", { text: "after summary" })
+    thought("User asks: continue the real task. Key insight: the tool result matters.")
+    chunk("Answer after summary tool.")
+    return finish("Answer after summary tool.")
+  }
+  if (text.includes("SUMMARY_ONLY")) {
+    const summary = "Thinking Process: 1. **Analyze the Request:** * **Goal:** Summarize the provided thoughts " +
+      "in the first person (\"I\"). * **Length:** Maximum 50 words for the preview."
+    for (let n = 0; n < 5; n++) {
+      await new Promise(resolve => setTimeout(resolve, 400))
+      thought(summary)
+    }
+    chunk("Answer after summaries only.")
+    return finish("Answer after summaries only.")
+  }
   if (text.includes("UNICODE")) {
     const message = { jsonrpc: "2.0", method: "session/update", params: { sessionId: session.id, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "中文😀" } } } }
     const wire = Buffer.from(JSON.stringify(message) + "\n")
@@ -1095,6 +1135,82 @@ async function launchedModel(body) {
   check("signed thinking blocks in history do not break continuation", stopOf(followEvents) === "end_turn" && lastOf("user").text === "after thinking")
   const again = assistantBlocks((await readSSE(await callFetch({ model, messages: [{ role: "user", content: "THINK_BLOCKS again" }] }))).events)
   check("signatures are bound to the session and text", again[0]?.thinking === blocks[0].thinking && again[0].signature !== blocks[0].signature)
+}
+
+{
+  const body = { model, messages: [{ role: "user", content: "SUMMARY_LEAK please" }] }
+  const { events } = await readSSE(await callFetch(body))
+  const blocks = assistantBlocks(events)
+  const thoughts = blocks.filter(block => block.type === "thinking")
+  check("#39: agy's title-summary reasoning is not forwarded as thinking",
+    thoughts.length === 1 && !thoughts[0].thinking.includes("Summarize the provided thoughts"), JSON.stringify(blocks))
+  check("#39: the primary turn's own reasoning survives",
+    thoughts[0]?.thinking === "User asks: keep the real reasoning. Key insight: only the summary echo is dropped.")
+  check("#39: suppressing summary thoughts keeps the answer and its ordering",
+    blocks.at(-1)?.type === "text" && blocks.at(-1).text === "Answer after summaries.")
+  check("#39: dropped summaries leave a single signed thinking block",
+    events.filter(event => event.data?.delta?.type === "signature_delta").length === 1)
+}
+
+{
+  const saved = process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS
+  let unfiltered
+  try {
+    process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS = "1"
+    ;({ default: unfiltered } = await import("./index.mjs?summary-thoughts-opt-out"))
+  } finally {
+    if (saved === undefined) delete process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS
+    else process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS = saved
+  }
+  const loaderOptOut = await (await unfiltered.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const response = await loaderOptOut.fetch("agy://local/messages", {
+    method: "POST", body: JSON.stringify({ model, messages: [{ role: "user", content: "SUMMARY_LEAK opt out" }] }),
+  })
+  const thoughts = assistantBlocks((await readSSE(response)).events).filter(block => block.type === "thinking")
+  check("#39: AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS=1 forwards every thought chunk",
+    thoughts.length === 1 && thoughts[0].thinking.startsWith("Thinking Process: 1. **Analyze the Request:**") &&
+    thoughts[0].thinking.includes("Key insight"), JSON.stringify(thoughts.map(block => block.thinking.slice(0, 40))))
+}
+
+{
+  // Suppressed summaries must still count as agy activity: five summary-only
+  // thoughts at 400 ms apart would otherwise exceed this shortened turn limit.
+  const saved = process.env.AGY_BRIDGE_TURN_TIMEOUT_MS
+  let limited
+  try {
+    process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "1200"
+    ;({ default: limited } = await import("./index.mjs?summary-thoughts-activity"))
+  } finally {
+    process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = saved
+  }
+  const loaderLimited = await (await limited.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const response = await loaderLimited.fetch("agy://local/messages", {
+    method: "POST", body: JSON.stringify({ model, messages: [{ role: "user", content: "SUMMARY_ONLY please" }] }),
+  })
+  const { events } = await readSSE(response)
+  check("#39: suppressed summary chunks still renew the activity timeout",
+    stopOf(events) === "end_turn" && textOf(events) === "Answer after summaries only." && !events.some(event => event.event === "error"),
+    JSON.stringify(events.filter(event => event.event === "error").map(event => event.data)))
+}
+
+{
+  // A tool call is a real response boundary: buffered thought text must be
+  // delivered before the tool block, and the echo region must not leak past it.
+  const first = { model, messages: [{ role: "user", content: "SUMMARY_TOOL please" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const blocks = assistantBlocks(firstEvents)
+  const toolIndex = blocks.findIndex(block => block.type === "tool_use")
+  const lastThinkingIndex = blocks.reduce((last, block, index) => block.type === "thinking" ? index : last, -1)
+  check("#39: a tool call flushes the held thought before the tool block",
+    lastThinkingIndex >= 0 && lastThinkingIndex < toolIndex, JSON.stringify(blocks.map(block => block.type)))
+  const beforeTool = blocks.filter(block => block.type === "thinking").map(block => block.thinking).join("")
+  check("#39: no summary echo reaches the client before a tool call",
+    !beforeTool.includes("Summarize the provided thoughts") && !beforeTool.includes("Maximum 50 words"), beforeTool.slice(0, 200))
+  const continued = (await readSSE(await callFetch(continuation(first, firstEvents, "after the tool")))).events
+  const afterTool = assistantBlocks(continued).filter(block => block.type === "thinking").map(block => block.thinking).join("")
+  check("#39: real reasoning on both sides of a tool call survives",
+    beforeTool.includes("Think") && afterTool.includes("Key insight: the tool result matters."),
+    JSON.stringify({ beforeTool, afterTool, stop: stopOf(continued) }))
 }
 
 {

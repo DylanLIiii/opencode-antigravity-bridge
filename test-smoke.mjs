@@ -200,6 +200,54 @@ function recordModelCall({ input = 0, read = 0, output = 0, thinking = 0 }) {
   }
 }
 
+function recordInProgressGeneration() {
+  const dir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR
+  if (!sqliteOpen || !dir) return null
+  const db = sqliteOpen(path.join(dir, session.id + ".db"))
+  try {
+    session.stepIdx = (session.stepIdx ?? -1) + 1
+    const idx = session.stepIdx
+    const store = process.env.FAKE_AGY_USAGE_STORE
+    if (store && store !== "empty-generation") {
+      db.run("CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB)")
+      // Pre-send local context estimate without billing counters yet.
+      const inner = [8, ...varint(3600)]
+      const estimate = [0x52, inner.length, ...inner]
+      db.run("INSERT INTO gen_metadata VALUES (?, ?)", idx, new Uint8Array([0x0a, estimate.length, ...estimate]))
+    }
+    let stepRow = null
+    if (store !== "generation") {
+      db.run("CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB)")
+      session.stepIdx++
+      stepRow = session.stepIdx
+      db.run("INSERT INTO steps VALUES (?, 15, 1, ?)", stepRow, new Uint8Array([0x18, 1]))
+    }
+    return { genIdx: idx, stepRow }
+  } finally {
+    db.close()
+  }
+}
+
+function finalizeInProgressGeneration(pending, { input = 0, read = 0, output = 0, thinking = 0 }) {
+  const dir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR
+  if (!sqliteOpen || !dir || !pending) return
+  const db = sqliteOpen(path.join(dir, session.id + ".db"))
+  try {
+    const usage = [0x10, ...varint(input), 0x18, ...varint(output), 0x28, ...varint(read), 0x48, ...varint(thinking)]
+    const store = process.env.FAKE_AGY_USAGE_STORE
+    if (store && store !== "empty-generation") {
+      const estimate = [0x52, ...varint(varint(input + read + 100).length + 1), 8, ...varint(input + read + 100)]
+      const chat = [0x22, ...varint(usage.length), ...usage, 0x4a, ...varint(estimate.length), ...estimate]
+      db.run("UPDATE gen_metadata SET data = ? WHERE idx = ?", new Uint8Array([0x0a, ...varint(chat.length), ...chat]), pending.genIdx)
+    }
+    if (store !== "generation" && pending.stepRow != null) {
+      db.run("UPDATE steps SET status = 3, metadata = ? WHERE idx = ?", new Uint8Array([0x18, 2, 0x4a, usage.length, ...usage]), pending.stepRow)
+    }
+  } finally {
+    db.close()
+  }
+}
+
 function finish(reply, extra = {}) {
   const cached = extra.cached || 0
   const thought = extra.thought || 0
@@ -418,6 +466,32 @@ async function prompt(params, recorded = false) {
     chunk("Inflated two.\n")
     recordModelCall({ input: 500, read: 3000, output: 20 })
     return finish("Inflated one.\nInflated two.\n", { input: 3500, cached: 3000, exclusive: true })
+  }
+  if (text.includes("MEASURED_SIBLING")) {
+    chunk("Sibling one.\n")
+    recordModelCall({ input: 3000, output: 40, thinking: 4 })
+    const p1 = invoke("echo", { text: "sib-1" })
+    // Issue the second MCP tool call of the SAME generation after the first
+    // HTTP tool_use response has already closed, forcing a sibling response.
+    await new Promise(resolve => setTimeout(resolve, 120))
+    const p2 = invoke("echo", { text: "sib-2" })
+    await Promise.all([p1, p2])
+    chunk("Sibling done.\n")
+    recordModelCall({ input: 500, read: 3000, output: 20 })
+    return finish("Sibling one.\nSibling done.\n", { input: 3500, cached: 3000, exclusive: true })
+  }
+  if (text.includes("MEASURED_TWO_GEN_LAG")) {
+    chunk("Gen one.\n")
+    recordModelCall({ input: 3000, output: 40, thinking: 4 })
+    await invoke("echo", { text: "gen-1" })
+    // Start a real second tool generation whose in-progress step/estimate row
+    // lands immediately while its completed billing counters commit 120ms later.
+    const pendingGen = recordInProgressGeneration()
+    setTimeout(() => finalizeInProgressGeneration(pendingGen, { input: 400, read: 3000, output: 30 }), 120)
+    await invoke("echo", { text: "gen-2" })
+    chunk("Gen done.\n")
+    recordModelCall({ input: 200, read: 3400, output: 15 })
+    return finish("Gen one.\nGen done.\n", { input: 3600, cached: 6400, exclusive: true })
   }
   if (text.includes("MEASURED")) {
     const lag = text.includes("MEASURED_LAG")
@@ -3745,6 +3819,49 @@ for (const compacted of [true, false]) {
     check(`${label}: final step reports its own call with the cache hit`,
       stopOf(lastEvents) === "end_turn" && final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20,
       JSON.stringify(final))
+  }
+  if (hasSqlite) {
+    for (const store of ["", "generation", "both", "empty-generation"]) {
+      process.env.FAKE_AGY_USAGE_STORE = store
+      const label = "MEASURED_SIBLING/" + (store || "steps")
+      const r1 = { model, metadata: { user_id: "measured-sibling-" + (store || "steps") }, messages: [{ role: "user", content: "MEASURED_SIBLING usage" }], tools: [echoTool] }
+      const e1 = (await readSSE(await callFetch(r1))).events
+      const c1 = continuation(r1, e1, "sib-1-result")
+      const t0 = Date.now()
+      const e2 = (await readSSE(await callFetch(c1))).events
+      const siblingElapsed = Date.now() - t0
+      const c2 = continuation(c1, e2, "sib-2-result")
+      const e3 = (await readSSE(await callFetch(c2))).events
+      const u1 = usageOf(e1)
+      const u2 = usageOf(e2)
+      const u3 = usageOf(e3)
+      check(`${label}: first tool step reports generation #1`,
+        stopOf(e1) === "tool_use" && u1.input_tokens === 3000 && u1.cache_read_input_tokens === 0 && u1.output_tokens === 44,
+        JSON.stringify(u1))
+      check(`${label}: staggered sibling tool step reports 0 incremental usage without 1s timeout`,
+        stopOf(e2) === "tool_use" && u2.input_tokens === 0 && u2.cache_read_input_tokens === 0 &&
+          u2.cache_creation_input_tokens === 0 && u2.output_tokens === 0 && siblingElapsed < 800,
+        `${siblingElapsed}ms ${JSON.stringify(u2)}`)
+      check(`${label}: preserved cursor lets final step report generation #2 cache hit`,
+        stopOf(e3) === "end_turn" && u3.input_tokens === 500 && u3.cache_read_input_tokens === 3000 && u3.output_tokens === 20,
+        JSON.stringify(u3))
+
+      const lagLabel = "MEASURED_TWO_GEN_LAG/" + (store || "steps")
+      const g1 = { model, metadata: { user_id: "measured-twogen-" + (store || "steps") }, messages: [{ role: "user", content: "MEASURED_TWO_GEN_LAG usage" }], tools: [echoTool] }
+      const ge1 = (await readSSE(await callFetch(g1))).events
+      const gc1 = continuation(g1, ge1, "gen-1-result")
+      const ge2 = (await readSSE(await callFetch(gc1))).events
+      const gc2 = continuation(gc1, ge2, "gen-2-result")
+      const ge3 = (await readSSE(await callFetch(gc2))).events
+      const gu2 = usageOf(ge2)
+      const gu3 = usageOf(ge3)
+      check(`${lagLabel}: in-progress second generation polls instead of misclassifying as sibling`,
+        stopOf(ge2) === "tool_use" && gu2.input_tokens === 400 && gu2.cache_read_input_tokens === 3000 && gu2.output_tokens === 30,
+        JSON.stringify(gu2))
+      check(`${lagLabel}: third generation reconciles cleanly at end_turn`,
+        stopOf(ge3) === "end_turn" && gu3.input_tokens === 200 && gu3.cache_read_input_tokens === 3400 && gu3.output_tokens === 15,
+        JSON.stringify(gu3))
+    }
   }
   delete process.env.FAKE_AGY_USAGE_STORE
 }

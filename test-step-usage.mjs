@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { decodeStepUsage, decodeGenerationUsage, lastModelStep, modelStepsAfter, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
+import { decodeStepUsage, decodeGenerationUsage, lastModelStep, latestGenerationIdx, latestModelStep, modelStepsAfter, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -112,6 +112,14 @@ test("stores with an absent or unused generation table retain step billing", { s
     const empty = modelUsageCursor(file)
     db.run("INSERT INTO steps VALUES (2, 15, 3, ?)", usageBlob(usage))
     assert.deepEqual(modelUsageAfter(file, empty), { source: "steps", steps: [{ idx: 2, ...usage }] })
+    // Unfinished model step (status != 3) advances latestModelStep while lastModelStep stays at 2;
+    // tool call steps (step_type = 132) leave latestModelStep unchanged.
+    db.run("INSERT INTO steps VALUES (3, 132, 3, ?)", new Uint8Array([0x18, 2]))
+    assert.equal(latestModelStep(file), 2)
+    assert.equal(latestGenerationIdx(file), -1)
+    db.run("INSERT INTO steps VALUES (4, 15, 1, ?)", new Uint8Array([0x18, 1]))
+    assert.equal(lastModelStep(file), 2)
+    assert.equal(latestModelStep(file), 4)
   } finally {
     db.close()
     fs.rmSync(dir, { recursive: true, force: true })

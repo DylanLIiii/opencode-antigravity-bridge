@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.5
+
+- Preserve per-step SQLite usage cursors across staggered parallel MCP tool
+  calls from an already-measured model generation. Confirm after one poll tick
+  that neither `steps` (`step_type = 15`) nor `gen_metadata` has advanced, then
+  report zero incremental usage (`agy_sibling`) without waiting out the 1-second
+  store timeout, recalibrating token ratios on zeros, or dropping
+  `turn.stepCursor` before subsequent generations and `end_turn` reconciliation.
+
 ## 0.3.4
 
 - Fix named accounts on Windows reusing the default sign-in. agy prefers the

@@ -243,7 +243,9 @@ user profile or VM.
   reconciled against ACP totals. Each response reports the calls it covered
   from there, including the latest call's uncached input,
   `cache_read_input_tokens` and cache writes, and the calls' output with
-  thought tokens itemized in `output_tokens_details.thinking_tokens`. When
+  thought tokens itemized in `output_tokens_details.thinking_tokens`; staggered
+  parallel tool sub-steps from an already-measured generation report zero
+  incremental usage while keeping the store cursor intact. When
   SQLite support or complete store records are unavailable, responses fall
   back to an estimate calibrated on ACP's
   totals. Set `AGY_BRIDGE_STEP_USAGE=0` to disable store reads entirely.

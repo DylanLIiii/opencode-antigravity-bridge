@@ -2,10 +2,12 @@ import { spawn } from "node:child_process"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { agySpawnSpec, childEnv } from "./platform.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
 const MAX_OUTPUT_BYTES = 1024 * 1024
+const CLEANUP_TIMEOUT_MS = 1000
 
 class UsageError extends Error {}
 
@@ -98,9 +100,10 @@ function usageDisabled(env) {
 }
 
 // Keep the CLI's normal sign-in while leaving its global skills, rules, plugins,
-// MCP servers and settings behind. Keyring/ADC auth needs no seed; a file-based
-// token is linked, never copied.
-async function linkIsolatedAccount(home, geminiDir) {
+// MCP servers and settings behind. Keyring/ADC auth needs no seed. Windows file
+// symlinks require privileges; use a private copy there. A hardlink would let a
+// CLI token refresh write through to the user's original credential.
+async function linkIsolatedAccount(home, geminiDir, platform, fs) {
   const source = path.join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
   try {
     await fs.access(source)
@@ -110,36 +113,77 @@ async function linkIsolatedAccount(home, geminiDir) {
   const appDir = path.join(geminiDir, "antigravity-cli")
   await fs.mkdir(appDir, { recursive: true, mode: 0o700 })
   await fs.chmod(appDir, 0o700)
+  const destination = path.join(appDir, "antigravity-oauth-token")
+  if (platform === "win32") {
+    await fs.copyFile(source, destination, fs.constants.COPYFILE_EXCL)
+    await fs.chmod(destination, 0o600)
+    return
+  }
   try {
-    await fs.symlink(source, path.join(appDir, "antigravity-oauth-token"))
+    await fs.symlink(source, destination)
   } catch (error) {
     if (error.code !== "EEXIST") throw error
   }
 }
 
-function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
+function stopWindows(child, env, spawnProcess) {
+  return new Promise(resolve => {
+    let killer
+    let settled = false
+    const finish = fallback => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (fallback) {
+        try { child.kill("SIGKILL") } catch {}
+      }
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      try { killer?.kill("SIGKILL") } catch {}
+      finish(true)
+    }, CLEANUP_TIMEOUT_MS)
+    // Resolve the OS tool independently of PATH (which starts with our shims).
+    const root = Object.entries(env).find(([key]) => /^systemroot$/i.test(key))?.[1] || "C:\\Windows"
+    try {
+      killer = spawnProcess(path.win32.join(root, "System32", "taskkill.exe"), ["/PID", String(child.pid), "/T", "/F"], {
+        env, windowsHide: true, detached: false, stdio: "ignore",
+      })
+      killer.once("error", () => finish(true))
+      killer.once("close", code => finish(code !== 0))
+    } catch {
+      finish(true)
+    }
+  })
+}
+
+function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, platform, spawnProcess }) {
   return new Promise((resolve, reject) => {
     let child
     let settled = false
-    let stopped = false
+    let cleanup
     let bytes = 0
     const stdout = []
     const stderr = []
     let timer
     const stop = () => {
-      if (!child?.pid || stopped) return
-      stopped = true
+      if (cleanup) return cleanup
+      if (!child?.pid) return Promise.resolve()
+      if (platform === "win32") return cleanup = stopWindows(child, env, spawnProcess)
       // Only this detached child/group is ours, never an existing user agy.
       try { process.kill(-child.pid, "SIGKILL") } catch {
         try { child.kill("SIGKILL") } catch {}
       }
+      return cleanup = Promise.resolve()
     }
-    const finish = (error, result) => {
+    const finish = async (error, result) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       signal?.removeEventListener("abort", abort)
-      stop() // Also stop MCP descendants if the parent exited first.
+      // Await tree cleanup before removing files. POSIX groups also retain
+      // exited parents' descendants; Windows taskkill requires a live parent.
+      await stop()
       child?.stdout?.destroy()
       child?.stderr?.destroy()
       if (error) reject(error)
@@ -149,13 +193,14 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
     if (signal?.aborted) return abort()
     if (Date.now() >= deadline) return finish(new UsageError("agy usage query timed out."))
     try {
-      child = spawn(file, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+      const command = agySpawnSpec(file, args, platform, env)
+      child = spawnProcess(command.file, command.args, {
+        ...command.options, cwd, env, detached: platform !== "win32", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+      })
     } catch {
       finish(new UsageError("agy usage could not start the CLI."))
       return
     }
-    signal?.addEventListener("abort", abort, { once: true })
-    timer = setTimeout(() => finish(new UsageError("agy usage query timed out.")), Math.max(1, deadline - Date.now()))
     const collect = chunks => chunk => {
       if (settled) return
       bytes += chunk.length
@@ -171,6 +216,10 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes }) {
     child.on("close", code => finish(null, {
       code, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"),
     }))
+    signal?.addEventListener("abort", abort, { once: true })
+    timer = setTimeout(() => finish(new UsageError("agy usage query timed out.")), Math.max(1, deadline - Date.now()))
+    // Cover cancellation during spawn, after registering error/close handlers.
+    if (signal?.aborted) abort()
   })
 }
 
@@ -189,13 +238,15 @@ export async function fetchUsage(agy, {
   tempRoot = os.tmpdir(),
   home = os.homedir(),
   geminiDir: fixedGeminiDir,
+  platform = process.platform,
+  spawn: spawnProcess = spawn,
+  fs: fileSystem = fs,
 } = {}) {
   if (!agy) throw new UsageError("agy CLI not found. Install it and run `agy` once to sign in.")
-  // Browser launcher blocking and owned process-group cleanup are POSIX-specific.
-  if (process.platform === "win32") throw new UsageError("agy bridge usage queries currently require macOS or Linux.")
+  const fs = fileSystem
   const deadline = Date.now() + timeout(timeoutMs)
   // A caller-supplied Gemini dir is a named account profile: use it as-is and
-  // never delete it. Otherwise build a private one that only links the token.
+  // never delete it. Otherwise build a private one seeded only with the token.
   const owned = !fixedGeminiDir
   const directory = owned ? await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-")) : null
   let workDir = null
@@ -210,7 +261,7 @@ export async function fetchUsage(agy, {
       geminiDir = path.resolve(directory, "gemini")
       await fs.mkdir(geminiDir, { recursive: true, mode: 0o700 })
       await fs.chmod(geminiDir, 0o700)
-      await linkIsolatedAccount(home, geminiDir)
+      await linkIsolatedAccount(home, geminiDir, platform, fs)
     }
     workDir = owned ? directory : await fs.mkdtemp(path.join(tempRoot, "magpie-agy-usage-work-"))
     const agentDir = path.join(workDir, ".agents", "agents", "magpie-usage")
@@ -221,16 +272,18 @@ export async function fetchUsage(agy, {
       "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true",
       "---", "Do not run model prompts or tools.", "",
     ].join("\n"), { mode: 0o600 })
+    const windows = platform === "win32"
     for (const name of ["open", "xdg-open"]) {
-      await fs.writeFile(path.join(workDir, name), "#!/bin/sh\nexit 1\n", { mode: 0o700 })
+      await fs.writeFile(path.join(workDir, name + (windows ? ".cmd" : "")), windows ? "@echo off\r\nexit /b 1\r\n" : "#!/bin/sh\nexit 1\n", { mode: 0o700 })
     }
-    const childEnv = {
-      ...env,
-      AGY_CLI_DISABLE_AUTO_UPDATE: "true",
-      PATH: workDir + path.delimiter + (env.PATH || "/usr/bin:/bin"),
-      BROWSER: path.join(workDir, "open"),
+    const launchEnv = childEnv(env, platform, {})
+    const pathKey = Object.keys(launchEnv).find(key => windows ? /^path$/i.test(key) : key === "PATH") || "PATH"
+    launchEnv[pathKey] = workDir + (windows ? ";" : ":") + (launchEnv[pathKey] || (windows ? "" : "/usr/bin:/bin"))
+    // Merge again to replace a differently-cased Windows BROWSER as well.
+    const options = {
+      cwd: workDir, env: childEnv({ BROWSER: path.join(workDir, windows ? "open.cmd" : "open") }, platform, launchEnv),
+      deadline, signal, maxOutputBytes, platform, spawnProcess,
     }
-    const options = { cwd: workDir, env: childEnv, deadline, signal, maxOutputBytes }
     // Probe the hidden profile flag within the version call. Older CLIs reject
     // it; only then fall back to the user's real Gemini directory. A fixed
     // account dir must never fall back: that would read the wrong account.
@@ -250,7 +303,15 @@ export async function fetchUsage(agy, {
     if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
     return parseUsageReport(result.stdout)
   } finally {
-    await fs.rm(owned ? directory : workDir, { recursive: true, force: true }).catch(() => {})
+    const temporary = owned ? directory : workDir
+    if (temporary) {
+      try {
+        // Node retries EBUSY, EPERM and ENOTEMPTY with bounded linear backoff.
+        await fs.rm(temporary, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+      } catch {
+        throw new UsageError("agy usage could not remove its temporary workspace. Check temporary-directory permissions.")
+      }
+    }
   }
 }
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.3
+
+- Enable Windows quota queries with batch-file launch support, isolated account
+  tokens, browser blockers, process-tree cleanup and temporary-directory retries
+  (#30).
+- Isolate background summaries that fork from an already answered tool step,
+  preserving the primary session and its newer pending calls. Ignore answered
+  calls when routing later requests, and allow complete results from a superseded
+  sibling to replay independently without a new user instruction (#31).
+
 ## 0.3.2
 
 - Prefer AGY 1.5.0+ native steering by sending another prompt in the running

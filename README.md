@@ -182,7 +182,8 @@ GPT-OSS 的声明始终取配置值与 131,072 中的较小值。
 - **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和二进制/PDF 文档；纯文本 document 和 search_result 可用。
   需要服务端声明 ACP 图片能力（agy 1.5.0 起）。
 - **平台**：Linux / macOS 已验证。Windows 已补充 `.exe` / `.cmd` / `.bat`
-  发现、启动和 WSL 路径处理，并有命令构造测试；维护者尚未完成 Windows 实机验证。
+  发现、启动和 WSL 路径处理；额度查询支持浏览器拦截、临时凭证副本、进程树清理和文件删除重试。
+  这些路径已有自动化测试；维护者尚未完成 Windows 实机验证。
 - **账号**：默认一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
   `authenticate` 去切换登录。需要多账号时使用上方"多账号"小节的
   `--gemini_dir` 隔离方案（模型名 `<账号>/<模型id>` 前缀路由）。

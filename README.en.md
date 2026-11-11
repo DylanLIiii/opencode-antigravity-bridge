@@ -390,19 +390,25 @@ service problem).
 - A private temporary workspace contains the custom agent (`tools: []`,
   `mcpServers: []`, `inheritMcp: false`, `inheritCustomizations: false`,
   `excludeDefaultComponents: true`) and failing
-  `open`/`xdg-open`/`BROWSER` launchers, preventing background usage refreshes
-  from opening OAuth browser login. Queries set
+  `open`/`xdg-open`/`BROWSER` launchers (`.cmd` on Windows), preventing background
+  usage refreshes from opening OAuth browser login. Queries set
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` only for their child processes. They do
   not change global agy settings or the user's updater preferences.
 - On completion, failure, timeout, or cancellation, the query's owned POSIX
-  process group is stopped and its workspace removed. Processes that detach
-  into a different process group are outside this cleanup guarantee. Errors
+  process group is stopped; Windows uses bounded `taskkill /T /F` with a direct
+  child fallback. Workspace removal waits for cleanup and retries transient
+  file locks. Processes that detach into a different process group, and Windows
+  descendants whose parent already exited or whose `taskkill` fails, are outside
+  this cleanup guarantee. Errors
   show sanitized diagnostics, not raw stderr, tokens, or account URLs, and do
   not mark the bridge's sentinel login as revoked. Run `agy` interactively to
   repair an expired CLI sign-in.
 
-Quota probing currently supports **macOS and Linux**. Windows returns an
-explicit unsupported error rather than querying without browser/process guards.
+Quota probing supports **macOS, Linux and Windows**, including Windows `.cmd` and
+`.bat` CLI wrappers. Windows copies file-based credentials into the temporary
+profile to avoid symlink privileges and changes to the original token. Windows
+launch and cleanup paths have automated coverage; real Windows verification is
+still pending.
 
 References: CodexBar's
 [CLI quota parser](https://github.com/steipete/CodexBar/blob/0aa34100b7a7ea397bcbf14eaab388d3f32aa4a1/Sources/CodexBarCore/Providers/Antigravity/AntigravityQuotaSummaryParser.swift)

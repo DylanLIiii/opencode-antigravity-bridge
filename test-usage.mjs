@@ -176,11 +176,13 @@ if (process.platform === "win32") {
     windowsHide: true, encoding: "utf8", timeout: 5000,
   })
   const resolved = lookup.stdout?.trim().split(/\r?\n/)[0]
-  const expected = path.join(process.cwd(), "rundll32.cmd")
   windowsBrowser = { resolved, lookupStatus: lookup.status, lookupError: lookup.error?.code ?? null, lookupStderr: lookup.stderr }
   // Never execute the system launcher if lookup bypassed the blocker. Record
   // the lookup so the test reports a useful failure instead of opening a URL.
-  if (lookup.status === 0 && fs.realpathSync(resolved).toLowerCase() === fs.realpathSync(expected).toLowerCase()) {
+  const blocker = lookup.status === 0 && path.basename(resolved).toLowerCase() === "rundll32.cmd"
+    ? fs.readFileSync(resolved, "utf8") : null
+  windowsBrowser.blocker = blocker
+  if (blocker === "@echo off\r\nexit /b 1\r\n") {
     const command = agySpawnSpec(resolved, ["url.dll,FileProtocolHandler", "https://example.invalid/"], process.platform, process.env)
     const result = spawnSync(command.file, command.args, { ...command.options, windowsHide: true, encoding: "utf8", timeout: 5000 })
     Object.assign(windowsBrowser, { status: result.status, error: result.error?.code ?? null, stderr: result.stderr })
@@ -295,6 +297,7 @@ test("queries only the structured command in a private, restricted workspace and
     if (process.platform === "win32") {
       assert.equal(log.windowsBrowser.lookupStatus, 0, JSON.stringify(log.windowsBrowser))
       assert.equal(path.basename(log.windowsBrowser.resolved), "rundll32.cmd")
+      assert.equal(log.windowsBrowser.blocker, "@echo off\r\nexit /b 1\r\n")
       assert.equal(log.windowsBrowser.status, 1, JSON.stringify(log.windowsBrowser))
       assert.equal(log.windowsBrowser.error, null)
       assert.equal(log.windowsBrowser.stderr, "")

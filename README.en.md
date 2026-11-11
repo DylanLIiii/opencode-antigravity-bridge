@@ -354,18 +354,18 @@ required; the hook was verified with the **0.1.1599** host.
 The plugin queries `agy --version`, then runs
 `agy -p /usage --output-format json` with a restricted custom agent and a
 bounded print timeout. It reads the **current agy sign-in**, not a Google
-account separately added to Magpie. It does not read, copy, or save Google
-tokens, impersonate the IDE, scrape the TUI, or send a model prompt. `agy`
-remains responsible for authentication and quota requests. An unrecognized
+account separately added to Magpie. `agy` remains responsible for authentication
+and quota requests. The bridge prepares an isolated profile from the CLI's
+file-based sign-in when present and reads its structured usage report. An unrecognized
 version, or one older than **1.1.11**, is rejected before print mode because
 older slash-command implementations could treat `/usage` as a model prompt.
 
 Quota probes use a private `--gemini_dir` profile. Print-mode startup therefore
 discovers only that empty profile instead of the user's global
 `~/.gemini/config` skills, rules, plugins, MCP servers and settings. A
-file-based agy sign-in is linked into the profile when present; otherwise the
-probe relies on the same keyring/ADC credentials as the CLI. The link is
-removed with the workspace and the token contents are never copied. Hidden
+file-based agy sign-in is linked into the profile on POSIX and copied on Windows;
+otherwise the probe relies on the same keyring/ADC credentials as the CLI. The
+temporary profile is removed with the workspace. Hidden
 `--gemini_dir` support is probed with the version call; older CLIs fall back to
 the normal Gemini directory. Set `AGY_BRIDGE_USAGE=0` to skip automatic quota
 probes entirely (for example while investigating a CLI or macOS approval

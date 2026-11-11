@@ -169,16 +169,23 @@ Refreshing the model catalog re-scans the accounts directory.
   installed through ACP metadata count toward the total budget, but not the user
   prompt ceiling. Image base64 travels separately. Existing
   session history can exceed this per-submission budget during continuation or
-  resume. A replay over either limit first omits historical tool-result bodies (calls
-  and the current turn stay complete). If it is still too large, the bridge
-  returns HTTP 400 `context_length_exceeded` before
-  replacing the existing session. The client must compact its history and submit
-  the summary with the complete current instruction. Automatic client compaction
-  depends on the client's error handling. When the history already carries a
-  Claude Code compaction summary, the error uses code `prompt_budget_exceeded`
-  without the "prompt is too long" wording, so the client does not compact in a
-  loop; shorten that summary or the current input to proceed. The bridge leaves summarization to the
-  client. Bounded, content-free events record session IDs, replay reasons and
+  resume. A replay over either limit first switches to compact tool records:
+  complete escaped call arguments, IDs and error status, self-closing omitted
+  results, and one history-level notice instead of repeated per-record caveats.
+  If it is still too large, the bridge omits the oldest complete exchanges until
+  it fits, keeping the opening context, compaction summaries, latest exchange and
+  complete current turn. Calls and their results stay together. An explicit
+  notice tells the model that history is incomplete; this trades older recall
+  for recovery and also applies to client summarization requests. The client's
+  transcript is unchanged, so subsequent turns can reuse the recovered session.
+  If this protected content alone cannot fit, the bridge returns HTTP 400
+  `context_length_exceeded` before submitting it or replacing the existing session.
+  Automatic client compaction depends on the client's error handling. A Claude
+  Code summary in the final eight messages instead produces `prompt_budget_exceeded`
+  without "prompt is too long", avoiding immediate compaction loops; shorten the
+  summary or current input to proceed. Older summaries do not prevent a later
+  compaction. The bridge leaves summarization to the client. Bounded, content-free
+  events record session IDs, replay reasons and
   prompt sizes; `AGY_BRIDGE_EVENTS=0` disables them.
 - **Upstream errors without retry amplification.** agy reports API failures as
   an in-band `⚠ Agent execution terminated due to error.` message and
@@ -355,18 +362,18 @@ required; the hook was verified with the **0.1.1599** host.
 The plugin queries `agy --version`, then runs
 `agy -p /usage --output-format json` with a restricted custom agent and a
 bounded print timeout. It reads the **current agy sign-in**, not a Google
-account separately added to Magpie. It does not read, copy, or save Google
-tokens, impersonate the IDE, scrape the TUI, or send a model prompt. `agy`
-remains responsible for authentication and quota requests. An unrecognized
+account separately added to Magpie. `agy` remains responsible for authentication
+and quota requests. The bridge prepares an isolated profile from the CLI's
+file-based sign-in when present and reads its structured usage report. An unrecognized
 version, or one older than **1.1.11**, is rejected before print mode because
 older slash-command implementations could treat `/usage` as a model prompt.
 
 Quota probes use a private `--gemini_dir` profile. Print-mode startup therefore
 discovers only that empty profile instead of the user's global
 `~/.gemini/config` skills, rules, plugins, MCP servers and settings. A
-file-based agy sign-in is linked into the profile when present; otherwise the
-probe relies on the same keyring/ADC credentials as the CLI. The link is
-removed with the workspace and the token contents are never copied. Hidden
+file-based agy sign-in is linked into the profile on POSIX and copied on Windows;
+otherwise the probe relies on the same keyring/ADC credentials as the CLI. The
+temporary profile is removed with the workspace. Hidden
 `--gemini_dir` support is probed with the version call; older CLIs fall back to
 the normal Gemini directory. Set `AGY_BRIDGE_USAGE=0` to skip automatic quota
 probes entirely (for example while investigating a CLI or macOS approval
@@ -391,19 +398,26 @@ service problem).
 - A private temporary workspace contains the custom agent (`tools: []`,
   `mcpServers: []`, `inheritMcp: false`, `inheritCustomizations: false`,
   `excludeDefaultComponents: true`) and failing
-  `open`/`xdg-open`/`BROWSER` launchers, preventing background usage refreshes
-  from opening OAuth browser login. Queries set
+  `open`/`xdg-open`/`BROWSER` launchers (`.cmd` on Windows), plus a Windows
+  `rundll32.cmd` blocker for AGY's native authentication browser command,
+  preventing background usage refreshes from opening OAuth browser login. Queries set
   `AGY_CLI_DISABLE_AUTO_UPDATE=true` only for their child processes. They do
   not change global agy settings or the user's updater preferences.
 - On completion, failure, timeout, or cancellation, the query's owned POSIX
-  process group is stopped and its workspace removed. Processes that detach
-  into a different process group are outside this cleanup guarantee. Errors
+  process group is stopped; Windows uses bounded `taskkill /T /F` with a direct
+  child fallback. Workspace removal waits for cleanup and retries transient
+  file locks. Processes that detach into a different process group, and Windows
+  descendants whose parent already exited or whose `taskkill` fails, are outside
+  this cleanup guarantee. Errors
   show sanitized diagnostics, not raw stderr, tokens, or account URLs, and do
   not mark the bridge's sentinel login as revoked. Run `agy` interactively to
   repair an expired CLI sign-in.
 
-Quota probing currently supports **macOS and Linux**. Windows returns an
-explicit unsupported error rather than querying without browser/process guards.
+Quota probing supports **macOS, Linux and Windows**, including Windows `.cmd` and
+`.bat` CLI wrappers. Windows copies file-based credentials into the temporary
+profile to avoid symlink privileges and changes to the original token. Native
+quota fixtures and platform helpers run in CI on Windows, macOS and Linux;
+real Windows Antigravity account verification is still pending.
 
 References: CodexBar's
 [CLI quota parser](https://github.com/steipete/CodexBar/blob/0aa34100b7a7ea397bcbf14eaab388d3f32aa4a1/Sources/CodexBarCore/Providers/Antigravity/AntigravityQuotaSummaryParser.swift)
@@ -565,7 +579,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_MINIMAL_AGENT` | on | `0` keeps agy's default prompt components (about 2,600 more input tokens per model call) |
 | `AGY_BRIDGE_PROMPT_GUARD` | on | `0` disables scoped system metadata/identity normalization |
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
-| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | total UTF-8 text budget per submission plus session instructions; does not override the separate 180,000-byte ACP user-input ceiling (including image-label reserves); oversized replay first omits historical tool-result bodies, then returns `context_length_exceeded` (`prompt_budget_exceeded` for an already compacted history) |
+| `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | total UTF-8 text budget per submission plus session instructions; does not override the separate 180,000-byte ACP ceiling (including image-label reserves); oversized replay tries compact tool records, then omits oldest complete exchanges; irreducible input returns `context_length_exceeded` (`prompt_budget_exceeded` for a summary in the final eight messages) |
 | `AGY_BRIDGE_CONTEXT_WINDOW` | 256000 | client context declaration, integer 1–1048576; GPT-OSS capped at 131072; requires separately verified upstream capacity |
 | `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session, tool and model usage diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |

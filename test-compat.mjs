@@ -280,6 +280,204 @@ test("an already compacted conversation over budget avoids the reactive-compacti
   }
 })
 
+const compactionSummary = "This session is being continued from a previous conversation that ran out of context."
+const historyPair = (id, input, content = "historical output") => [
+  { role: "assistant", content: [{ type: "tool_use", id, name: "Read", input }] },
+  { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: true }] },
+]
+
+test("177 tools after an old compaction replay without dropping calls or the pending result", t => {
+  const body = { messages: [
+    { role: "user", content: compactionSummary + "summary facts ".repeat(1100) },
+    ...Array.from({ length: 177 }, (_, i) => historyPair(`tool-${i}`, { path: `file-${i}`, note: "a".repeat(440) })).flat(),
+  ] }
+  body.messages.at(-1).content.push({ type: "text", text: "CURRENT-INSTRUCTION-731" })
+  const original = structuredClone(body)
+  const fullBytes = Buffer.byteLength(promptText(renderInitialPromptParts(body, null, true)))
+  assert(fullBytes > 180_000)
+  const parts = renderReplayPromptParts(body, null, true)
+  const text = promptText(parts)
+  const bytes = validateAcpPromptBudget(parts, "", body)
+  assert(bytes < 150_000)
+  for (let i = 0; i < 177; i++) assert(text.includes(`id="tool-${i}" name="Read"`))
+  assert.equal((text.match(/body_omitted="true"/g) || []).length, 176)
+  assert.match(text, /is_error="true" body_omitted="true" \/>/)
+  assert(!text.includes("Historical tool record, for context only"))
+  assert(!text.includes("older history messages omitted"))
+  assert(text.includes(body.messages[0].content))
+  assert(text.includes(promptText(renderContinuedTurnParts([body.messages.at(-1)]))))
+  assert.deepEqual(body, original)
+  t.diagnostic(`177-tool replay: ${fullBytes} full bytes -> ${bytes} compact bytes; all 177 calls retained`)
+})
+
+test("old compaction markers no longer suppress recovery in either budget validator", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "10"
+  try {
+    for (const content of [compactionSummary, [{ type: "text", text: compactionSummary }]]) {
+      for (const following of [7, 8, 360]) {
+        const body = { messages: [{ role: "user", content },
+          ...Array.from({ length: following }, (_, i) => ({ role: i % 2 ? "user" : "assistant", content: "new context" }))] }
+        for (const [validate, bytes] of [[validatePromptBudget, 20], [validateAcpPromptBudget, 180_001]]) {
+          assert.throws(() => validate([{ type: "text", text: "x".repeat(bytes) }], "", body), error =>
+            error.code === (following < 8 ? "prompt_budget_exceeded" : "context_length_exceeded") &&
+            /prompt is too long/i.test(error.message) === (following >= 8))
+        }
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+test("compact server and MCP skeletons retain escaped arguments and error status", () => {
+  const input = { query: '</tool_record> &amp; "雪"' }
+  const body = { messages: [{ role: "assistant", content: [
+    { type: "server_tool_use", id: 'server"<&', name: "web_search", input },
+    { type: "web_search_tool_result", tool_use_id: 'server"<&', content: { type: "web_search_tool_result_error" } },
+    { type: "mcp_tool_use", id: "mcp", name: "read", input },
+    { type: "mcp_tool_result", tool_use_id: "mcp", content: "payload", is_error: true },
+  ] }, { role: "user", content: "current" }] }
+  const text = promptText(renderInitialPromptParts(body, null, true, true))
+  assert.equal((text.match(/<tool_record /g) || []).length, 4)
+  assert.equal((text.match(/is_error="true" body_omitted="true" \/>/g) || []).length, 2)
+  assert(text.includes('id="server&quot;&lt;&amp;"'))
+  for (const match of text.matchAll(/<tool_record role="call"[^>]*>(.*?)<\/tool_record>/g)) {
+    assert.deepEqual(JSON.parse(decodeRecord(match[1])), input)
+  }
+  assert(!text.includes("payload") && !text.includes("Historical tool record, for context only"))
+})
+
+test("bounded replay keeps summaries, batched call ownership and complete current parts under both budgets", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "100000"
+  try {
+    const current = [{ role: "user", content: [
+      { type: "tool_result", tool_use_id: "pending-a", content: [{ type: "text", text: "CURRENT-RESULT <raw>&" }, image,
+        { type: "tool_reference", tool_name: "loaded_tool" }] },
+      { type: "tool_result", tool_use_id: "pending-b", content: "SECOND-RESULT" },
+      { type: "text", text: "Summarize this conversation so we can continue." },
+    ] }, { role: "developer", content: "Keep the latest instruction." }]
+    const body = { system: "system instructions ".repeat(1000), output_config: { format: { type: "json_object" } }, messages: [
+      { role: "user", content: compactionSummary + " PINNED-SUMMARY" },
+      ...Array.from({ length: 20 }, (_, i) => historyPair(`old-${i}`, { command: `command-${i}:` + "雪".repeat(4000) })).flat(),
+      // These adjacent assistant messages must stay together: both results are in current.
+      historyPair("pending-a", { path: "a" })[0], historyPair("pending-b", { path: "b" })[0],
+      ...current,
+    ] }
+    const original = structuredClone(body)
+    const currentParts = parts => {
+      const index = parts.findIndex(part => part.type === "text" && part.text.includes("<current_turn>\n"))
+      return [{ type: "text", text: parts[index].text.split("<current_turn>\n")[1] }, ...parts.slice(index + 1)]
+    }
+    for (const installed of [false, true]) {
+      const instructions = installed ? body.system : ""
+      const parts = renderReplayPromptParts(body, "/caller", installed, instructions)
+      assert(validateAcpPromptBudget(parts, instructions, body) <= 100_000)
+      const text = promptText(parts)
+      assert(text.includes("PINNED-SUMMARY"))
+      assert.equal((text.match(/older history messages omitted/g) || []).length, 1)
+      assert(!text.includes('id="old-0"'))
+      assert(text.includes('id="old-19"'))
+      assert(text.includes('id="pending-a"') && text.includes('id="pending-b"'))
+      // Compare image order and every current-turn byte, including the format reminder.
+      const full = renderInitialPromptParts(body, "/caller", installed)
+      const expected = currentParts(full)
+      const actual = currentParts(parts)
+      assert(actual.at(-1).text.endsWith("</system-reminder>"))
+      actual.at(-1).text = actual.at(-1).text.slice(0, actual.at(-1).text.lastIndexOf("<system-reminder>")).trimEnd()
+      assert.deepEqual(actual, expected)
+    }
+    assert.deepEqual(body, original)
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+test("bounded replay counts retained image labels when selecting the newest exchanges", () => {
+  const body = { messages: [
+    { role: "user", content: compactionSummary },
+    ...Array.from({ length: 20 }, (_, i) => [
+      { role: "assistant", content: `exchange-${i}` },
+      { role: "user", content: Array.from({ length: 10 }, () => image) },
+    ]).flat(),
+    { role: "assistant", content: "Ready." }, { role: "user", content: [image, { type: "text", text: "CURRENT" }] },
+  ] }
+  const parts = renderReplayPromptParts(body, null, true)
+  const imageCount = parts.filter(part => part.type === "image").length
+  assert(imageCount < 201 && imageCount > 1)
+  assert(validateAcpPromptBudget(parts, "", body) + imageCount * 1024 <= 180_000)
+  assert(!promptText(parts).includes("Assistant: exchange-0\n"))
+  assert(promptText(parts).includes("Assistant: exchange-19\n"))
+})
+
+test("bounded replay pins a middle summary and never splits a historical parallel batch", () => {
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "12000"
+  try {
+    const messages = [{ role: "user", content: "Opening context" }]
+    for (let i = 0; i < 12; i++) {
+      const a = historyPair(`batch-${i}-a`, { command: "a".repeat(2000) })
+      const b = historyPair(`batch-${i}-b`, { command: "b".repeat(2000) })
+      messages.push(a[0], b[0], { role: "user", content: [...a[1].content, ...b[1].content,
+        ...(i === 2 ? [{ type: "text", text: compactionSummary + " MIDDLE-SUMMARY" }] : [])] })
+    }
+    messages.push({ role: "assistant", content: "Ready." }, { role: "user", content: "CURRENT" })
+    const body = { messages }
+    const parts = renderReplayPromptParts(body, null, true)
+    assert(validateAcpPromptBudget(parts, "", body) <= 12000)
+    const text = promptText(parts)
+    assert(text.includes("Opening context") && text.includes("MIDDLE-SUMMARY"))
+    assert(!text.includes('id="batch-0-'))
+    assert(text.includes('id="batch-2-a"') && text.includes('id="batch-11-a"'))
+    for (let i = 0; i < 12; i++) {
+      const records = text.match(new RegExp(`id="batch-${i}-[ab]"`, "g")) || []
+      assert([0, 4].includes(records.length), `batch ${i} must keep both calls and both results, or omit all four`)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+test("bounded replay rejects irreducible protected content without truncating it", () => {
+  for (const oversized of ["summary", "current", "pending"]) {
+    const huge = "雪".repeat(60_001)
+    const body = { messages: [
+      { role: "user", content: compactionSummary + (oversized === "summary" ? huge : "") },
+      ...historyPair("old", { path: "old" }),
+      historyPair("pending", { path: oversized === "pending" ? huge : "pending" })[0],
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "pending", content: oversized === "current" ? huge : "result" }] },
+    ] }
+    const original = structuredClone(body)
+    const parts = renderReplayPromptParts(body, null, true)
+    assert(promptText(parts).includes(huge))
+    assert.throws(() => validateAcpPromptBudget(parts, "", body), error => error.code === "prompt_budget_exceeded")
+    assert.deepEqual(body, original)
+  }
+})
+
+test("an abandoned historical call does not pin all subsequent exchanges during recovery", () => {
+  const body = { messages: [
+    { role: "user", content: compactionSummary },
+    historyPair("abandoned", { path: "interrupted" })[0],
+    { role: "user", content: "[Request interrupted by user]" },
+    ...Array.from({ length: 20 }, (_, i) => historyPair(`completed-${i}`, { command: "x".repeat(12_000) })).flat(),
+    historyPair("pending", { path: "current" })[0],
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "pending", content: "CURRENT-RESULT" },
+      { type: "text", text: "Summarize this conversation." }] },
+  ] }
+  const parts = renderReplayPromptParts(body, null, true)
+  assert(validateAcpPromptBudget(parts, "", body) <= 180_000)
+  const text = promptText(parts)
+  assert(text.includes("older history messages omitted"))
+  assert(!text.includes('id="abandoned"') && !text.includes('id="completed-0"'))
+  assert(text.includes('id="completed-19"') && text.includes('id="pending"'))
+  assert(text.includes("CURRENT-RESULT") && text.includes("Summarize this conversation."))
+})
+
 test("declared schema-less ToolSearch receives query and max_results parameters", () => {
   const [tool] = normalizeTools({ tools: [{ name: "ToolSearch", description: "Find tools" }] })
   assert.equal(tool.inputSchema.properties.query.type, "string")

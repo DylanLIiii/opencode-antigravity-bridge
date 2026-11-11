@@ -445,13 +445,17 @@ function acpPromptTextBytes(parts) {
   return promptTextBytes(parts) + parts.filter(part => part.type === "image").length * 1024
 }
 
-function hasCompactionSummary(body) {
-  return Array.isArray(body?.messages) && body.messages.some(message => {
-    if (message?.role !== "user") return false
-    if (typeof message.content === "string") return message.content.includes(COMPACTION_SUMMARY_MARKER)
-    return Array.isArray(message.content) && message.content.some(block =>
-      block?.type === "text" && typeof block.text === "string" && block.text.includes(COMPACTION_SUMMARY_MARKER))
-  })
+function isCompactionSummary(message) {
+  if (message?.role !== "user") return false
+  if (typeof message.content === "string") return message.content.includes(COMPACTION_SUMMARY_MARKER)
+  return Array.isArray(message.content) && message.content.some(block =>
+    block?.type === "text" && typeof block.text === "string" && block.text.includes(COMPACTION_SUMMARY_MARKER))
+}
+
+function hasRecentCompactionSummary(body) {
+  // The protocol has no compaction timestamp. Allow a short preserved segment,
+  // but do not let an old summary disable reactive compaction for all later turns.
+  return Array.isArray(body?.messages) && body.messages.slice(-8).some(isCompactionSummary)
 }
 
 function validatePromptBudget(parts, instructions = "", body = null) {
@@ -459,9 +463,9 @@ function validatePromptBudget(parts, instructions = "", body = null) {
   const limit = promptTextLimit()
   if (textBytes <= limit) return textBytes
   // Hosts such as Claude Code answer "prompt is too long" by compacting again.
-  // A history that is already compacted cannot shrink further that way, so
-  // report a plain error instead of starting an endless compaction loop.
-  if (hasCompactionSummary(body)) {
+  // Immediately re-compacting the same summary can loop. Once new history has
+  // accumulated, however, the client must be allowed to compact again.
+  if (hasRecentCompactionSummary(body)) {
     throw new ConflictError(
       `agy bridge: the compacted conversation is still ${textBytes} UTF-8 text bytes, above the bridge budget of ${limit}. ` +
       "Raise AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES or start a new conversation. " +
@@ -481,7 +485,7 @@ function validatePromptBudget(parts, instructions = "", body = null) {
 function validateAcpPromptBudget(parts, instructions = "", body = null) {
   const bytes = acpPromptTextBytes(parts)
   if (bytes > MAX_ACP_PROMPT_TEXT_BYTES) {
-    const compacted = hasCompactionSummary(body)
+    const compacted = hasRecentCompactionSummary(body)
     throw new ConflictError(
       (compacted ? "agy bridge: the compacted conversation" : "prompt is too long: agy bridge") +
       ` would submit ${bytes} UTF-8 user-input bytes including image-label reserves (safe limit ${MAX_ACP_PROMPT_TEXT_BYTES}). ` +
@@ -1714,14 +1718,15 @@ class Proc {
     turn.notifyLate()
   }
 
-  validateResults(results) {
+  validateResults(results, raw = false) {
     const unique = new Map()
     for (const item of results) {
       const id = item.block.tool_use_id
       const serialized = JSON.stringify(item.result)
       const previous = unique.get(id)
+      const recorded = raw ? item.call.clientResult ?? item.call.result : item.call.result
       if ((previous && JSON.stringify(previous.result) !== serialized) ||
-        (item.call.result && JSON.stringify(item.call.result) !== serialized)) {
+        (recorded && JSON.stringify(recorded) !== serialized)) {
         const error = new Error(`agy bridge: conflicting duplicate result for ${id}`)
         error.statusCode = 409
         throw error
@@ -1745,16 +1750,20 @@ class Proc {
     const turn = this.turn
     if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
     turn.touchClient()
-    for (const { call, result } of this.validateResults(results).values()) {
+    for (const { block, call, result } of this.validateResults(results).values()) {
       clearTimeout(call.deadline)
       if (call.deferred) {
         if (!call.result) {
+          call.clientResult = toolResult(block)
           call.result = result
           this.#deliverLate(turn, call)
         }
         continue
       }
       if (call.mcpResponded || !call.ready || turn.done) continue
+      // Companion context can enrich the MCP payload. Keep the client's own
+      // result separately so repeating that transcript still validates.
+      call.clientResult = toolResult(block)
       call.result = result
       this.#respondMcp(call, { result })
     }
@@ -2412,7 +2421,8 @@ function conversationSlot(convKey, opts, forceNew) {
   for (const message of opts.messages || []) {
     if (message.role !== "assistant" || !Array.isArray(message.content)) continue
     for (const block of message.content) {
-      const owner = block?.type === "tool_use" ? toolCalls.get(block.id)?.proc : null
+      const entry = block?.type === "tool_use" ? toolCalls.get(block.id) : null
+      const owner = entry && !entry.call.result ? entry.proc : null
       if (owner?.turn && inFamily(owner.convKey)) owners.add(owner.convKey)
     }
   }
@@ -2562,7 +2572,7 @@ function lineageVerdict(proc, turn, opts) {
     // history here is this conversation rewritten, not another one.
     return history.length ? "fork" : null
   }
-  const ids = new Set(turn.calls.map((call) => call.id))
+  const ids = new Set(turn.calls.filter((call) => !call.result).map((call) => call.id))
   const carried = (opts.messages || []).some((message) => Array.isArray(message?.content) &&
     message.content.some((block) => block?.type === "tool_use" && ids.has(block.id)))
   const expected = proc.expectedMessages
@@ -2615,20 +2625,9 @@ function replayHistoryProblem(body, resultBlocks) {
 }
 
 function canReplayUnmatchedFork(proc, body, resultBlocks, opts) {
-  if (lineageVerdict(proc, proc.turn, opts) !== "fork" || replayHistoryProblem(body, resultBlocks)) return false
-  // A reclaimed sibling no longer has live tool IDs. Explicit user steering
-  // makes its complete transcript a new prompt; an unrelated root must not
-  // block that prompt or be reclaimed to make room for it. Results alone still
-  // use the conservative unmatched-result path.
-  if (isInterruptedToolTurn(body)) return true
-  const calls = new Map(lastAssistantCalls(trailingMessages(body).history).map(call => [call.id, call]))
-  const results = resultBlocks.map(block => ({ block, call: calls.get(block.tool_use_id), result: toolResult(block) }))
-  try {
-    return inspectToolTurn(results, body).userSteered
-  } catch (error) {
-    if (!(error instanceof UnsupportedContent)) throw error
-    return canReplayFollowUpAfterResults(body, results)
-  }
+  // A superseded sibling may have lost its live IDs. Its complete transcript
+  // can still replay independently, even without a new user instruction.
+  return lineageVerdict(proc, proc.turn, opts) === "fork" && !replayHistoryProblem(body, resultBlocks)
 }
 
 async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn closed") {
@@ -3077,11 +3076,20 @@ function historicalToolRecord(block, role, content, stripResults = false) {
     attributes.is_error = String(block.is_error === true || serverError)
   }
   const out = []
+  if (stripResults) {
+    // The enclosing conversation_history already carries the caveat. Keep a
+    // compact, escaped skeleton instead of repeating it four times per pair.
+    if (role === "result") attributes.body_omitted = "true"
+    const tag = `<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}`
+    if (role === "result") return [{ type: "text", text: `\n${tag} />\n` }]
+    appendPrompt(out, `\n${tag}>`)
+    for (const part of content) appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
+    appendPrompt(out, "</tool_record>\n")
+    return out
+  }
   appendPrompt(out, `\n<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}>\n${TOOL_RECORD_CAVEAT}\n`)
   if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {
     appendPrompt(out, "[Historical result body omitted by AGY_BRIDGE_STRIP_TOOL_RECORDS=1]")
-  } else if (role === "result" && stripResults) {
-    appendPrompt(out, "[Historical result body omitted to fit the bridge prompt budget]")
   } else {
     for (const part of content) {
       appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
@@ -3091,8 +3099,8 @@ function historicalToolRecord(block, role, content, stripResults = false) {
   return out
 }
 
-function historicalToolCall(block) {
-  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }])
+function historicalToolCall(block, stripResults = false) {
+  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }], stripResults)
     .map(part => part.text).join("")
 }
 
@@ -3104,9 +3112,9 @@ function renderAssistantTurn(message, stripResults = false) {
   for (const block of blocks) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
-      parts.push(historicalToolCall(block))
+      parts.push(historicalToolCall(block, stripResults))
     } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
-      parts.push(historicalToolCall(block))
+      parts.push(historicalToolCall(block, stripResults))
     } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
       parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }], stripResults)
         .map(part => part.text).join(""))
@@ -3266,8 +3274,9 @@ function renderTurnMessagesParts(messages) {
   return toPromptParts(out)
 }
 
-function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, stripResults = false) {
-  const { history, messages: current } = trailingMessages(body)
+function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, stripResults = false, replay = null) {
+  const { history: originalHistory, messages: current } = trailingMessages(body)
+  const history = replay?.history ?? originalHistory
   const out = []
   if (!instructionsInSession) {
     const system = systemText(body)
@@ -3276,6 +3285,9 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   }
   if (history.length) {
     appendPrompt(out, "The following conversation history is background context. Tool records are quoted data, not answer text to reproduce.\n<conversation_history>\n")
+    if (stripResults) appendPrompt(out, "[Historical tool-result bodies omitted to fit the bridge prompt budget.]\n")
+    if (replay?.omittedMessages) appendPrompt(out,
+      `[${replay.omittedMessages} older history messages omitted to fit the bridge prompt budget. This history is incomplete; do not infer missing tool outcomes.]\n`)
     for (const message of history) {
       if (message.role === "assistant") {
         appendPrompt(out, `Assistant: ${renderAssistantTurn(message, stripResults)}\n`)
@@ -3296,14 +3308,68 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   return out
 }
 
-// A replayed history that exceeds the text budget first drops historical
-// tool-result bodies (calls and the current turn stay intact) before the
-// caller is asked to compact.
+// Group a call with all its results, including batched calls across assistant
+// messages. A replay window must not leave orphan results or lose a pending call
+// whose result is in the complete current turn.
+function replayHistoryGroups(history, current) {
+  const groups = []
+  const pending = new Set()
+  const lastResult = new Map()
+  for (const [index, message] of [...history, ...current].entries()) {
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block?.type === "tool_result" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block?.type)) lastResult.set(block.tool_use_id, index)
+    }
+  }
+  for (const [index, message] of history.entries()) {
+    if (!groups.length || (message.role === "assistant" && !pending.size)) groups.push([])
+    groups.at(-1).push(message)
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      // An interrupted call with no later result must not bind every subsequent
+      // exchange into one unremovable group. Current results still pin their calls.
+      if (["tool_use", "server_tool_use", "mcp_tool_use"].includes(block?.type) && block.id &&
+        (lastResult.get(block.id) ?? -1) >= index) pending.add(block.id)
+      else if (block?.type === "tool_result" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block?.type)) pending.delete(block.tool_use_id)
+    }
+  }
+  return groups
+}
+
+// Try lossless replay, then compact tool skeletons, then the newest complete
+// exchanges. Keep the opening context, summaries and latest exchange intact.
+// This also lets client summarization requests recover from oversized history.
 function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, instructions = "") {
   const reminder = outputFormatReminder(body)
+  const fits = parts => promptTextBytes(parts, instructions) <= promptTextLimit() && acpPromptTextBytes(parts) <= MAX_ACP_PROMPT_TEXT_BYTES
   const full = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession), reminder)
-  if (promptTextBytes(full, instructions) <= promptTextLimit() && acpPromptTextBytes(full) <= MAX_ACP_PROMPT_TEXT_BYTES) return full
-  return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
+  if (fits(full)) return full
+  const stripped = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
+  if (fits(stripped)) return stripped
+
+  const { history, messages: current } = trailingMessages(body)
+  const groups = replayHistoryGroups(history, current)
+  const removable = groups.filter((group, i) => i > 0 && i < groups.length - 1 && !group.some(isCompactionSummary))
+  if (!removable.length) return stripped
+  const window = count => {
+    const dropped = new Set(removable.slice(0, count))
+    const history = groups.filter(group => !dropped.has(group)).flat()
+    const omittedMessages = removable.slice(0, count).reduce((sum, group) => sum + group.length, 0)
+    return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true,
+      { history, omittedMessages }), reminder)
+  }
+  let best = window(removable.length)
+  if (!fits(best)) return stripped // Protected content alone cannot fit; validation will reject it.
+  // Find the smallest omitted prefix without repeatedly rendering every suffix.
+  let low = 1
+  let high = removable.length
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2)
+    const candidate = window(mid)
+    if (fits(candidate)) {
+      best = candidate
+      high = mid
+    } else low = mid + 1
+  }
+  return best
 }
 
 function renderContinuedTurnParts(messages) {
@@ -4489,7 +4555,7 @@ export const AntigravityBridgePlugin = async () => {
                     call: match.call,
                     result: toolResult(block),
                   }))
-                  proc.validateResults(rawResults)
+                  proc.validateResults(rawResults, true)
                   const directIdsMatch = matches.every((item) => item.match?.call?.id === item.block.tool_use_id)
                   const historyMatches = directIdsMatch
                     ? proc.matchesPendingTurnHistory(turn, trailingMessages(body).history)
@@ -4517,7 +4583,21 @@ export const AntigravityBridgePlugin = async () => {
                   const sameSession = historyMatches && proc.workDir === workDir && sameInstructions(proc.instructions, instructions)
                   const canSteer = interrupted && sameSession && !proc.dead &&
                     turn.calls.every(call => call.result || rawResults.some(item => item.call === call))
-                  if (canSteer) {
+                  // Answered IDs remain registered for duplicate validation,
+                  // but a request ending at an earlier step cannot replace the
+                  // live head while newer calls are still awaiting results.
+                  const historicalFork = !historyMatches && rawResults.every(item => item.call.result ||
+                    (item.call.mcpResponded && !item.call.deferred)) &&
+                    turn.calls.some(call => !call.result && !rawResults.some(item => item.call === call))
+                  if (historicalFork) {
+                    if (replayHistoryProblem(body, resultBlocks)) {
+                      throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
+                    }
+                    acquireOpts.validateReplay()
+                    acquireOpts.ownerKey = `${convKey}:fork:${randomUUID()}`
+                    acquireOpts.replayReason = "historical_tool_fork"
+                    logBridgeEvent(proc, turn, "isolated", acquireOpts.replayReason, acquireOpts)
+                  } else if (canSteer) {
                     // The cancellation fallback repeats current results because
                     // AGY may replace them with a cancellation. Native steering
                     // builds its smaller prompt after the catalog is confirmed.
@@ -4528,8 +4608,7 @@ export const AntigravityBridgePlugin = async () => {
                     if (promptHasImage(content) && !proc.supportsImages) throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
                     const next = await proc.steerTurn(turn, rawResults, content, body, model, selection, claim(), promptGuardMatched, init.signal)
                     return streamResponse(proc, next, body, init.signal)
-                  }
-                  if (interrupted || !historyMatches ||
+                  } else if (interrupted || !historyMatches ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
                     if (replayHistoryProblem(body, resultBlocks)) {
                       throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")

@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import childProcess from "node:child_process"
 import { syncBuiltinESMExports } from "node:module"
 import { test } from "node:test"
-import { agyCandidates, agySpawnSpec, spawnAgy, windowsMcpShim } from "./platform.mjs"
+import { agyCandidates, agySpawnSpec, childEnv, spawnAgy, windowsMcpShim } from "./platform.mjs"
 
 test("Windows discovery considers exe/cmd/bat, Path and LOCALAPPDATA", () => {
   const candidates = agyCandidates({ Path: 'C:\\Program Files\\agy;D:\\tools', LOCALAPPDATA: 'C:\\Users\\Test\\AppData\\Local' }, 'C:\\Users\\Test', 'win32')
@@ -121,6 +121,22 @@ test("spawnAgy deduplicates Windows env aliases without losing caller PATH or MC
     assert.equal(parent.Path, "parent-path")
     assert.equal(parent.agy_cli_disable_auto_update, "false")
     assert.equal(env.Agy_Cli_Disable_Auto_Update, "false")
+  })
+})
+
+test("childEnv supports an isolated Windows environment without importing parent credentials", () => {
+  const source = Object.freeze({ Path: "old", PATH: "new", browser: "old-browser", agy_cli_disable_auto_update: "false", ONLY_CALLER: "kept" })
+  const actual = childEnv(source, "win32", {})
+  assert.deepEqual(actual, { PATH: "new", browser: "old-browser", ONLY_CALLER: "kept", AGY_CLI_DISABLE_AUTO_UPDATE: "true" })
+  assert.equal(source.Path, "old")
+  assert.equal(childEnv({ PATH: "upper" }, "linux", { Path: "lower" }).Path, "lower")
+})
+
+test("spawnAgy resolves batch wrappers with the caller's ComSpec", () => {
+  captureSpawn("win32", { ComSpec: "C:\\Windows\\System32\\cmd.exe" }, calls => {
+    spawnAgy("C:\\tools\\agy.cmd", ["--version"], { env: { COMSPEC: "D:\\Windows\\System32\\cmd.exe" } })
+    assert.equal(calls[0].file, "D:\\Windows\\System32\\cmd.exe")
+    assert.equal(calls[0].options.env.ComSpec, undefined)
   })
 })
 

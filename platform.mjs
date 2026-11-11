@@ -1,6 +1,75 @@
 import { spawn } from "node:child_process"
 import path from "node:path"
 
+// Explicit opt-in: a Windows host launches agy inside this WSL distribution.
+// The setting is never inferred, and a failure never falls back to a native agy.
+export function wslDistro(env = process.env, platform = process.platform) {
+  const distro = env.AGY_BRIDGE_WSL_DISTRO?.trim()
+  return platform === "win32" && distro ? distro : null
+}
+
+// AGY_PATH keeps its single-executable meaning: here a bare command name or an
+// absolute Linux path inside the distro. It is never interpreted as shell text.
+export function wslAgyPath(env = process.env, platform = process.platform) {
+  if (!wslDistro(env, platform)) return null
+  const executable = env.AGY_PATH?.trim() || "agy"
+  if (/[\0\r\n\\]/.test(executable) || /^[a-zA-Z]:/.test(executable) || (executable.includes("/") && !executable.startsWith("/"))) {
+    throw new Error("with AGY_BRIDGE_WSL_DISTRO, AGY_PATH must be a bare command or an absolute Linux path inside the distribution (for example /home/me/.local/bin/agy), not a Windows path")
+  }
+  if (executable.startsWith("/mnt/")) {
+    throw new Error("with AGY_BRIDGE_WSL_DISTRO, AGY_PATH must be installed inside the distribution, not on a /mnt Windows drive")
+  }
+  return executable
+}
+
+// Only the standard /mnt/<drive> automount is supported; there is no wslpath
+// probe, so a customised [automount] root is an explicit limitation.
+export function wslPath(file, distro, platform = process.platform) {
+  if (!distro || platform !== "win32" || typeof file !== "string" || file.startsWith("/")) return file
+  const match = /^([a-zA-Z]):[\\/](.*)$/.exec(file)
+  if (!match) throw new Error(`WSL mode needs a Windows drive path (C:\\...) to map to /mnt/<drive>: ${file}`)
+  return `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`
+}
+
+// nc shim run by agy inside the distro. It starts the *host* Node .exe through
+// WSL interop (absolute /mnt path, so appendWindowsPath is not needed). The
+// module argument stays a Windows path because the .exe is a Windows process;
+// the control port/token arrive through WSLENV, never argv.
+export function wslMcpShim(executable, server, distro) {
+  const quote = value => {
+    if (/[\0\r\n]/.test(value)) throw new Error("invalid WSL MCP shim path")
+    return `'${String(value).replace(/'/g, `'\\''`)}'`
+  }
+  return `#!/bin/sh\nexec ${quote(wslPath(executable, distro, "win32"))} ${quote(server)}\n`
+}
+
+const WSL_FORWARDED = ["AGY_CLI_DISABLE_AUTO_UPDATE", "AGY_BRIDGE_CONTROL_PORT", "AGY_BRIDGE_TOKEN"]
+
+// WSLENV is case-sensitive and unflagged entries are shared in both directions.
+function wslForwardedEnv(env) {
+  const names = (env.WSLENV || "").split(":").filter(Boolean)
+  const known = new Set(names.map(name => name.split("/")[0]))
+  for (const name of WSL_FORWARDED) if (env[name] != null && !known.has(name)) names.push(name)
+  return { ...env, WSLENV: names.join(":") }
+}
+
+// Fixed script + positional arguments: nothing user-controlled is interpolated
+// into shell text. The script only prepends the shim directory to the guest PATH
+// (the distro's own PATH is preserved so a bare `agy` still resolves).
+const WSL_PATH_SCRIPT = 'PATH="$1:$PATH"; shift; exec "$@"'
+
+export function wslSpawnSpec(file, args, distro, env = process.env, guestCwd = null) {
+  const guestBin = env.AGY_BRIDGE_WSL_BIN
+  return {
+    file: env.AGY_BRIDGE_WSL_EXE || "wsl.exe",
+    args: [
+      "-d", distro, ...(guestCwd ? ["--cd", guestCwd] : []), "--exec",
+      ...(guestBin ? ["/bin/sh", "-c", WSL_PATH_SCRIPT, "sh", guestBin, file, ...args] : [file, ...args]),
+    ],
+    options: {},
+  }
+}
+
 export function agyCandidates(env, home, platform = process.platform) {
   const windows = platform === "win32"
   const paths = windows ? path.win32 : path.posix
@@ -54,6 +123,8 @@ function cmdArgument(value, doubleEscape) {
 }
 
 export function agySpawnSpec(file, args, platform = process.platform, env = process.env) {
+  const distro = wslDistro(env, platform)
+  if (distro) return wslSpawnSpec(file, args, distro, env)
   if (platform !== "win32" || !/\.(?:cmd|bat)$/i.test(file)) return { file, args, options: {} }
   if (/[\0\r\n]/.test(file)) throw new Error("a Windows command path contains a line break or NUL")
   const doubleEscape = /node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/i.test(file)
@@ -83,8 +154,13 @@ export function childEnv(overrides, platform = process.platform, inherited = pro
 }
 
 export function spawnAgy(file, args, options = {}) {
-  const env = childEnv(options?.env)
-  const command = agySpawnSpec(file, args, process.platform, env)
+  let env = childEnv(options?.env)
+  const distro = wslDistro(env)
+  // The Windows child keeps its native cwd; only the guest sees the /mnt path.
+  const command = distro
+    ? wslSpawnSpec(file, args, distro, env, options.cwd ? wslPath(options.cwd, distro) : null)
+    : agySpawnSpec(file, args, process.platform, env)
+  if (distro) env = wslForwardedEnv(env)
   return spawn(command.file, command.args, { ...options, ...command.options, windowsHide: true, env })
 }
 

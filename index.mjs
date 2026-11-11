@@ -1,4 +1,4 @@
-import { agyCandidates, spawnAgy, windowsMcpShim } from "./platform.mjs"
+import { agyCandidates, spawnAgy, windowsMcpShim, wslAgyPath, wslDistro, wslMcpShim, wslPath } from "./platform.mjs"
 import { spawn } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -122,6 +122,7 @@ let controlServer
 let controlServerPromise
 let shimDir
 let shimDirPromise
+let shimDistro
 
 function positiveTimeout(value, fallback) {
   const parsed = Number(value)
@@ -146,9 +147,17 @@ function contextWindow(model) {
 // unlock`. Changing that setting takes effect after Magpie restarts, so a live
 // process pool and its sessions never switch context mode mid-conversation.
 let cachedAgyUnlocked = false
+let cachedAgyError = null
 
 function findAgy() {
   if (cachedAgyPath) return cachedAgyPath
+  try {
+    const wslPath = wslAgyPath(process.env)
+    if (wslPath) return cachedAgyPath = wslPath
+  } catch (error) {
+    cachedAgyError = error.message
+    return null
+  }
   const candidates = agyCandidates(process.env, os.homedir())
   for (const candidate of candidates) {
     try {
@@ -244,6 +253,9 @@ async function getAccounts(agy, { refresh = false } = {}) {
   if (accountsCache && !refresh) return accountsCache
   invalidateAccounts()
   const accounts = listAccounts()
+  if (wslDistro() && accounts.length > 1) {
+    throw new Error("named agy profiles are unavailable in WSL mode. Remove AGY_BRIDGE_ACCOUNTS_DIR or use the distro's default account; Windows profiles are never used as WSL credentials.")
+  }
   const usable = [DEFAULT_ACCOUNT]
   await Promise.all(accounts.slice(1).map(async account => {
     if (!agy) return
@@ -580,10 +592,15 @@ function shellQuote(value) {
 // earlier in agy's PATH runs the bridge's stdio MCP server instead, so the
 // connection is authenticated by the per-process token in its environment.
 function ensureShimDir() {
-  if (shimDirPromise) return shimDirPromise
+  const distro = wslDistro()
+  if (shimDirPromise && shimDistro === distro) return shimDirPromise
   shimDirPromise = (async () => {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-bin-"))
-    if (process.platform === "win32") {
+    if (distro) {
+      await fs.promises.writeFile(path.join(dir, "nc"),
+        wslMcpShim(process.execPath, MCP_SERVER_PATH, distro), { mode: 0o700 })
+      await fs.promises.chmod(path.join(dir, "nc"), 0o700)
+    } else if (process.platform === "win32") {
       await fs.promises.writeFile(path.join(dir, "nc.cmd"),
         windowsMcpShim(process.execPath, MCP_SERVER_PATH))
     } else {
@@ -591,9 +608,10 @@ function ensureShimDir() {
         `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(MCP_SERVER_PATH)}\n`, { mode: 0o700 })
     }
     shimDir = dir
+    shimDistro = distro
     return dir
   })()
-  shimDirPromise.catch(() => { shimDirPromise = null })
+  shimDirPromise.catch(() => { shimDirPromise = null; shimDistro = undefined })
   return shimDirPromise
 }
 
@@ -1120,16 +1138,21 @@ class Proc {
     await fs.promises.mkdir(agentDir, { recursive: true })
     await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition(), { mode: 0o600 })
     this.logPath = path.join(this.workspace, "agy-acp.log")
+    const distro = wslDistro()
+    if (this.geminiDir && distro) {
+      throw new Error("named agy profiles are unavailable in WSL mode; Windows-hosted profiles must not select WSL credentials. Use the distro's own default account.")
+    }
+    const agentPath = value => wslPath(value, distro)
 
     const args = [
       "acp",
       "--agent", AGENT_NAME,
-      "--log-file", this.logPath,
+      "--log-file", agentPath(this.logPath),
       "--ide-mcp-port", String(controlServer.address().port),
     ]
     // A named account pins this process to its own Gemini dir (own OAuth token).
     if (this.geminiDir) args.push(`--gemini_dir=${this.geminiDir}`)
-    if (this.workDir) args.push("--add-dir", this.workDir)
+    if (this.workDir) args.push("--add-dir", agentPath(this.workDir))
     try {
       const childEnv = accountEnv({ ...process.env }, this.geminiDir)
       const inheritedPath = process.env.PATH || childEnv.Path || ""
@@ -1143,7 +1166,9 @@ class Proc {
         windowsHide: true,
         env: {
           ...childEnv,
-          PATH: bin + path.delimiter + inheritedPath,
+          ...(!distro ? { PATH: bin + path.delimiter + inheritedPath } : {}),
+          ...(distro ? { AGY_BRIDGE_WSL_BIN: wslPath(bin, distro),
+            WSLENV: [childEnv.WSLENV, "AGY_BRIDGE_CONTROL_PORT", "AGY_BRIDGE_TOKEN"].filter(Boolean).join(":") } : {}),
           AGY_BRIDGE_CONTROL_PORT: String(controlServer.address().port),
           AGY_BRIDGE_TOKEN: this.token,
           AGY_CLI_DISABLE_AUTO_UPDATE: "true",
@@ -1213,7 +1238,7 @@ class Proc {
       try {
         session = await this.conn.request("session/resume", {
           sessionId: this.resumeFrom.sessionId,
-          cwd: this.workspace,
+          cwd: wslPath(this.workspace, wslDistro()),
           mcpServers: [],
         })
         if (!session || typeof session !== "object") throw new Error("empty session/resume result")
@@ -1230,7 +1255,7 @@ class Proc {
     if (this.resumeFrom && !resumable) this.replayReason = "resume_unsupported"
     if (!this.resumed) {
       this.validateReplay?.()
-      session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
+      session = await this.conn.request("session/new", { cwd: wslPath(this.workspace, wslDistro()), mcpServers: [], ...meta })
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
     }
@@ -1487,7 +1512,7 @@ class Proc {
       const stepsEnv = this.geminiDir
         ? { AGY_BRIDGE_CONVERSATIONS_DIR: path.join(this.geminiDir, "antigravity-cli", "conversations") }
         : process.env
-      turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId, stepsEnv) : null
+      turn.stepsFile = stepUsageEnabled && !wslDistro() ? sessionDbPath(this.sessionId, stepsEnv) : null
       turn.stepCursor = modelUsageCursor(turn.stepsFile)
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
@@ -4876,7 +4901,7 @@ export const AntigravityBridgePlugin = async () => {
       models: async () => {
         const agy = findAgy()
         // Refreshing the model catalog also re-discovers named accounts.
-        const accounts = await getAccounts(agy, { refresh: true })
+        const accounts = agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
         const out = {}
         await Promise.all(accounts.map(async account => {
           const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)

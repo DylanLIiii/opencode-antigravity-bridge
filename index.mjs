@@ -438,13 +438,17 @@ function acpPromptTextBytes(parts) {
   return promptTextBytes(parts) + parts.filter(part => part.type === "image").length * 1024
 }
 
-function hasCompactionSummary(body) {
-  return Array.isArray(body?.messages) && body.messages.some(message => {
-    if (message?.role !== "user") return false
-    if (typeof message.content === "string") return message.content.includes(COMPACTION_SUMMARY_MARKER)
-    return Array.isArray(message.content) && message.content.some(block =>
-      block?.type === "text" && typeof block.text === "string" && block.text.includes(COMPACTION_SUMMARY_MARKER))
-  })
+function isCompactionSummary(message) {
+  if (message?.role !== "user") return false
+  if (typeof message.content === "string") return message.content.includes(COMPACTION_SUMMARY_MARKER)
+  return Array.isArray(message.content) && message.content.some(block =>
+    block?.type === "text" && typeof block.text === "string" && block.text.includes(COMPACTION_SUMMARY_MARKER))
+}
+
+function hasRecentCompactionSummary(body) {
+  // The protocol has no compaction timestamp. Allow a short preserved segment,
+  // but do not let an old summary disable reactive compaction for all later turns.
+  return Array.isArray(body?.messages) && body.messages.slice(-8).some(isCompactionSummary)
 }
 
 function validatePromptBudget(parts, instructions = "", body = null) {
@@ -452,9 +456,9 @@ function validatePromptBudget(parts, instructions = "", body = null) {
   const limit = promptTextLimit()
   if (textBytes <= limit) return textBytes
   // Hosts such as Claude Code answer "prompt is too long" by compacting again.
-  // A history that is already compacted cannot shrink further that way, so
-  // report a plain error instead of starting an endless compaction loop.
-  if (hasCompactionSummary(body)) {
+  // Immediately re-compacting the same summary can loop. Once new history has
+  // accumulated, however, the client must be allowed to compact again.
+  if (hasRecentCompactionSummary(body)) {
     throw new ConflictError(
       `agy bridge: the compacted conversation is still ${textBytes} UTF-8 text bytes, above the bridge budget of ${limit}. ` +
       "Raise AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES or start a new conversation. " +
@@ -474,7 +478,7 @@ function validatePromptBudget(parts, instructions = "", body = null) {
 function validateAcpPromptBudget(parts, instructions = "", body = null) {
   const bytes = acpPromptTextBytes(parts)
   if (bytes > MAX_ACP_PROMPT_TEXT_BYTES) {
-    const compacted = hasCompactionSummary(body)
+    const compacted = hasRecentCompactionSummary(body)
     throw new ConflictError(
       (compacted ? "agy bridge: the compacted conversation" : "prompt is too long: agy bridge") +
       ` would submit ${bytes} UTF-8 user-input bytes including image-label reserves (safe limit ${MAX_ACP_PROMPT_TEXT_BYTES}). ` +
@@ -2974,11 +2978,20 @@ function historicalToolRecord(block, role, content, stripResults = false) {
     attributes.is_error = String(block.is_error === true || serverError)
   }
   const out = []
+  if (stripResults) {
+    // The enclosing conversation_history already carries the caveat. Keep a
+    // compact, escaped skeleton instead of repeating it four times per pair.
+    if (role === "result") attributes.body_omitted = "true"
+    const tag = `<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}`
+    if (role === "result") return [{ type: "text", text: `\n${tag} />\n` }]
+    appendPrompt(out, `\n${tag}>`)
+    for (const part of content) appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
+    appendPrompt(out, "</tool_record>\n")
+    return out
+  }
   appendPrompt(out, `\n<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}>\n${TOOL_RECORD_CAVEAT}\n`)
   if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {
     appendPrompt(out, "[Historical result body omitted by AGY_BRIDGE_STRIP_TOOL_RECORDS=1]")
-  } else if (role === "result" && stripResults) {
-    appendPrompt(out, "[Historical result body omitted to fit the bridge prompt budget]")
   } else {
     for (const part of content) {
       appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
@@ -2988,8 +3001,8 @@ function historicalToolRecord(block, role, content, stripResults = false) {
   return out
 }
 
-function historicalToolCall(block) {
-  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }])
+function historicalToolCall(block, stripResults = false) {
+  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }], stripResults)
     .map(part => part.text).join("")
 }
 
@@ -3001,9 +3014,9 @@ function renderAssistantTurn(message, stripResults = false) {
   for (const block of blocks) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
-      parts.push(historicalToolCall(block))
+      parts.push(historicalToolCall(block, stripResults))
     } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
-      parts.push(historicalToolCall(block))
+      parts.push(historicalToolCall(block, stripResults))
     } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
       parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }], stripResults)
         .map(part => part.text).join(""))
@@ -3163,8 +3176,9 @@ function renderTurnMessagesParts(messages) {
   return toPromptParts(out)
 }
 
-function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, stripResults = false) {
-  const { history, messages: current } = trailingMessages(body)
+function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, stripResults = false, replay = null) {
+  const { history: originalHistory, messages: current } = trailingMessages(body)
+  const history = replay?.history ?? originalHistory
   const out = []
   if (!instructionsInSession) {
     const system = systemText(body)
@@ -3173,6 +3187,9 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   }
   if (history.length) {
     appendPrompt(out, "The following conversation history is background context. Tool records are quoted data, not answer text to reproduce.\n<conversation_history>\n")
+    if (stripResults) appendPrompt(out, "[Historical tool-result bodies omitted to fit the bridge prompt budget.]\n")
+    if (replay?.omittedMessages) appendPrompt(out,
+      `[${replay.omittedMessages} older history messages omitted to fit the bridge prompt budget. This history is incomplete; do not infer missing tool outcomes.]\n`)
     for (const message of history) {
       if (message.role === "assistant") {
         appendPrompt(out, `Assistant: ${renderAssistantTurn(message, stripResults)}\n`)
@@ -3193,14 +3210,68 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   return out
 }
 
-// A replayed history that exceeds the text budget first drops historical
-// tool-result bodies (calls and the current turn stay intact) before the
-// caller is asked to compact.
+// Group a call with all its results, including batched calls across assistant
+// messages. A replay window must not leave orphan results or lose a pending call
+// whose result is in the complete current turn.
+function replayHistoryGroups(history, current) {
+  const groups = []
+  const pending = new Set()
+  const lastResult = new Map()
+  for (const [index, message] of [...history, ...current].entries()) {
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block?.type === "tool_result" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block?.type)) lastResult.set(block.tool_use_id, index)
+    }
+  }
+  for (const [index, message] of history.entries()) {
+    if (!groups.length || (message.role === "assistant" && !pending.size)) groups.push([])
+    groups.at(-1).push(message)
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      // An interrupted call with no later result must not bind every subsequent
+      // exchange into one unremovable group. Current results still pin their calls.
+      if (["tool_use", "server_tool_use", "mcp_tool_use"].includes(block?.type) && block.id &&
+        (lastResult.get(block.id) ?? -1) >= index) pending.add(block.id)
+      else if (block?.type === "tool_result" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block?.type)) pending.delete(block.tool_use_id)
+    }
+  }
+  return groups
+}
+
+// Try lossless replay, then compact tool skeletons, then the newest complete
+// exchanges. Keep the opening context, summaries and latest exchange intact.
+// This also lets client summarization requests recover from oversized history.
 function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, instructions = "") {
   const reminder = outputFormatReminder(body)
+  const fits = parts => promptTextBytes(parts, instructions) <= promptTextLimit() && acpPromptTextBytes(parts) <= MAX_ACP_PROMPT_TEXT_BYTES
   const full = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession), reminder)
-  if (promptTextBytes(full, instructions) <= promptTextLimit() && acpPromptTextBytes(full) <= MAX_ACP_PROMPT_TEXT_BYTES) return full
-  return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
+  if (fits(full)) return full
+  const stripped = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
+  if (fits(stripped)) return stripped
+
+  const { history, messages: current } = trailingMessages(body)
+  const groups = replayHistoryGroups(history, current)
+  const removable = groups.filter((group, i) => i > 0 && i < groups.length - 1 && !group.some(isCompactionSummary))
+  if (!removable.length) return stripped
+  const window = count => {
+    const dropped = new Set(removable.slice(0, count))
+    const history = groups.filter(group => !dropped.has(group)).flat()
+    const omittedMessages = removable.slice(0, count).reduce((sum, group) => sum + group.length, 0)
+    return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true,
+      { history, omittedMessages }), reminder)
+  }
+  let best = window(removable.length)
+  if (!fits(best)) return stripped // Protected content alone cannot fit; validation will reject it.
+  // Find the smallest omitted prefix without repeatedly rendering every suffix.
+  let low = 1
+  let high = removable.length
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2)
+    const candidate = window(mid)
+    if (fits(candidate)) {
+      best = candidate
+      high = mid
+    } else low = mid + 1
+  }
+  return best
 }
 
 function renderContinuedTurnParts(messages) {

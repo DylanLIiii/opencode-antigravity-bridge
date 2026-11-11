@@ -32,8 +32,10 @@ Google Code Assist backend
 
 ## Requirements
 
-- Antigravity CLI (`agy`) with the `acp` subcommand, signed in interactively at
-  least once. Text/tool transport was verified with **1.4.12** and **1.5.0**;
+- Antigravity CLI (`agy`) with the `acp` subcommand. Add a separate Google login
+  in Magpie or reuse an existing CLI login. UI sign-in requires `agy acp --login`
+  (authorization-link and input behavior checked with **1.5.4**).
+  Text/tool transport was verified with **1.4.12** and **1.5.0**;
   user image input requires an image-capable ACP server (verified with **1.5.0**).
 - magpie with OpenCode-style provider plugin support.
 - No global MCP configuration is required, and none is used: the plugin creates
@@ -49,16 +51,43 @@ magpie plugin add ./opencode-antigravity-bridge
 
 ## Use
 
-1. Run `agy` interactively once and sign in to your Google account.
-2. In magpie, choose Providers → Antigravity Bridge → Sign in. This verifies
-   the CLI with `agy models`; agy owns the actual Google credentials.
-3. Pick a model and, when offered, a thinking level. Effort-specific IDs from
+1. In Magpie, choose Providers → Antigravity Bridge → Sign in →
+   **Sign in a new agy account with Google**, and name the account, e.g. `work`.
+2. Follow the browser link, sign in with Google, then paste the full address of
+   the final callback page (recommended), or its authorization code, into Magpie.
+3. Pick `work/<model>` and, when offered, a thinking level. Effort-specific IDs from
    `agy models` are grouped into one model with variants, then mapped back to
    the corresponding agy ID for each request.
 
-**Multiple accounts**: put each extra account in
+To reuse agy's existing default sign-in, choose **Sign in with the agy CLI**.
+That method verifies `agy models`; it does not start a new Google login.
+
+**Browser sign-in.** The new method starts the official `agy acp --login` in a
+hidden staging profile. The CLI sends the browser to
+`https://antigravity.google/oauth-callback`, so the current flow needs a paste;
+it does not finish automatically through localhost. Remote Magpie uses the same
+flow. A full callback URL must match the original redirect origin, path and state.
+The bridge sends its code to the waiting CLI over stdin. agy owns PKCE, token
+exchange, credential format and subsequent refresh.
+
+The account is published through the import backend only after the CLI exits
+successfully, writes a file credential containing a refresh token, and an isolated
+`agy models` check succeeds. Its model caches are invalidated. Credentials stay in
+the bridge's named-account directory; Magpie's auth store receives only the `agy`
+sentinel. The login forces file storage, and existing accounts are never overwritten.
+On POSIX, directories are `0700` and published tokens `0600`; see the Windows
+permission requirements below.
+
+Sign-ins expire after 10 minutes. Starting another sign-in cleans the previous
+one up. Cancellation during the start or completion step also cleans up. Closing
+the UI while it waits for a paste leaves no RPC signal for the plugin to observe;
+the hidden profile and child process are removed on expiry or the next sign-in.
+After a failed attempt, start again and use a fresh callback or code.
+
+**Multiple accounts**: UI sign-in prepares each account in
 `~/.config/magpie-agy-bridge/accounts/<name>/` (override the root with
-`AGY_BRIDGE_ACCOUNTS_DIR`) as a full Gemini directory, and sign in once inside it:
+`AGY_BRIDGE_ACCOUNTS_DIR`). Alternatively, prepare a full Gemini directory and
+sign in once inside it:
 
 ```sh
 agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
@@ -485,6 +514,10 @@ and Magpie's [usage hook](https://github.com/yetone/magpie/blob/5b4dec58e47d1eb9
 and [official Antigravity quota pools](https://github.com/yetone/magpie/blob/5b4dec58e47d1eb961f5a3f4417c441f77662c7d/internal/provider/google.go).
 The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 
+## Windows host with agy installed only in WSL2
+
+Set `AGY_BRIDGE_WSL_DISTRO=<distro>` before starting Magpie on Windows. `AGY_PATH` is then one Linux executable inside that distro (absolute path such as `/home/me/.local/bin/agy`, or bare `agy`); optional `AGY_BRIDGE_WSL_EXE` overrides `wsl.exe`. The bridge never scans distros or falls back to a native agy, and the setting is fixed until Magpie restarts. Requirements: WSL interop, the standard `/mnt/<drive>` automount, and agy signed in as the default account of the same distro. Native Windows/macOS/Linux installs are unaffected. Unavailable in WSL mode: named profiles, profile import, browser OAuth account sign-in, quota queries, context unlock and per-step conversation DB usage (estimates are used); UNC paths and custom automount roots are rejected. Tested only with simulated launch/ACP/MCP fixtures, not on a real Windows/WSL host.
+
 ## Limitations
 
 - **User images and binary documents**: user prompt images require an `agy`
@@ -670,7 +703,9 @@ community observations and depend on the current account and CLI.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `AGY_PATH` | PATH lookup | agy executable |
+| `AGY_PATH` | PATH lookup | agy executable; in WSL mode, one Linux executable inside the distro |
+| `AGY_BRIDGE_WSL_DISTRO` | unset | Windows opt-in WSL distro name; no scan or native fallback |
+| `AGY_BRIDGE_WSL_EXE` | `wsl.exe` | optional WSL launcher executable |
 | `AGY_BRIDGE_THINKING` | on | `0` stops forwarding thought summaries |
 | `AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS` | off | `1` forwards agy's internal title-summarizer thought chunks, which are otherwise suppressed by their prompt echo; diagnostic only, they can dominate the transcript |
 | `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |

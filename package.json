@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.4.2",
+  "version": "0.5.1",
   "description": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage. Multiple Google accounts supported via per-account agy profiles (`<account>/<model>` in the picker).",
   "type": "module",
   "main": "./index.mjs",
@@ -11,6 +11,7 @@
     "index.mjs",
     "accounts.mjs",
     "accounts-import.mjs",
+    "accounts-login.mjs",
     "context-unlock.mjs",
     "bin/agy-bridge.mjs",
     "vendor/agy-context-unlock/agy-patch.py",
@@ -30,7 +31,7 @@
     "README.en.md"
   ],
   "scripts": {
-    "test": "node --test test-step-usage.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-wsl.mjs test-prompt-guard.mjs test-tool-schema.mjs test-upstream-error.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-context-unlock.mjs && node test-smoke.mjs",
+    "test": "node --test test-step-usage.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-upstream-error.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [

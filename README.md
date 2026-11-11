@@ -61,19 +61,22 @@ Prompt caching 由 Google 后端决定，本插件让请求前缀尽量稳定：
 前置要求：
 
 - 已安装 [magpie](https://github.com/yetone/magpie)，支持 OpenCode 风格插件
-- 已安装 [Antigravity CLI](https://antigravity.google)（`agy`）并至少交互式
-  登录过一次 Google 账号（实测版本 1.4.12 / 1.5.0）
+- 已安装 [Antigravity CLI](https://antigravity.google)（`agy`）；可在 Magpie 中添加
+  独立 Google 登录，也可复用已有 CLI 登录。UI 登录要求 `agy acp --login`
+  （已核对 1.5.4 的授权链接与输入流程）
 
 ```sh
 # 1. 安装插件（本地 checkout，尚未发布 npm）
 magpie plugin add ./opencode-antigravity-bridge
 
-# 2. 交互式运行一次 agy 完成 Google 登录
-agy
-
-# 3. 在 Magpie 中：Providers → Antigravity Bridge → Sign in
-# 4. 选一个模型（可选思考等级），开始对话
+# 2. 在 Magpie 中：Providers → Antigravity Bridge → Sign in
+#    选择「Sign in a new agy account with Google / 登录新的 agy 账号」
+# 3. 填写名称（例如 work），在浏览器完成 Google 登录，
+#    把最终回调页面的完整 URL 或授权码粘贴回 Magpie
+# 4. 选择 work/<模型>（可选思考等级），开始对话
 ```
+
+已有默认 CLI 登录时，仍可选择「Sign in with the agy CLI」直接验证并使用。
 
 客户端侧零配置：不需要改全局 MCP 配置，插件为每个 agy 进程创建隔离的临时
 agent。ACP `clientInfo` 固定使用 `zed / 0.0.0`，兼容 agy 的非 Gemini 模型 allowlist。
@@ -101,9 +104,27 @@ Google Code Assist 后端
 **切换模型 / 思考等级**：在 magpie 的模型选择器中切换即可，会话不中断，
 历史保留。
 
-**多账号**：在 `~/.config/magpie-agy-bridge/accounts/<名称>/` 下为每个额外账号
-准备一个完整的 Gemini 配置目录（可用 `AGY_BRIDGE_ACCOUNTS_DIR` 覆盖根目录），
-并在该目录里交互式登录一次：
+**在 Magpie 中登录新账号**：在 Bridge 的登录列表选择「Sign in a new agy account
+with Google / 登录新的 agy 账号」，输入唯一名称。Magpie 打开 Google 授权链接；
+完成后把浏览器最终停留的 `https://antigravity.google/oauth-callback?...` 完整地址
+粘贴回 Magpie（推荐，也可只粘贴页面显示的授权码）。当前官方 CLI 使用这个网页回调，
+需要手动粘贴，没有本机自动回调。远程 Magpie 也使用相同流程。
+
+插件在隐藏临时目录里运行官方 `agy acp --login`，完整回调 URL 会先校验来源、路径
+及本次登录的 state，授权码再通过 stdin 交给原 agy 进程。PKCE、换取 token 和之后
+的刷新均由 agy 处理。只有 agy 成功退出、保存了含 refresh token 的文件、且独立
+`agy models` 检查通过，才通过导入后端发布账号并清除模型缓存。选择 `<名称>/<模型>`
+即可使用该账号独立的 ACP 进程池。
+
+凭据仅保存在 Bridge 的账号目录，Magpie 账户存储里仍是 `agy` 标记；不会切换全局
+登录态或覆写已有同名账号。登录进程强制使用文件存储，POSIX 上目录为 `0700`、
+发布的 token 为 `0600`；Windows 的文件权限要求见下方。一次登录最多等待 10 分钟；
+新的登录会清理上次未完成的流程。取消开始或完成步骤会立即清理；关闭等待粘贴的
+界面后，插件会在到期或下次登录时清理隐藏目录和进程。失败后请重新开始，使用新回调。
+
+**多账号**：新 UI 登录会自动创建
+`~/.config/magpie-agy-bridge/accounts/<名称>/`（可用 `AGY_BRIDGE_ACCOUNTS_DIR`
+覆盖根目录）。也可手动准备一个完整的 Gemini 配置目录，并在该目录里登录一次：
 
 ```sh
 agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
@@ -264,6 +285,10 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
 [上下文调研](https://linux.do/t/topic/3117832) ·
 [ACP 接入方案](https://linux.do/t/topic/3133812) ·
 [参考实现](https://github.com/lili-luo/dsh-plugin-bundle/blob/457b9395e9bd8a1aefae2b83cda7e5e9e08af783/dsh-llm-antigravity-acp/src/usage-db.ts)
+
+## Windows 宿主 + 仅安装在 WSL2 的 agy
+
+在 Windows 上启动 Magpie 前设置 `AGY_BRIDGE_WSL_DISTRO=<发行版>`。此时 `AGY_PATH` 是该发行版内的单个 Linux 可执行文件（绝对路径如 `/home/me/.local/bin/agy`，或裸 `agy`）；可选 `AGY_BRIDGE_WSL_EXE` 覆盖 `wsl.exe`。桥不会扫描发行版，也不会回退到原生 agy；配置在重启 Magpie 前固定。要求：WSL interop、标准 `/mnt/<盘符>` 自动挂载、同一发行版的默认账号已登录 agy。原生 Windows/macOS/Linux 不受影响。WSL 模式明确不支持：命名 profile、profile 导入、浏览器 OAuth 账号登录、额度查询、上下文解锁与逐步会话数据库用量（改用估算）；UNC 路径和自定义挂载根会被拒绝。仅用模拟启动/ACP/MCP 夹具测试，未在真实 Windows/WSL 主机验证。
 
 ## FAQ / 注意事项
 

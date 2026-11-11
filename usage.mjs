@@ -281,6 +281,13 @@ export async function fetchUsage(agy, {
     const launchEnv = childEnv(env, platform, {})
     const pathKey = Object.keys(launchEnv).find(key => windows ? /^path$/i.test(key) : key === "PATH") || "PATH"
     launchEnv[pathKey] = workDir + (windows ? ";" : ":") + (launchEnv[pathKey] || (windows ? "" : "/usr/bin:/bin"))
+    if (windows) {
+      // Go's exec.LookPath uses PATHEXT for bare rundll32. Keep our blocker
+      // discoverable even when the host customized its executable extensions.
+      const key = Object.keys(launchEnv).find(key => /^pathext$/i.test(key)) || "PATHEXT"
+      const extensions = launchEnv[key] || ".COM;.EXE;.BAT;.CMD"
+      launchEnv[key] = extensions.split(";").some(value => value.toUpperCase() === ".CMD") ? extensions : extensions + ";.CMD"
+    }
     // Merge again to replace a differently-cased Windows BROWSER as well.
     const options = {
       cwd: workDir, env: childEnv({ BROWSER: path.join(workDir, windows ? "open.cmd" : "open") }, platform, launchEnv),

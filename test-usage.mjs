@@ -177,12 +177,14 @@ if (process.platform === "win32") {
   })
   const resolved = lookup.stdout?.trim().split(/\r?\n/)[0]
   const expected = path.join(process.cwd(), "rundll32.cmd")
-  if (lookup.status !== 0 || resolved?.toLowerCase() !== expected.toLowerCase()) {
-    throw new Error("Windows authentication browser command escaped the private workspace")
+  windowsBrowser = { resolved, lookupStatus: lookup.status, lookupError: lookup.error?.code ?? null, lookupStderr: lookup.stderr }
+  // Never execute the system launcher if lookup bypassed the blocker. Record
+  // the lookup so the test reports a useful failure instead of opening a URL.
+  if (lookup.status === 0 && resolved?.toLowerCase() === expected.toLowerCase()) {
+    const command = agySpawnSpec(resolved, ["url.dll,FileProtocolHandler", "https://example.invalid/"], process.platform, process.env)
+    const result = spawnSync(command.file, command.args, { ...command.options, windowsHide: true, encoding: "utf8", timeout: 5000 })
+    Object.assign(windowsBrowser, { status: result.status, error: result.error?.code ?? null, stderr: result.stderr })
   }
-  const command = agySpawnSpec(resolved, ["url.dll,FileProtocolHandler", "https://example.invalid/"], process.platform, process.env)
-  const result = spawnSync(command.file, command.args, { ...command.options, windowsHide: true, encoding: "utf8", timeout: 5000 })
-  windowsBrowser = { resolved, status: result.status, error: result.error?.code ?? null, stderr: result.stderr }
 }
 const record = {
   args, cwd: process.cwd(), pid: process.pid,
@@ -234,7 +236,7 @@ else if (version) {
 }
 
 test("queries only the structured command in a private, restricted workspace and cleans up", async t => {
-  const f = await fixture(t, { AGY_CLI_DISABLE_AUTO_UPDATE: "false" })
+  const f = await fixture(t, { AGY_CLI_DISABLE_AUTO_UPDATE: "false", ...(process.platform === "win32" ? { PATHEXT: ".EXE;.BAT" } : {}) })
   const originalSpawn = childProcess.spawn
   const spawns = []
   let result
@@ -283,6 +285,7 @@ test("queries only the structured command in a private, restricted workspace and
     assert.equal(log.guardError, null)
     assert.equal(log.guardStderr, "")
     if (process.platform === "win32") {
+      assert.equal(log.windowsBrowser.lookupStatus, 0, JSON.stringify(log.windowsBrowser))
       assert.equal(path.basename(log.windowsBrowser.resolved), "rundll32.cmd")
       assert.equal(log.windowsBrowser.status, 1)
       assert.equal(log.windowsBrowser.error, null)
@@ -527,7 +530,7 @@ async function windowsFixture(t, { mode = "success", taskkill = "success", clean
     return child
   }
   const env = Object.freeze({
-    Path: "C:\\Program Files\\Tools;D:\\bin", ComSpec: "D:\\Windows\\System32\\cmd.exe", SystemRoot: "D:\\Windows",
+    Path: "C:\\Program Files\\Tools;D:\\bin", ComSpec: "D:\\Windows\\System32\\cmd.exe", SystemRoot: "D:\\Windows", PathExt: ".EXE;.BAT",
     browser: "old-browser", agy_cli_disable_auto_update: "false", CALLER_ONLY: "kept",
   })
   const home = path.join(directory, "home")
@@ -582,6 +585,8 @@ for (const extension of ["exe", "cmd", "bat"]) {
       assert.equal(options.windowsVerbatimArguments, expected.options.windowsVerbatimArguments)
       assert.deepEqual(Object.keys(options.env).filter(key => /^path$/i.test(key)), ["Path"])
       assert.equal(options.env.Path, options.cwd + ";" + f.env.Path)
+      assert.equal(options.env.PathExt, ".EXE;.BAT;.CMD")
+      assert.equal(options.env.PATHEXT, undefined)
       assert.equal(options.env.BROWSER, path.join(options.cwd, "open.cmd"))
       assert.equal(options.env.browser, undefined)
       assert.equal(options.env.AGY_CLI_DISABLE_AUTO_UPDATE, "true")
@@ -595,6 +600,7 @@ for (const extension of ["exe", "cmd", "bat"]) {
     }
     assert.deepEqual(blockers, ["@echo off\r\nexit /b 1\r\n", "@echo off\r\nexit /b 1\r\n"])
     assert.equal(f.env.browser, "old-browser")
+    assert.equal(f.env.PathExt, ".EXE;.BAT")
     assert.equal(f.env.agy_cli_disable_auto_update, "false")
     await f.assertClean()
   })

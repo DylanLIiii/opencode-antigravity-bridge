@@ -31,6 +31,7 @@ test("simulated WSL sign-in, models and ACP/MCP client tool roundtrip", { skip: 
     bridge = await import(pathToFileURL(path.join(root, "index.mjs")).href)
     const plugin = await bridge.AntigravityBridgePlugin()
     assert.equal(plugin.auth.methods.length, 1)
+    assert.equal(plugin.auth.single, true)
     assert.deepEqual(await plugin.auth.methods[0].authorize(), { type: "success", key: "agy" })
     assert.ok(Object.keys(await plugin.provider.models()).some(key => key.includes("gemini-test")))
     assert.equal((await bridge.getAccounts(process.env.AGY_PATH)).length, 1)

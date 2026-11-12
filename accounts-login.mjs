@@ -7,6 +7,7 @@ import { spawn, spawnSync } from "node:child_process"
 import { accountsRootDir } from "./accounts.mjs"
 import { importAccount, ImportError, TOKEN_RELATIVE, validateAccountName } from "./accounts-import.mjs"
 import { agySpawnSpec, childEnv } from "./platform.mjs"
+import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
 
 const MAX_OUTPUT_BYTES = 128 * 1024
 const MAX_INPUT_BYTES = 16 * 1024
@@ -201,9 +202,9 @@ export function createAccountLoginMethod(findAgy, {
   let generation = 0
   return {
     type: "oauth",
-    label: "Sign in a new agy account with Google / 登录新的 agy 账号",
+    ...ACCOUNT_ACTIONS.google,
     prompts: [{
-      type: "text", key: "name", message: "Account name (shown as <name>/<model>) / 账号名称", placeholder: "work",
+      ...ACCOUNT_NAME_PROMPT,
       validate: value => { try { validateAccountName(String(value ?? "").trim()); return undefined } catch (error) { return error.message } },
     }],
     authorize: async (inputs, { signal } = {}) => {

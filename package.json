@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage. Multiple Google accounts supported via per-account agy profiles (`<account>/<model>` in the picker).",
   "type": "module",
   "main": "./index.mjs",
@@ -12,6 +12,7 @@
     "accounts.mjs",
     "accounts-import.mjs",
     "accounts-login.mjs",
+    "account-ui.mjs",
     "context-unlock.mjs",
     "bin/agy-bridge.mjs",
     "vendor/agy-context-unlock/agy-patch.py",
@@ -52,8 +53,8 @@
   "magpie": {
     "name": "Antigravity Bridge",
     "summary": {
-      "en": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage. Multiple Google accounts via per-account agy profiles: pick `<account>/<model>` in the model picker.",
-      "zh": "通过官方 agy CLI 接入 Antigravity，旨在降低模拟客户端带来的封号风险；精简提示词、复用会话，减少重复上下文与 Token 消耗。支持多账号：每个账号独立 agy 配置目录，在模型选择器里选 `<账号>/<模型>` 即可切换。"
+      "en": "Connect through the official agy CLI with lean prompts and session reuse. Native account management: add a Google account, import one account or import a manifest. For an existing Bridge connection, choose Sign in again to open these actions; existing accounts are kept. Pick `<account>/<model>` to use a named account.",
+      "zh": "通过官方 agy CLI 接入，精简提示词并复用会话。原生模式下，账号管理支持新增 Google 账号、导入账号和批量导入。已有 Bridge 连接时，点击「重新登录」打开操作选项；已有账号会保留。在模型选择器里选 `<账号>/<模型>` 即可使用对应账号。"
     },
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
     "maxConcurrency": 16

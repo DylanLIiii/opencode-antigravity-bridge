@@ -4533,9 +4533,9 @@ for (const compacted of [true, false]) {
   check("default agy login stays first and single:true sentinel identity is kept",
     importPlugin.auth.single === true && methods[0].keyless === true && /agy CLI/.test(methods[0].label) && methods[0].prompts === undefined)
   const forms = methods.filter(m => m.type === "api" && m.prompts)
-  check("import forms are native keyless api methods with bilingual labels and text prompts",
+  check("import forms are native keyless api methods with localized labels and text prompts",
     forms.length === 2 && forms.every(m => m.type === "api" && m.keyless === true && typeof m.authorize === "function" &&
-      /[\u4e00-\u9fff]/.test(m.label) && /[A-Za-z]/.test(m.label) && m.prompts.every(p => p.type === "text" && p.key && p.message)))
+      /[\u4e00-\u9fff]/.test(m.labels?.zh) && /[A-Za-z]/.test(m.label) && m.prompts.every(p => p.type === "text" && p.key && p.message)))
   const [single, batch] = forms
   const browserLogin = methods.find(m => m.type === "oauth")
   check("browser login is a native oauth method asking only for the isolated account name",

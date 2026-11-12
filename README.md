@@ -72,14 +72,30 @@ Prompt caching 由 Google 后端决定，本插件让请求前缀尽量稳定：
 # 1. 安装插件（本地 checkout，尚未发布 npm）
 magpie plugin add ./opencode-antigravity-bridge
 
-# 2. 在 Magpie 中：Providers → Antigravity Bridge → Sign in
-#    选择「Sign in a new agy account with Google / 登录新的 agy 账号」
+# 2. 在 Magpie 中：Providers → Antigravity Bridge → 登录
+#    已接入时点击「重新登录」，再选择「新增 Google 账号」
 # 3. 填写名称（例如 work），在浏览器完成 Google 登录，
 #    把最终回调页面的完整 URL 或授权码粘贴回 Magpie
 # 4. 选择 work/<模型>（可选思考等级），开始对话
 ```
 
-已有默认 CLI 登录时，仍可选择「Sign in with the agy CLI」直接验证并使用。
+### 账号管理入口
+
+原生模式下，在 **Providers → Antigravity Bridge** 中，首次接入点「登录」，已有连接点
+「重新登录」。这两个入口都会先显示操作选项，打开它们不会立即开始 Google
+登录，也不会替换已有账号。选项名称随 Magpie 的界面语言显示：
+
+| 操作 | 用途 |
+| --- | --- |
+| 使用已有 CLI 登录 | 验证当前 agy CLI 的登录，不启动新的 Google 登录 |
+| 导入账号 | 将已有配置目录或 token 文件导入为一个新名称的账号 |
+| 批量导入账号 | 从 JSON 清单一次导入多个账号 |
+| 新增 Google 账号 | 在浏览器登录 Google，保存为一个新名称的账号 |
+
+新增和导入都会保留已有账号；名称已被使用时会拒绝操作，请换一个名称。
+Magpie 的单账号提示指 Bridge 连接，插件中的 Google 账号按名称独立保存。
+外层「重新登录」按钮及宿主的提示由 Magpie 生成，插件不修改它们。
+WSL 模式仅支持使用发行版内已有的 CLI 登录，不提供命名账号的新增或导入选项。
 
 客户端侧零配置：不需要改全局 MCP 配置，插件为每个 agy 进程创建隔离的临时
 agent。ACP `clientInfo` 使用本包名称与版本；模型列表按账号探测实际可用型号。
@@ -107,8 +123,8 @@ Google Code Assist 后端
 **切换模型 / 思考等级**：在 magpie 的模型选择器中切换即可，会话不中断，
 历史保留。
 
-**在 Magpie 中登录新账号**：在 Bridge 的登录列表选择「Sign in a new agy account
-with Google / 登录新的 agy 账号」，输入唯一名称。Magpie 打开 Google 授权链接；
+**在 Magpie 中登录新账号**：通过上面的账号管理入口选择「新增 Google 账号」，
+输入一个未占用的名称。Magpie 打开 Google 授权链接；
 完成后把浏览器最终停留的 `https://antigravity.google/oauth-callback?...` 完整地址
 粘贴回 Magpie（推荐，也可只粘贴页面显示的授权码）。当前官方 CLI 使用这个网页回调，
 需要手动粘贴，没有本机自动回调。远程 Magpie 也使用相同流程。
@@ -139,8 +155,8 @@ agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
 （agy 自己的全局登录态，模型不带前缀）始终保留。要求 agy 支持 `--gemini_dir`
  且账号使用文件 token 登录态——钥匙串/ADC 登录态是整机全局的，无法按目录隔离。
 
-**导入账号**：除了在配置目录里登录，也可以导入已有的 agy 登录——在 Magpie 登录列表选
-"Import an agy account / 导入 agy 账号"（或批量导入），或用随包 CLI。路径是运行
+**导入账号**：除了在配置目录里登录，也可以导入已有的 agy 登录——在账号管理操作中选
+「导入账号」或「批量导入账号」，也可用随包 CLI。路径是运行
 Magpie 那台机器上的路径，两者调用同一个后端：
 
 ```sh

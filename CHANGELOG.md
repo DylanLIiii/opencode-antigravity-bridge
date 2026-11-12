@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2
+
+- Declare native named-account support so Magpie offers an add-account entry and stops warning that another Google login replaces existing accounts. Keep the single-account declaration in WSL mode.
+- Keep one Bridge connection through the shared `agy` sentinel; verify CLI validation, account/manifest imports and OAuth completion against Magpie's real host with synthetic credentials.
+- Keep English and Chinese plugin summaries within Magpie's 300 UTF-8 byte limit and document the account-name step before the browser opens.
+
 ## 0.6.1
 
 - Clarify the Bridge's native account actions with short localized labels for existing CLI access, single-account import, manifest import and adding a Google account.

@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage. Multiple Google accounts supported via per-account agy profiles (`<account>/<model>` in the picker).",
   "type": "module",
   "main": "./index.mjs",
@@ -53,8 +53,8 @@
   "magpie": {
     "name": "Antigravity Bridge",
     "summary": {
-      "en": "Official agy CLI bridge with lean prompts and session reuse. Native account actions: add a Google account or import accounts. For an existing connection, Sign in again opens these actions; existing accounts are kept. Pick `<account>/<model>`.",
-      "zh": "通过官方 agy CLI 接入，精简提示词并复用会话。原生模式支持新增 Google 账号、导入和批量导入。已有连接点「重新登录」打开账号操作，已有账号会保留；选择 `<账号>/<模型>` 使用对应账号。"
+      "en": "Official agy CLI bridge with lean prompts and session reuse. Native account actions: add a Google account or import accounts. For an existing connection, Add another account opens these actions; existing accounts are kept. Pick `<account>/<model>`.",
+      "zh": "通过官方 agy CLI 接入，精简提示词并复用会话。原生模式支持新增 Google 账号、导入和批量导入。已有连接点「添加另一个账号」打开操作，已有账号会保留；选择 `<账号>/<模型>` 使用对应账号。"
     },
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
     "maxConcurrency": 16

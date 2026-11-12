@@ -434,6 +434,10 @@ async function prompt(params, recorded = false) {
     chunk("Answer after summaries only.")
     return finish("Answer after summaries only.")
   }
+  if (text.includes("RATIO_ZERO")) {
+    chunk("ratio zero acknowledged")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 0, outputTokens: 500, totalTokens: 10500 } }
+  }
   if (text.includes("RATIO_INITIAL")) {
     chunk("ratio acknowledged")
     return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, cachedWriteTokens: 900, outputTokens: 500, totalTokens: 11500 } }
@@ -1332,6 +1336,18 @@ for (const [name, system, headers, expectedDir, named] of [
   const window = (usage?.input_tokens || 0) + (usage?.cache_read_input_tokens || 0)
   check("real prompt cache ratio survives final response with cache writes", stopOf(toolEvents) === "tool_use" && window > 1000 && usage.cache_read_input_tokens === Math.round(window * 100 / 10100), JSON.stringify(usage))
   await readSSE(await callFetch(continuation(second, toolEvents, "ratio result")))
+  delete process.env.AGY_BRIDGE_STEP_USAGE
+}
+
+{
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  const first = { model, metadata: { user_id: "ratio-zero-regression" }, messages: [{ role: "user", content: "RATIO_ZERO" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const second = nextTurn(first, firstEvents, "MULTISTEP zero ratio " + "y".repeat(10000))
+  const events = (await readSSE(await callFetch(second))).events
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("recorded zero cache ratio stays zero during later tool step", stopOf(events) === "tool_use" && usage?.cache_read_input_tokens === 0 && usage?.input_tokens > 0, JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(second, events, "zero ratio result")))
   delete process.env.AGY_BRIDGE_STEP_USAGE
 }
 

@@ -255,6 +255,14 @@ async function listAgyModels(agyPath, extraArgs = []) {
 }
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
+// The name agy lists its non-Gemini models to. It is zed's, not this bridge's:
+// agy answers Claude and GPT-OSS to that name alone (HANDOFF.md).
+const ACP_PROBE_CLIENT = "zed"
+// How long the offered-model probe may take before the catalog is listed
+// without it. A probe starts agy and completes an ACP handshake; 500ms was
+// under the start-up alone, so every probe timed out and every model the
+// catalog lists beyond Gemini looked gone to the host.
+const PROBE_WAIT_MS = 6000
 const catalogCache = new Map()
 const offeredProbes = new Map()
 
@@ -275,7 +283,10 @@ async function probeOfferedModels(agyPath, account) {
       child.on("error", error => conn?.close(error))
       child.on("close", () => conn?.close(new Error("agy model probe exited")))
       conn = new AcpConnection(child, { onNotification: () => {}, onRequest: async () => { throw Object.assign(new Error("not supported"), { code: -32601 }) }, onProtocolError: error => conn.close(error) })
-      const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: { name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version }, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, 5000)
+      // agy only lists the Claude and GPT-OSS models of a client it knows as
+      // "zed" (HANDOFF.md); under any other name it lists Gemini's alone. The
+      // probe asks as zed for that reason, whatever the bridge calls itself.
+      const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: { name: ACP_PROBE_CLIENT, version: PACKAGE_METADATA.version }, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, 5000)
       if (agyTooOld(init?.agentInfo?.version)) return null
       const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, 5000)
       const canClose = init?.agentCapabilities?.sessionCapabilities?.close ?? init?.agentCapabilities?.session_capabilities?.close
@@ -1621,6 +1632,15 @@ class Proc {
         // an abnormal protocol outcome) can fail the turn. Recovered output
         // clears the candidate, even when an earlier retry logged an error.
         turn.flushText(true)
+        // A spent vendor allowance ends the turn cleanly, with its notice as
+        // the only text and nothing in agy's log: no log detail can be found
+        // for it, so it is failed here from the notice's own words, which
+        // carry the reset time. Without this the turn was answered 200 and a
+        // group never fell to the model next in line.
+        if (turn.notices.quotaSaid) {
+          turn.agentError = true
+          throw this.#formatQuotaNotice(turn.notices.quotaSaid)
+        }
         if (turn.notices.failureCandidate) {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
           if (detail || result?.stopReason === "refusal") {
@@ -1730,6 +1750,18 @@ class Proc {
         ? "rate_limit_error"
         : "api_error"
     return new AgentTurnError(classification.message, kind, classification)
+  }
+
+  // A quota notice agy sent as the turn's own text. Classified as the quota
+  // refusal it is, so the host sees a 429 with the reset time it named and
+  // moves the request to the next model, rather than a 200 with a sentence.
+  // The model is named in the message on purpose: the notice itself names no
+  // model, and a host that can tell a refusal is the model's own rests only
+  // that model, letting the group's next one answer (Sonnet → Opus → Argon,
+  // where the whole provider resting would take Argon down with them).
+  #formatQuotaNotice(said, model) {
+    const classification = classifyUpstreamError(`${said} [${model || "this model"}]`, {})
+    return new AgentTurnError(classification.message, "rate_limit_error", classification)
   }
 
   // Cancel a turn the client stopped reading. The session stays usable; the
@@ -5554,12 +5586,25 @@ export const AntigravityBridgePlugin = async () => {
         const out = {}
         await Promise.all(accounts.map(async account => {
           const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)
+          // The ACP session tells which models the account is offered, but it
+          // is the only thing that does: `agy models` lists all of them for
+          // the account already. An empty or late answer is no evidence that
+          // a model is gone — agy 1.5.6's session/new lists modes only and
+          // never a model, so the probe answers nothing at all — and reading
+          // it as "gone" made the host delist every Claude model an hour
+          // later, over and over. So a catalog the probe cannot narrow is
+          // taken whole; only a probe that answers narrows it.
+          // The wait is a start-up's: a probe spawns agy and finishes its ACP
+          // handshake, which took 4s against a real account. 500ms only ever
+          // timed it out, and the catalog is listed at the same time, so a
+          // probe still running when the listing is done is given up on.
           const offered = agy ? await Promise.race([
             probeOfferedModels(agy, account),
-            new Promise(resolve => setTimeout(() => resolve(null), 500)),
+            new Promise(resolve => setTimeout(() => resolve(null), PROBE_WAIT_MS)),
           ]) : null
           const offeredIds = new Set((offered || []).map(item => item.id))
-          const available = offered ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : catalog.models.filter(item => /^gemini-/i.test(item.id))
+          const narrowed = !!offered && offeredIds.size > 0
+          const available = narrowed ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : [...catalog.models]
           const covered = new Set(available.flatMap(item => [item.id, ...[...(catalog.routes.get(item.id)?.byEffort?.values() || [])]]))
           for (const item of offered || []) if (!covered.has(item.id)) available.push({ id: item.id, name: item.name || item.id })
           for (const model of available) {

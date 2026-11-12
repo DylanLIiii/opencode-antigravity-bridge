@@ -250,8 +250,7 @@ pingdotgg/t3code `apps/server/src/provider/acp/`（`b7ab02e0f6`）：它用独�
 
 - `clientInfo.name: "zed"` 才列出 Claude/GPT-OSS（照搬 T3）。不要调用 ACP
   `authenticate`：`oauth-personal` 会换认证路径，随后报 `User location is not
-  supported`；不调用时沿用 CLI 登录正常。
-- 自定义 agent `tools: []` 并**不**限制内置工具，且会继承全局
+  supported`；不调用时沿用 CLI 登录正常。- 自定义 agent `tools: []` 并**不**限制内置工具，且会继承全局
   `~/.gemini/config/mcp_config.json`（旧桥接把用户全局 MCP 暴露给了模型）。
   `inheritMcp: false` + `inheritCustomizations: false` + `excludeDefaultComponents:
   true`：首轮 input 8,357 → 509。`_meta.antigravity.disabledTools` 在 1.4.12 无效；
@@ -260,6 +259,23 @@ pingdotgg/t3code `apps/server/src/provider/acp/`（`b7ab02e0f6`）：它用独�
   工具目录**（T3 源码注释也承认，T3 兜底是让 agent 跑 `t3 acp-mcp-call`）。可用的是
   `--ide-mcp-port`：agy 执行 `nc 127.0.0.1 <port>`，工具以 `mcp_ide-tools_<name>`
   直接函数出现、无权限请求、`toolSummary` 不进入参数；名称 104 字符也可。
+
+真实 agy 1.5.6 探针结论（2026-11-12，脚本在会话临时目录，未入库）：
+
+- `session/new` **不再返回模型列表**，`configOptions` 里只有 `mode`（default /
+  accept-edits / plan），`models.availableModels` 不存在。`clientInfo.name` 用
+  `"zed"` 还是包名，返回的都是这同一份 modes。所以「探针拿到的模型集合」在 1.5.6
+  上是空集，不能当作「模型被下架」的证据：空集时插件按 `agy models` 的全量目录走，
+  只有非空才收窄。旧代码在空集时收窄到 `/^gemini-/`，导致 Claude 每轮 relist 都被
+  判下架。
+- 探针耗时：起进程 + initialize + session/new 约 4s。旧的 500ms 竞速必然超时，
+  现在给 6s（`PROBE_WAIT_MS`）。
+- `agy models` 仍是判断「账号实际能拿到哪些模型」的可靠来源：带认证代理时 4s 返回
+  13 个模型，含 6 个 Claude。
+- 额度耗尽时 agy 不发错误：它把 `⚠ Individual quota reached. … Resets in 1h40m57s.`
+  当普通 `agent_message_chunk` 发出来，然后干净 `end_turn`，日志里没有
+  `agent executor error`。宿主只看到 200 + 28 token，不会降级。插件现在把这一行
+  当终端横幅扣住，并作为 `quota_exhausted` 失败抛出（→ 429，带 reset 时间）。
   本机无 `nc`，所以桥接在 agy 的 PATH 前放私有 `nc` → 直接 exec `mcp-server.mjs`
   （沿用 token 控制通道）。
 - MCP helper 若响应 `server/discover`，agy 走 2026-07-28 并发 `subscriptions/listen`，

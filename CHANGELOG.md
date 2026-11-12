@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.5
+
+- Stop a spent vendor allowance from being answered as the reply. agy reports "Individual quota reached … Resets in 1h40m57s." as an ordinary message chunk and ends the turn cleanly, with nothing in its log, so the turn was returned 200 with the notice as its only text and a host had nothing to fall back on: a group stayed on the model it had spent instead of moving to the next one. The notice is now held rather than shown, and fails the turn as the quota refusal it is (429, with the reset time agy named), so the next model of the group answers.
+- Stop delisting models the ACP probe cannot confirm. agy 1.5.6's `session/new` lists modes only and no model at all, so the offered-model probe answered nothing every time; the catalog was then narrowed to Gemini's models alone, and the host read every Claude model as gone and delisted it — again on each relist, an hour later. A catalog the probe cannot narrow is now taken whole, and only a probe that answers narrows it. The probe also waits for a start-up (6s) instead of 500ms, which was under the handshake alone.
+- Ask as `zed` in the probe's ACP handshake. agy lists Claude and GPT-OSS to that client name alone; under the bridge's own package name it lists Gemini's models only.
+
 ## 0.6.4
 
 - Filter standalone agy retry and terminal notices while preserving quoted model text; corroborate terminal failures with this prompt’s log or an abnormal result.

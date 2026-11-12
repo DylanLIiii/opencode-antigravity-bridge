@@ -112,3 +112,61 @@ test("whitespace after a terminal banner is not recovery", () => {
     assert.equal(run(chunks).text, chunks.join(""))
   }
 })
+
+// agy reports a spent allowance as the turn's own text, with a clean end_turn
+// and nothing in its log. It used to reach the agent as the answer: a 200 with
+// 28 tokens of notice, so a group never fell to the model next in line.
+const QUOTA = "\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h40m57s.\n"
+
+test("a quota notice is held, not answered, and says what it said", () => {
+  for (const chunks of [[QUOTA], split(QUOTA), ["\n", "⚠ Individual quota reached", ". Please upgrade your subscription", " to increase your limits. Resets in 1h40m", "57s.\n"]]) {
+    const f = new AgentNoticeFilter()
+    let text = ""
+    for (const chunk of chunks) text += f.push(chunk)
+    text += f.flush({ holdTerminal: true })
+    assert.equal(text, "")
+    assert.equal(f.failureCandidate, true)
+    assert.match(f.quotaSaid, /Individual quota reached/)
+    assert.match(f.quotaSaid, /Resets in 1h40m57s\./)
+    assert.equal(f.flush(), "")
+  }
+})
+
+test("agy's other quota wordings are held too", () => {
+  for (const said of [
+    "⚠ You have exhausted your capacity on this model. Your quota will reset after 3h19m30s.",
+    "⚠ Usage limit reached. Resets in 2h.",
+    "⚠ Quota exceeded for this account.",
+  ]) {
+    const f = new AgentNoticeFilter()
+    assert.equal(f.push("\n" + said + "\n"), "")
+    f.flush({ holdTerminal: true })
+    assert.equal(f.quotaSaid, said)
+  }
+})
+
+test("a quota line quoted in prose, inline code or a fence is model text", () => {
+  for (const text of [
+    "The notice `⚠ Individual quota reached. Resets in 1h.` is what agy sends.",
+    "agy said ⚠ Individual quota reached. Resets in 1h. earlier\n",
+    "Log:\n```\n⚠ Individual quota reached. Resets in 1h.\n```\ndone",
+    "> ⚠ Individual quota reached. Resets in 1h.\n",
+  ]) for (const chunks of [[text], split(text)]) assert.equal(run(chunks).text, text)
+})
+
+test("a quota notice followed by real output is not the turn's end", () => {
+  const r = run([QUOTA, "Here is the plan you asked for.\n"])
+  assert.equal(r.failureCandidate, false)
+  assert.ok(r.text.includes("Here is the plan you asked for."))
+})
+
+test("a quota notice ends the turn as quota even when agy logged no error", () => {
+  // The filter is given no diagnostic to find, which is what makes the notice
+  // itself the only evidence the turn failed.
+  const f = new AgentNoticeFilter(() => false)
+  let text = f.push(QUOTA)
+  text += f.flush({ holdTerminal: true })
+  assert.equal(text, "")
+  assert.equal(f.failureCandidate, true)
+  assert.ok(f.quotaSaid.startsWith("⚠ Individual quota reached"))
+})

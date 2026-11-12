@@ -5,6 +5,9 @@ Gemini、Claude、GPT-OSS 全系可用。
 
 **[English version → README.en.md](README.en.md)**
 
+
+精简 agent 默认开启；设置 `AGY_BRIDGE_MINIMAL_AGENT=0` 可关闭，这与 agy-cli 的默认关闭有意不同。缺少逐调用记录时，工具轮次的缓存用量是有界估算，不能证明 Google 实际缓存命中；ACP 输出量包含一次思考量。
+
 ## 它解决什么问题
 
 - 已经订阅了 Antigravity（Google AI Pro/Ultra 附带），却还要为 Gemini / Claude API
@@ -79,7 +82,7 @@ magpie plugin add ./opencode-antigravity-bridge
 已有默认 CLI 登录时，仍可选择「Sign in with the agy CLI」直接验证并使用。
 
 客户端侧零配置：不需要改全局 MCP 配置，插件为每个 agy 进程创建隔离的临时
-agent。ACP `clientInfo` 固定使用 `zed / 0.0.0`，兼容 agy 的非 Gemini 模型 allowlist。
+agent。ACP `clientInfo` 使用本包名称与版本；模型列表按账号探测实际可用型号。
 
 ## 它是怎么工作的
 

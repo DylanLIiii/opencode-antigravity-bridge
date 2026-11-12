@@ -24,6 +24,7 @@ test("simulated WSL sign-in, models and ACP/MCP client tool roundtrip", { skip: 
     fs.writeFileSync(path.join(root, "platform.mjs"), platform)
     let source = fs.readFileSync(entry, "utf8").replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(target === "./platform.mjs" ? pathToFileURL(path.join(root, "platform.mjs")).href : new URL(target, entry).href)}`)
     source = source.replace('fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))', JSON.stringify(new URL("./mcp-server.mjs", import.meta.url).pathname))
+    source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(new URL("./package.json", entry).pathname))
     source += '\nexport { allProcs, workDirectory, getAccounts }; export async function cleanupSimulation() { await Promise.all([...allProcs].map(p => p.stop())); controlServer?.close(); }\n'
     fs.writeFileSync(path.join(root, "index.mjs"), source)
     Object.assign(process.env, { AGY_BRIDGE_WSL_DISTRO: "Simulation", AGY_BRIDGE_WSL_EXE: path.join(root, "wsl"), AGY_PATH: path.join(root, "agy"), FAKE_AGY_LOG: path.join(root, "log"), FAKE_AGY_STATE: root, AGY_BRIDGE_ACCOUNTS_DIR: path.join(root, "host-profiles-never-read") })

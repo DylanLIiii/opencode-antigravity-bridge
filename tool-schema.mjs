@@ -180,10 +180,10 @@ export function sanitizeInputSchema(root) {
       if (out.type === "string" && values.length && values.every(value => typeof value === "string" && value.length)) out.enum = [...values]
       else if (values.length) appendHint(out, `${Object.hasOwn(schema, "const") ? "Must equal" : "Allowed values"}: ${values.map(value => JSON.stringify(value)).join(", ")}`)
     }
-    if (out.type === "array" && schema.items === undefined && !tuple) {
+    if (out.type === "array" && !out.items && schema.items === undefined && !tuple) {
       const inferred = structuredClone(schema)
       ensureGeminiArrayItems(inferred)
-      if (inferred.items) out.items = inferred.items
+      if (inferred.items) out.items = child(inferred.items)
     }
     if (out.type === "object") out.properties ??= {}
     sanitizePatternFields(out)

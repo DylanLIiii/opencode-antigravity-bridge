@@ -355,6 +355,11 @@ async function prompt(params, recorded = false) {
     log({ type: "agentError", convId: session.id })
     return { stopReason: "end_turn" }
   }
+  if (text.includes("SYSTEM_REJECT429")) {
+    fs.appendFileSync(agentLog, "E1103 errorreport.go:224] agent executor error: RESOURCE_EXHAUSTED (code 429): system prompt rejected by server.\n")
+    chunk("\n⚠ Agent execution terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
   if (text.includes("GENERIC429")) {
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): upstream rejected request.\n")
     chunk("\n⚠ Agent execution terminated due to error.\n")
@@ -428,6 +433,10 @@ async function prompt(params, recorded = false) {
     }
     chunk("Answer after summaries only.")
     return finish("Answer after summaries only.")
+  }
+  if (text.includes("RATIO_INITIAL")) {
+    chunk("ratio acknowledged")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, cachedWriteTokens: 900, outputTokens: 500, totalTokens: 11500 } }
   }
   if (text.includes("USAGE_THINKING_EXCEEDS_OUTPUT")) {
     chunk("usage fixture")
@@ -620,7 +629,7 @@ function configOptions() {
   const family = model.replace(/-(low|medium|high|xhigh|max)$/, "")
   const configurable = family === "gemini-test" || family === "gemini-config-only" || family === "gemini-4-argon"
   const grouped = process.env.FAKE_AGY_CONFIG === "grouped"
-  const models = ["gemini-test", "gemini-config-only", "gemini-4-argon", "claude-test-medium"].map(value => ({ value, name: value }))
+  const models = ["gemini-test", "gemini-config-only", "gemini-4-argon", "claude-test-medium", "gpt-oss-120b-medium"].map(value => ({ value, name: value }))
   return [
     { id: grouped ? "model-picker" : "model", name: "Model", category: "model", type: "select", currentValue: configurable ? family : model,
       options: grouped ? [{ group: "Test models", options: models }] : models },
@@ -762,7 +771,7 @@ fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} $
 fs.chmodSync(wrapper, 0o755)
 process.env.AGY_PATH = wrapper
 
-const { default: pluginDefault } = await import("./index.mjs")
+const { default: pluginDefault } = await import(process.env.AGY_BRIDGE_TEST_INDEX || "./index.mjs")
 const plugin = await pluginDefault.server({ client: null, directory: os.tmpdir() }, {})
 const loader = await plugin.auth.loader(async () => ({ key: "agy" }))
 let failures = 0
@@ -923,7 +932,11 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
 
 {
   const probesBefore = logs().filter(event => event.type === "models").length
+  const promptsBefore = logs().filter(event => event.type === "user").length
+  const initBefore = inits().length
   const models = await plugin.provider.models()
+  const discovery = inits().slice(initBefore)
+  check("model discovery opens ACP without submitting a prompt", discovery.length === 1 && logs().filter(event => event.type === "user").length === promptsBefore && discovery[0].update === "true", JSON.stringify(discovery))
   const probes = logs().filter(event => event.type === "models").slice(probesBefore)
   check("directory refresh disables auto update even when the parent enables it", probes.length > 0 && probes.every(event => event.update === "true"))
   check("dynamic models accept tab-separated agy output", !!models["gemini-test"])
@@ -1058,7 +1071,7 @@ async function launchedModel(body) {
   check("input_tokens reported", (usage?.input_tokens ?? 0) > 0)
   const init = inits().at(-1)
   const user = lastOf("user")
-  check("ACP session uses the minimal isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true"].every(line => init.agentConfig.includes(line)), init.agentConfig)
+  check("ACP session uses the default minimal isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true"].every(line => init.agentConfig.includes(line)), init.agentConfig)
   const pkg = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
   check("ACP client identifies as this package", init.clientInfo?.name === pkg.name && init.clientInfo?.version === pkg.version)
   check("client system prompt is appended to the session instructions", init.systemAppend?.includes("SYSTEM-PROMPT-MARKER"))
@@ -1095,6 +1108,18 @@ async function launchedModel(body) {
     init.systemAppend?.includes("Anthropic, OpenAI and Deepseek") &&
     user.text === `PROMPTGUARD user text stays unchanged: ${sdkIdentity}`,
     JSON.stringify({ system: init.systemAppend, user: user.text }))
+}
+
+{
+  process.env.AGY_BRIDGE_MINIMAL_AGENT = "0"
+  const { default: offModule } = await import("./index.mjs?minimal-explicit-off")
+  const offPlugin = await offModule.server({ client: null, directory: os.tmpdir() }, {})
+  const offLoader = await offPlugin.auth.loader(async () => ({ key: "agy" }))
+  const response = await offLoader.fetch("agy://local/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "user", content: "minimal explicitly off" }] }) })
+  const { events } = await readSSE(response)
+  const config = inits().at(-1)?.agentConfig
+  check("explicit minimal agent 0 disables default component exclusion", stopOf(events) === "end_turn" && config?.includes("inheritMcp: false") && !config?.includes("excludeDefaultComponents: true"), config)
+  delete process.env.AGY_BRIDGE_MINIMAL_AGENT
 }
 
 {
@@ -1282,6 +1307,29 @@ for (const [name, system, headers, expectedDir, named] of [
   const { events } = await readSSE(response)
   const usage = events.find(event => event.event === "message_delta")?.data?.usage
   check("ACP input shape uses raw output before thinking floor", usage?.input_tokens === 10000 && usage?.cache_read_input_tokens === 100 && usage?.output_tokens === 400 && usage?.output_tokens_details?.thinking_tokens === 400, JSON.stringify(usage))
+}
+
+{
+  const before = inits().length
+  const first = { model, metadata: { user_id: "flatten-regression" }, messages: [{ role: "user", content: "flattened opening unique" }] }
+  const events = (await readSSE(await callFetch(first))).events
+  const reply = textOf(events)
+  const second = { ...first, messages: [{ role: "user", content: `flattened opening unique\n${reply}\nflattened new tail` }] }
+  const result = (await readSSE(await callFetch(second))).events
+  check("flattened history reuses session and sends only new tail", stopOf(result) === "end_turn" && inits().length === before + 1 && lastOf("user").text === "flattened new tail", JSON.stringify(lastOf("user")))
+}
+
+{
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  const first = { model, metadata: { user_id: "ratio-write-regression" }, messages: [{ role: "user", content: "RATIO_INITIAL" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const second = nextTurn(first, firstEvents, "MULTISTEP " + "x".repeat(100000))
+  const toolEvents = (await readSSE(await callFetch(second))).events
+  const usage = toolEvents.find(event => event.event === "message_delta")?.data?.usage
+  const window = (usage?.input_tokens || 0) + (usage?.cache_read_input_tokens || 0)
+  check("real prompt cache ratio survives final response with cache writes", stopOf(toolEvents) === "tool_use" && window > 1000 && usage.cache_read_input_tokens === Math.round(window * 100 / 10100), JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(second, toolEvents, "ratio result")))
+  delete process.env.AGY_BRIDGE_STEP_USAGE
 }
 
 let nativeBody
@@ -1783,6 +1831,17 @@ for (const change of ["tools", "model"]) {
     response.status === 429 && response.headers.get("x-should-retry") === "false" &&
     payload.error?.code === "AGY_ERROR_RESOURCE_EXHAUSTED_UNSPECIFIED" && payload.error?.retryable === false,
     JSON.stringify({ status: response.status, headers: Object.fromEntries(response.headers), payload }))
+}
+
+{
+  const system = "You are Codex, an agent based on GPT-5"
+  const generic = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "GENERIC429 with cloaked system" }] })
+  const genericPayload = await generic.json()
+  const sent = inits().at(-1)?.systemAppend
+  check("cloaked system retains generic 429 classification", generic.status === 429 && genericPayload.error?.type === "rate_limit_error" && sent !== system && sent?.includes("\u200b"), JSON.stringify({ status: generic.status, error: genericPayload.error }))
+  const rejected = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "SYSTEM_REJECT429 with cloaked system" }] })
+  const rejectedPayload = await rejected.json()
+  check("specific system prompt rejection maps to invalid request", rejected.status === 400 && rejectedPayload.error?.type === "invalid_request_error", JSON.stringify(rejectedPayload))
 }
 
 {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- Align ACP and SQLite usage accounting, cache estimates and read-only WAL handling with agy-cli 0.1.22; thinking is included once in output.
+- Improve session identity, tool schema compatibility, model discovery, assistant prefill and system instruction compatibility while preserving native steering and account isolation.
+- Keep the minimal agent enabled by default; `AGY_BRIDGE_MINIMAL_AGENT=0` disables it. Estimated cache usage is not a measured Google cache hit rate.
+
 ## 0.5.1
 
 - Fix #43 with explicit Windows-to-WSL agy launch mode, coherent ACP paths and host MCP interop; preserve native defaults and literal argv.

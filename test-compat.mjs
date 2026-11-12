@@ -16,6 +16,7 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
+source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(new URL("./package.json", entry).pathname))
 source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute };\n"
 fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts };\n")
 const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
@@ -165,6 +166,17 @@ const result = (id, name, text) => ({
   result: { content: [{ type: "text", text }], isError: false },
 })
 const bodyFor = content => ({ messages: [{ role: "assistant", content: [] }, { role: "user", content }] })
+
+test("quoted unclosed notice follows its author while truncated protocol notice is rejected", () => {
+  const item = result("t1", "echo", "ok")
+  const user = bodyFor([{ type: "tool_result", tool_use_id: "t1", content: "ok" }, { type: "text", text: "please explain <system-reminder> syntax" }])
+  assert.equal(inspectToolTurn([item], user).userSteered, true)
+  const system = { messages: [{ role: "assistant", content: [] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] }, { role: "developer", content: "please explain <system-reminder> syntax" }] }
+  const parsed = inspectToolTurn([item], system)
+  assert.equal(parsed.userSteered, false)
+  assert.match(JSON.stringify(parsed.results), /please explain/)
+  assert.throws(() => inspectToolTurn([item], bodyFor([{ type: "tool_result", tool_use_id: "t1", content: "ok" }, { type: "text", text: "<system-update>unfinished" }])))
+})
 
 test("prompt budget counts UTF-8 text and installed instructions, preserving complete parts", () => {
   const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES

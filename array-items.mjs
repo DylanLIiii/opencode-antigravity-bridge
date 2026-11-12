@@ -1,3 +1,5 @@
+// Adapted from magpie-community/plugins agy-cli b829a5541ecc0790b05a63308447bf87e952efbe.
+// MIT; Copyright (c) 2026 DylanLIiii, gitxm, yce. See NOTICE-upstream-license.txt.
 // Fill a sibling `items` on array JSON Schemas so Gemini function_declarations
 // are not rejected with `items: missing field`. Called as a tree walk after
 // sanitizeInputSchema, so this module does not have to live inside that

@@ -15,3 +15,12 @@ test('unsupported RE2 patterns become hints and large declarations keep fields',
   assert.deepEqual(result.required, ['p2399'])
   assert.equal(source.properties.bad.pattern, '^(?=foo)foo')
 })
+
+test('inferred array items preserve resolved refs and sanitize nested patterns', () => {
+  const resolved = sanitizeInputSchema({type:'array', $defs:{v:{type:'object',properties:{x:{type:'string'}},required:['x']}}, allOf:[{type:'array',items:{$ref:'#/$defs/v'}}]})
+  assert.equal(resolved.items.properties.x.type, 'string')
+  assert.deepEqual(resolved.items.required, ['x'])
+  const pattern = sanitizeInputSchema({type:'array',anyOf:[{type:'array',items:{type:'string',pattern:'(?<=x)y'}}]})
+  assert.equal(pattern.items.pattern, undefined)
+  assert.match(pattern.items.description, /pattern/)
+})

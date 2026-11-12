@@ -257,6 +257,47 @@ async function listAgyModels(agyPath, extraArgs = []) {
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const catalogCache = new Map()
+const offeredProbes = new Map()
+
+async function probeOfferedModels(agyPath, account) {
+  const key = `${wslDistro() || "native"}|${agyPath}|${account.key}`
+  const cached = offeredProbes.get(key)
+  if (cached && (cached.promise || Date.now() - cached.at < 60_000)) return cached.promise || cached.models
+  const entry = { at: Date.now(), models: null, promise: null }
+  entry.promise = (async () => {
+    let workspace, child, conn
+    try {
+      workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agy-model-probe-"))
+      const args = ["acp", ...(account.dir ? [`--gemini_dir=${account.dir}`] : [])]
+      child = spawnAgy(agyPath, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
+        env: { ...accountEnv({ ...process.env }, account.dir), AGY_CLI_DISABLE_AUTO_UPDATE: "true" } })
+      child.stderr?.resume()
+      child.stdin?.on("error", () => {})
+      child.on("error", error => conn?.close(error))
+      child.on("close", () => conn?.close(new Error("agy model probe exited")))
+      conn = new AcpConnection(child, { onNotification: () => {}, onRequest: async () => { throw Object.assign(new Error("not supported"), { code: -32601 }) }, onProtocolError: error => conn.close(error) })
+      const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: { name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version }, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, 5000)
+      if (agyTooOld(init?.agentInfo?.version)) return null
+      const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, 5000)
+      const canClose = init?.agentCapabilities?.sessionCapabilities?.close ?? init?.agentCapabilities?.session_capabilities?.close
+      if (session?.sessionId && canClose) await conn.request("session/close", { sessionId: session.sessionId }, 1000).catch(() => {})
+      const options = configSelect(Array.isArray(session?.configOptions) ? session.configOptions : [], "model")
+      const models = [...selectValues(options?.options).map(x => ({ id: x.value, name: x.name || x.value })),
+        ...(session?.models?.availableModels || []).map(x => ({ id: x.modelId || x.id, name: x.name }))].filter(x => typeof x.id === "string" && x.id)
+      return models.length ? models : null
+    } catch { return null } finally {
+      conn?.close(new Error("model probe complete"))
+      try { child?.stdin?.end() } catch {}
+      if (child?.pid) {
+        if (process.platform === "win32") await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3000 }).catch(() => {})
+        else try { process.kill(-child.pid, "SIGTERM") } catch { try { child.kill("SIGTERM") } catch {} }
+      }
+      if (workspace) await fs.promises.rm(workspace, { recursive: true, force: true }).catch(() => {})
+    }
+  })().then(models => { entry.models = models; return models }).finally(() => { entry.promise = null })
+  offeredProbes.set(key, entry)
+  return entry.promise
+}
 
 // Named accounts live in AGY_BRIDGE_ACCOUNTS_DIR (default
 // ~/.config/magpie-agy-bridge/accounts/<name>/) as full Gemini dirs. Each needs
@@ -1094,6 +1135,9 @@ class Proc {
   constructor(agyPath, convKey, opts) {
     this.agyPath = agyPath
     this.convKey = convKey
+    this.userId = opts.userId || ""
+    this.openingText = openingTextOf(opts.messages?.[0])
+    this.openingImages = openingImagesOf(opts.messages?.[0])
     this.account = opts.account || null
     this.geminiDir = opts.geminiDir || null
     this.model = opts.model
@@ -1437,12 +1481,14 @@ class Proc {
     if (update.sessionUpdate === "agent_message_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
       if (typeof text === "string" && text.length) {
+        turn.sawGenerationOutput = true
         turn.arm()
         turn.pushText(text)
       }
     } else if (update.sessionUpdate === "agent_thought_chunk") {
       const text = update.content?.type === "text" ? update.content.text : ""
       if (typeof text === "string" && text.length) {
+        turn.sawGenerationOutput = true
         turn.arm()
         turn.pushThought(text)
       }
@@ -1474,7 +1520,9 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    return historyKey(this.expectedMessages) === historyKey(messages)
+    if (historyKey(this.expectedMessages) === historyKey(messages)) return true
+    return sameToolUseIdentities(this.expectedMessages, messages) &&
+      historyKey(stripToolUseInputs(this.expectedMessages)) === historyKey(stripToolUseInputs(messages))
   }
 
   // Clients such as Claude Code normalize tool_use inputs when recording an
@@ -1676,7 +1724,7 @@ class Proc {
   }
 
   #formatAgentError(detail, promptGuardMatched = false) {
-    if (/code 429\b/i.test(detail) && /resource has been exhausted/i.test(detail) && turnsAway(this.instructions)) {
+    if (/code 429\b/i.test(detail) && /(?:system\s+prompt|system\s+instructions).{0,80}(?:reject|invalid|block|denied)/i.test(detail) && turnsAway(this.instructions)) {
       return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "invalid_request_error")
     }
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
@@ -1952,6 +2000,8 @@ class Proc {
           if (!isUnsupportedSteering(error) || turn.cancelRequested || turn.done || this.dead) throw error
           validateAcpPromptBudget(content, this.instructions, body)
           this.nativeSteeringRejected = true
+          if (turn.stepsFile) this.stepUsageTrusted = false
+          turn.stepCursor = null
           turn.steeringFallback = content
           // Repeat this batch's results in the follow-up: cancellation can cause
           // AGY to store a cancellation in place of an already delivered result.
@@ -2009,6 +2059,7 @@ class Proc {
   finalizeTurn(turn) {
     if (turn.finalized) return
     turn.finalized = true
+    if (turn.stepsFile && turn.promptCount > 0 && !turn.stepUsageReconciled) this.stepUsageTrusted = false
     for (const attempt of [turn.promptAttempt, ...turn.steeringAttempts].filter(Boolean)) {
       if (promptAttempts.get(attempt.key) !== attempt) continue
       if (!attempt.submitted || (turn.done && !attempt.terminal)) releasePromptAttempt(attempt)
@@ -2348,7 +2399,9 @@ function park(proc) {
     key: proc.convKey,
     sessionId: proc.sessionId,
     historyHash: digest(historyKey(proc.expectedMessages)),
-    instructionsHash: digest(compactIdentity(proc.instructions)),
+    historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
+    toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
+    instructionsHash: digest(instructionsIdentity(proc.instructions)),
     workDir: proc.workDir,
     at: Date.now(),
   })
@@ -2360,8 +2413,11 @@ function peekParked(convKey, opts) {
   loadParked()
   const entry = parked.get(convKey)
   if (!entry || Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(compactIdentity(opts.instructions)) ||
-    entry.historyHash !== digest(historyKey(opts.history))) return null
+    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions))) return null
+  if (entry.historyHash === digest(historyKey(opts.history))) return entry
+  const ids = toolUseIdentitiesKey(opts.history)
+  if (ids == null || entry.toolUseIdentitiesHash !== digest(ids) ||
+      entry.historyHashSansInputs !== digest(historyKey(stripToolUseInputs(opts.history)))) return null
   return entry
 }
 
@@ -2523,8 +2579,45 @@ async function withAcquireLock(key, fn) {
   }
 }
 
+function findFlattenedProc(opts) {
+  const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && proc.hasSentFirstTurn &&
+    (proc.account || null) === (opts.account || null) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
+    proc.workDir === opts.workDir && proc.model === opts.model && proc.toolsSignature === JSON.stringify(opts.tools) &&
+    sameInstructions(proc.instructions, opts.instructions) && isContinuedOpening(proc, opts.messages?.[0]))
+  candidates.sort((a, b) => b.openingText.length - a.openingText.length)
+  return candidates.length > 1 && candidates[0].openingText.length === candidates[1].openingText.length ? null : candidates[0]
+}
+
 async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
-  return withAcquireLock(convKey, () => acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew))
+  let extra = null
+  for (let attempt = 0; ; attempt++) {
+    const keys = [...new Set([convKey, extra].filter(Boolean))].sort()
+    const lock = (i, fn) => i === keys.length ? fn() : withAcquireLock(keys[i], () => lock(i + 1, fn))
+    const result = await lock(0, async () => {
+      const candidate = isFreshConversation && !forceNew && !pool.has(convKey) ? findFlattenedProc(opts) : null
+      if (candidate && !keys.includes(candidate.convKey)) {
+        if (attempt < 2) return { retry: candidate.convKey }
+        return { value: await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew) }
+      }
+      if (candidate) {
+        const tail = flattenedContinuationMessage(candidate, opts.messages[0])
+        if (tail) {
+          const oldKey = candidate.convKey
+          dropFromPool(candidate)
+          unpark(oldKey)
+          candidate.convKey = convKey
+          candidate.pendingFlattenedTurn = tail
+          candidate.openingText = openingTextOf(opts.messages[0])
+          candidate.openingImages = openingImagesOf(opts.messages[0])
+          pool.set(convKey, candidate)
+          return { value: { proc: candidate, history: [] } }
+        }
+      }
+      return { value: await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew) }
+    })
+    if (!result.retry || attempt >= 2) return result.value
+    extra = result.retry
+  }
 }
 
 // The opening-message key identifies a family, not a single line of history.
@@ -2882,6 +2975,39 @@ function stripMagpiePlaceholderNotice(text) {
 
 // Compare conversation content, not transport metadata or client-assigned IDs.
 // Keep argument values, result contents and internal whitespace significant.
+function stripToolUseInputs(messages) {
+  if (!Array.isArray(messages)) return messages
+  return messages.map((message) => ({
+    ...message,
+    content: Array.isArray(message.content)
+      ? message.content.map((block) => block?.type === "tool_use"
+        ? { type: "tool_use", id: block.id, name: block.name, input: {} }
+        : block)
+      : message.content,
+  }))
+}
+
+function toolUseIdentitiesKey(messages) {
+  if (!Array.isArray(messages)) return null
+  const rows = []
+  for (const message of messages) {
+    const blocks = Array.isArray(message.content) ? message.content : []
+    for (const block of blocks) {
+      if (block?.type !== "tool_use") continue
+      if (!/^toolu_[0-9a-f]{24}$/i.test(block.id || "")) return null
+      rows.push({ id: block.id, name: block.name || "" })
+    }
+  }
+  return stableJSON(rows)
+}
+
+function sameToolUseIdentities(left, right) {
+  const a = toolUseIdentitiesKey(left)
+  const b = toolUseIdentitiesKey(right)
+  return a != null && a === b
+}
+
+
 function stripBillingHeader(text) {
   let s = String(text ?? "")
   s = s.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*\n?/gmi, "")
@@ -2972,6 +3098,202 @@ function replaceClosedSystemReminders(text, replacer) {
 
 function stripVolatileOpening(text) {
   return replaceClosedSystemReminders(stripBillingHeader(text), (block) => stripAgentClockLines(block))
+}
+
+
+function contentText(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content.map(block => typeof block === "string" ? block : block?.type === "text" ? block.text || "" : "").join("")
+}
+
+function openingTextOf(message) {
+  if (!message) return ""
+  return compactIdentity(stripVolatileOpening(contentText(message.content)))
+}
+
+function openingImagesOf(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return []
+  const out = []
+  for (const block of content) {
+    if (block?.type !== "image") continue
+    try {
+      const image = parseUserImage(block)
+      if (image) out.push(`${image.mimeType}:${digest(image.data)}`)
+    } catch {
+      const source = block.source || {}
+      out.push(`invalid:${source.media_type || ""}:${digest(String(source.data || ""))}`)
+    }
+  }
+  return out
+}
+
+function sameOpeningImagePrefix(prev, cur) {
+  if (!Array.isArray(prev) || !Array.isArray(cur) || prev.length > cur.length) return false
+  return prev.every((id, index) => id === cur[index])
+}
+
+// Non-text, non-image blocks on an opening (documents, search results, etc.).
+function openingExtrasOf(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return []
+  const out = []
+  for (const block of content) {
+    if (!block || typeof block === "string" || block.type === "text" || block.type === "image") continue
+    out.push(digest(stableJSON(block)))
+  }
+  return out
+}
+
+function sameOpeningExtraPrefix(prev, cur) {
+  return sameOpeningImagePrefix(prev, cur)
+}
+
+// Advance through `text` while ignoring whitespace until `compactPrefix` is
+// consumed. Returns the index of the first non-space after the prefix, and
+// whether a newline (a turn boundary) sits between the prefix and the rest.
+function consumeCompactPrefix(text, compactPrefix) {
+  let i = 0
+  let k = 0
+  let lastWasNewline = true
+  while (i < text.length && k < compactPrefix.length) {
+    const ch = text[i]
+    if (/\s/.test(ch)) {
+      if (ch === "\n" || ch === "\r") lastWasNewline = true
+      i++
+      continue
+    }
+    if (ch !== compactPrefix[k]) return null
+    k++
+    i++
+    lastWasNewline = false
+  }
+  if (k < compactPrefix.length) return null
+  let sawNewline = lastWasNewline
+  let j = i
+  while (j < text.length && (text[j] === " " || text[j] === "\t")) j++
+  if (j < text.length && (text[j] === "\n" || text[j] === "\r")) {
+    sawNewline = true
+    while (j < text.length && /\s/.test(text[j])) j++
+  }
+  return { remainderIndex: j, boundary: sawNewline }
+}
+
+function subsequentTranscriptOf(proc) {
+  const messages = proc?.expectedMessages
+  if (!Array.isArray(messages) || messages.length < 2) return ""
+  const parts = []
+  for (const message of messages.slice(1)) {
+    if (!message) continue
+    if (message.role === "assistant") {
+      const text = assistantTextOf(message)
+      if (typeof text === "string" && text.trim()) {
+        parts.push(text)
+        continue
+      }
+      const blocks = Array.isArray(message.content) ? message.content : []
+      for (const block of blocks) {
+        if (!block) continue
+        if (block.type === "text" && typeof block.text === "string" && block.text.trim()) parts.push(block.text)
+        else if (block.type === "tool_use") parts.push(`${block.name || ""}:${stableJSON(block.input ?? {})}`)
+      }
+      continue
+    }
+    const text = contentText(message.content)
+    if (text.trim()) parts.push(text)
+  }
+  return compactIdentity(parts.join("\n"))
+}
+
+const FLAT_ROLE_LABEL_RE = /^(?:assistant|user|system|human|model)\s*:\s*/i
+
+// Leftover text after an optional role label and the subsequent transcript,
+// or null if the remainder does not start with that transcript. The reply
+// must end on a line boundary (or the end of the string) so a longer
+// independent line that only starts with the reply is rejected, including
+// replies of 12 characters or more — length is not a substitute for a
+// turn boundary.
+function leftoverAfterSubsequent(remainder, subsequentCompact) {
+  if (!subsequentCompact) return null
+  let text = remainder
+  if (FLAT_ROLE_LABEL_RE.test(text)) text = text.replace(FLAT_ROLE_LABEL_RE, "")
+  if (!compactIdentity(text).startsWith(subsequentCompact)) return null
+  const consumed = consumeCompactPrefix(text, subsequentCompact)
+  if (!consumed) return null
+  if (!consumed.boundary && consumed.remainderIndex < text.length) return null
+  return text.slice(consumed.remainderIndex)
+}
+
+function remainderHasSubsequent(remainder, subsequentCompact) {
+  return leftoverAfterSubsequent(remainder, subsequentCompact) != null
+}
+
+// The unsent tail of a flattened, growing first message: everything after
+// the previous opening and the live session's subsequent transcript (usually
+// the last assistant reply). Images and extra blocks already sent with the
+// previous opening are dropped; any new images, documents or search results
+// are kept. If the previous extras are not a prefix of the new ones, reuse
+// is refused rather than dropping content.
+function flattenedContinuationMessage(proc, firstMessage) {
+  const prev = proc?.openingText || ""
+  const cur = openingTextOf(firstMessage)
+  if (!prev || !cur || cur === prev) return null
+  // The new opening must continue the whole previous opening, not just a
+  // shared prefix. A shared 8 KiB head with a different tail is a different chat.
+  if (!(cur.startsWith(prev) && cur.length > prev.length + 4)) return null
+  const prevOpening = Array.isArray(proc.expectedMessages) ? proc.expectedMessages[0] : null
+  const prevImages = proc.openingImages || openingImagesOf(prevOpening)
+  const curImages = openingImagesOf(firstMessage)
+  if (!sameOpeningImagePrefix(prevImages, curImages)) return null
+  const prevExtras = openingExtrasOf(prevOpening)
+  const curExtras = openingExtrasOf(firstMessage)
+  if (!sameOpeningExtraPrefix(prevExtras, curExtras)) return null
+  // "Review README" must not attach "Review README and tests". Flattened
+  // history appends later turns after a newline, and those turns are still
+  // sitting on the live process, so require both a turn boundary and the
+  // subsequent transcript (the assistant reply, not just a longer prompt).
+  const curRaw = stripVolatileOpening(contentText(firstMessage?.content))
+  const consumed = consumeCompactPrefix(curRaw, prev)
+  if (!consumed?.boundary) return null
+  const subsequent = subsequentTranscriptOf(proc)
+  if (!subsequent) return null
+  const leftover = leftoverAfterSubsequent(curRaw.slice(consumed.remainderIndex), subsequent)
+  if (leftover == null) return null
+  const newText = leftover.replace(/^\s+/, "")
+  const keptBlocks = []
+  if (Array.isArray(firstMessage?.content)) {
+    let skippedImages = 0
+    let skippedExtras = 0
+    const skipImg = prevImages?.length || 0
+    const skipEx = prevExtras?.length || 0
+    for (const block of firstMessage.content) {
+      if (!block || typeof block === "string" || block.type === "text") continue
+      if (block.type === "image") {
+        if (skippedImages < skipImg) {
+          skippedImages++
+          continue
+        }
+        keptBlocks.push(block)
+        continue
+      }
+      if (skippedExtras < skipEx) {
+        skippedExtras++
+        continue
+      }
+      keptBlocks.push(block)
+    }
+  }
+  if (!newText && !keptBlocks.length) return null
+  if (!keptBlocks.length) return { role: "user", content: newText }
+  const content = []
+  if (newText) content.push({ type: "text", text: newText })
+  content.push(...keptBlocks)
+  return { role: "user", content }
+}
+
+function isContinuedOpening(proc, firstMessage) {
+  return flattenedContinuationMessage(proc, firstMessage) != null
 }
 
 
@@ -3910,13 +4232,21 @@ function inspectToolTurn(results, body) {
       }
       const rest = withoutNotices.replace(SYSTEM_REMINDER_RE, "").trim()
       if (UNCLOSED_NOTICE_RE.test(rest)) {
-        throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        const wrapped = /^<system-reminder(?:\s[^>]*)?>\s*([\s\S]*?)\s*<\/system-reminder>$/.exec(trimmed)
+        if (!wrapped && PROTOCOL_NOTICE_START_RE.test(rest)) throw new UnsupportedContent("text beside a live tool_result; send it after the tool response completes")
+        if (wrapped || message.role === "system" || message.role === "developer") {
+          const inner = wrapped ? wrapped[1] : rest
+          if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) userSteered = true
+          else if (!isNoise(inner)) notices.push(cloak(inner))
+        } else if (message.role === "user") userSteered = true
+        else if (!isNoise(rest)) notices.push(cloak(rest))
+        continue
       }
       if (message.role === "system" || message.role === "developer") {
         if (extractQueuedPrompt(rest) !== null || userInterruption.test(rest)) {
           userSteered = true
         } else if (!isNoise(rest)) {
-          notices.push(rest)
+          notices.push(cloak(rest))
         }
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
@@ -4225,7 +4555,7 @@ function isCausalSiblingSubstep(file, cursor) {
   return true
 }
 
-async function measuredUsage(turn, step, result) {
+async function measuredUsage(turn, step, content, result) {
   if (step.settled || !turn.stepsFile || turn.stepCursor == null) return null
   const final = result !== undefined
   const acp = final && result?.usage ? promptUsage(result.usage) : null
@@ -4246,7 +4576,7 @@ async function measuredUsage(turn, step, result) {
   // produce no new model step or generation row. Confirm after one poll grace
   // tick so WAL commits settle, then emit 0 incremental usage without clearing
   // turn.stepCursor or stalling 1000ms per sibling call.
-  if (!final && turn.measured && !batch?.pending && Array.isArray(batch?.steps) && batch.steps.length === 0 &&
+  if (!final && !turn.sawGenerationOutput && turn.measured && !batch?.pending && Array.isArray(batch?.steps) && batch.steps.length === 0 &&
       isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
     await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
     batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
@@ -4271,7 +4601,18 @@ async function measuredUsage(turn, step, result) {
     batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
   }
   const steps = batch?.steps
-  if (!complete(steps)) return null
+  if (!complete(steps)) {
+    if (final && !turn.sawGenerationOutput && !content?.some(block => block.type === "text" || block.type === "thinking") && !batch?.pending && Array.isArray(steps) && steps.length === 0 &&
+        expected !== null && measured.prompt > 0 && measured.prompt >= expected &&
+        measured.prompt <= expected + Math.max(16, Math.ceil(expected * 0.01)) &&
+        isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
+      turn.stepUsageReconciled = true
+      step.usageKind = "agy_same_generation"
+      step.modelCalls = 0
+      return { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 }
+    }
+    return null
+  }
   // agy's per-call prompts sum to ACP's total exactly. A large over-count means
   // the store's layout or contents no longer match what ACP reported, so don't
   // hand the client numbers we cannot reconcile.
@@ -4287,6 +4628,7 @@ async function measuredUsage(turn, step, result) {
     modelStep: latestModelStep(turn.stepsFile),
   }
   turn.measured = { prompt }
+  if (final) turn.stepUsageReconciled = true
   step.usageKind = "agy_model_call"
   step.modelCalls = steps.length
   logBridgeEvent(turn.proc, turn, "model_usage", batch.source, {}, {
@@ -4309,7 +4651,8 @@ async function measuredUsage(turn, step, result) {
 
 async function settleUsage(proc, turn, step, content, result) {
   if (step.settled) return step.usage
-  const measured = result?.stopReason === "cancelled" ? null : await measuredUsage(turn, step, result)
+  const measured = result?.stopReason === "cancelled" ? null : await measuredUsage(turn, step, content, result)
+  turn.sawGenerationOutput = false
   if (measured) return measured
   // The store's later calls would no longer line up with what was reported.
   turn.stepCursor = null
@@ -4676,7 +5019,7 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (streamError) {
     const status = streamError.code === "upstream_idle_timeout" ? 504
       : streamError.type === "rate_limit_error" ? 429
-      : streamError.type === "permission_error" ? 403 : 502
+      : streamError.type === "permission_error" ? 403 : streamError.type === "invalid_request_error" ? 400 : 502
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
       status,
       headers: {
@@ -4713,8 +5056,10 @@ function streamResponse(proc, turn, body, signal) {
 }
 
 async function beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt = null, promptGuardMatched = false) {
+  const flattened = proc.pendingFlattenedTurn
+  proc.pendingFlattenedTurn = null
   const contentParts = proc.hasSentFirstTurn
-    ? mergePromptParts(renderContinuedTurnParts(body.messages.slice(history.length)), outputFormatReminder(body))
+    ? mergePromptParts(renderContinuedTurnParts(flattened ? [flattened, ...body.messages.slice(1)] : body.messages.slice(history.length)), outputFormatReminder(body))
     : renderReplayPromptParts(body, callerWorkDir, proc.instructionsInSession,
       proc.instructionsInSession ? proc.instructions : "")
   if (promptHasImage(contentParts) && !proc.supportsImages) {
@@ -4910,7 +5255,7 @@ export const AntigravityBridgePlugin = async () => {
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false,
-                account: account.name, geminiDir: account.dir,
+                account: account.name, geminiDir: account.dir, userId: body.metadata?.user_id || "",
                 validateReplay: () => validateAcpPromptBudget(
                   renderReplayPromptParts(body, callerWorkDir, true, instructions), instructions, body) }
               const claim = () => {
@@ -5098,7 +5443,12 @@ export const AntigravityBridgePlugin = async () => {
         const out = {}
         await Promise.all(accounts.map(async account => {
           const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)
-          for (const model of catalog.models) {
+          const offered = agy ? await probeOfferedModels(agy, account) : null
+          const offeredIds = new Set((offered || []).map(item => item.id))
+          const available = offered ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : catalog.models.filter(item => /^gemini-/i.test(item.id))
+          const covered = new Set(available.flatMap(item => [item.id, ...[...(catalog.routes.get(item.id)?.byEffort?.values() || [])]]))
+          for (const item of offered || []) if (!covered.has(item.id)) available.push({ id: item.id, name: item.name || item.id })
+          for (const model of available) {
             // Named accounts expose the same catalog under "<account>/<model>".
             const id = account.name ? `${account.name}/${model.id}` : model.id
             const name = account.name ? `[${account.name}] ${model.name}` : model.name

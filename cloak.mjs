@@ -1,3 +1,5 @@
+// Adapted from magpie-community/plugins agy-cli b829a5541ecc0790b05a63308447bf87e952efbe.
+// MIT; Copyright (c) 2026 DylanLIiii, gitxm, yce. See NOTICE-upstream-license.txt.
 // System prompt lines Antigravity turns away, the same list and the same
 // break-up as packages/antigravity/index.mjs (TURNED_AWAY, breakUp, cloak,
 // hint). Each package ships on its own, so the code is a copy; cloak.test.mjs

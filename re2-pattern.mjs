@@ -1,3 +1,5 @@
+// Adapted from magpie-community/plugins agy-cli b829a5541ecc0790b05a63308447bf87e952efbe.
+// MIT; Copyright (c) 2026 DylanLIiii, gitxm, yce. See NOTICE-upstream-license.txt.
 // RE2-safe JSON Schema `pattern` / `patternProperties` handling for agy.
 //
 // agy validates every tool parameter schema against the JSON Schema 2020-12

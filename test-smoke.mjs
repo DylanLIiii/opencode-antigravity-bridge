@@ -1772,22 +1772,29 @@ for (const [summaryTool, withNotice] of [[false, false], [true, false], [false, 
   check("model change switches inside the live session", inits().length === before && user.convId === convId && user.model === "gemini-test-low" && stopOf(secondEvents) === "end_turn")
 }
 
-for (const change of ["tools", "model"]) {
-  const first = { model, messages: [{ role: "user", content: `TOOL live configuration ${change}` }], tools: [echoTool] }
+for (const change of ["tools", "tools-steering", "tools-shrink", "model"]) {
+  const growing = change === "tools" || change === "tools-steering"
+  const other = { name: "other", input_schema: { type: "object" } }
+  const first = { model, messages: [{ role: "user", content: `TOOL live configuration ${change}` }], tools: change === "tools-shrink" ? [echoTool, other] : [echoTool] }
   const events = (await readSSE(await callFetch(first))).events
   const old = inits().at(-1)
+  const before = inits().length
   const second = continuation(first, events, "completed-before-change")
-  if (change === "tools") {
-    second.tools = [...second.tools, { name: "other", input_schema: { type: "object" } }]
+  if (growing) {
+    second.tools = [...second.tools, other]
     second.messages.push({ role: "user", content: [{ type: "text", text: "<system-update>tool catalog changed</system-update>" }] })
-  } else second.model = legacyModel
+    if (change === "tools-steering") second.messages.at(-1).content.push({ type: "text", text: "Use the new tool after this instruction." })
+  } else if (change === "tools-shrink") second.tools = [echoTool]
+  else second.model = legacyModel
   const final = (await readSSE(await callFetch(second))).events
   const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === old.convId).at(-1)
-  if (change === "tools") {
+  if (growing) {
     const replay = lastOf("user")
-    check("tool growth replays once in a new session", stopOf(final) === "end_turn" && replay.convId !== old.convId && replay.text.includes("completed-before-change") && replay.text.includes("tool catalog changed"))
-    check("old tool result is not delivered twice", !logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("completed-before-change")))
-    check("new tool is present for replay", inits().at(-1)?.tools?.some(tool => tool.name === "other"))
+    check(`${change}: growth replays exactly once in a new session`, stopOf(final) === "end_turn" && inits().length === before + 1 && replay.convId !== old.convId && replay.text.includes("completed-before-change") && replay.text.includes("tool catalog changed"))
+    check(`${change}: old tool result is not delivered twice`, !logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("completed-before-change")))
+    check(`${change}: new tool is present for replay`, inits().at(-1)?.tools?.some(tool => tool.name === "other"))
+  } else if (change === "tools-shrink") {
+    check("tool catalog shrink preserves the live pending turn", stopOf(final) === "end_turn" && inits().length === before && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
   } else {
     check("live model change continues the pending turn", stopOf(final) === "end_turn" && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
     const next = (await readSSE(await callFetch({ ...nextTurn(second, final, "MODEL next prompt"), model: legacyModel }))).events

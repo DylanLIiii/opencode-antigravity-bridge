@@ -159,6 +159,10 @@ function saveState() {
 }
 
 async function invoke(name, args) {
+  if (activePrompt?.known && !activePrompt.known.has(name)) {
+    log({ type: "unknownTool", convId: session.id, name })
+    throw new Error("tool not in prompt snapshot")
+  }
   update({ sessionUpdate: "tool_call", toolCallId: "call_" + (++nextMcpId), name: "mcp_ide-tools_" + name, status: "in_progress", kind: "other", rawInput: args })
   log({ type: "mcpPending", convId: session.id, name, arguments: args })
   let result
@@ -346,6 +350,7 @@ async function prompt(params, recorded = false) {
     chunk("partial slow answer")
     await new Promise(resolve => { cancelWaiter = resolve })
     log({ type: "cancelled", convId: session.id })
+    if (text.includes("LATE_STORE_CANCEL")) setTimeout(() => { recordModelCall({ input: 99000, output: 900 }); log({ type: "lateStoreWrite", convId: session.id, sqlite: !!sqliteOpen }) }, 350)
     return text.includes("RATIO_CANCEL") ? { stopReason: "cancelled", usage: { inputTokens: 10000, cachedReadTokens: 5000, outputTokens: 10, totalTokens: 15010 } } : { stopReason: "cancelled" }
   }
   if (text.includes("AGENTERROR")) {
@@ -503,7 +508,7 @@ async function prompt(params, recorded = false) {
     return finish("Before skill.\nAfter skill.\n")
   }
   if (text.includes("TOOLSEARCHCALL")) {
-    await invoke("ToolSearch", { query: "select:WebFetch" })
+    if (!text.includes("<conversation_history>")) await invoke("ToolSearch", { query: "select:WebFetch" })
     if (text.includes("use loaded tool")) {
       if (!tools.some(tool => tool.name === "WebFetch")) throw new Error("Loaded WebFetch missing from catalog")
       await invoke("WebFetch", { url: "https://example.com" })
@@ -532,6 +537,12 @@ async function prompt(params, recorded = false) {
     session.cutOff = text.includes("CUTOFF_ALWAYS") ? "always" : "once"
     chunk("part one, ")
     return { stopReason: "max_tokens", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } }
+  }
+  if (text.includes("LATE_STORE_NEXT")) {
+    await new Promise(resolve => setTimeout(resolve, 450))
+    await invoke("echo", { text: "late store next" })
+    chunk("late store done")
+    return finish("late store done")
   }
   if (text.includes("MEASURED_INFLATED")) {
     // One call whose recorded prompt wildly exceeds ACP's total for the turn.
@@ -585,6 +596,10 @@ async function prompt(params, recorded = false) {
     chunk("Step two.\n")
     // ACP reports one accumulated total for both model steps of this prompt.
     return finish("Step one.\nStep two.\n", { input: 9000 })
+  }
+  if (text.includes("TOOL live configuration tools") && text.includes("<conversation_history>")) {
+    chunk("Tool growth replay completed.")
+    return finish("Tool growth replay completed.")
   }
   if (text.includes("TOOL")) {
     chunk("Before tool.\n")
@@ -721,7 +736,7 @@ async function handle(message) {
         // Acceptance is not completion: the original prompt keeps streaming.
         return { stopReason: "end_turn" }
       }
-      const context = { steers: [], delivering: false }
+      const context = { steers: [], delivering: false, known: new Set(tools.map(tool => tool.name)) }
       activePrompt = context
       const result = await prompt(params)
       const drain = async () => {
@@ -1763,11 +1778,13 @@ for (const change of ["tools", "model"]) {
   } else second.model = legacyModel
   const final = (await readSSE(await callFetch(second))).events
   const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === old.convId).at(-1)
-  check(`live ${change} change continues the pending turn`, stopOf(final) === "end_turn" && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
   if (change === "tools") {
-    check("live tool change reaches agy", logs().some(event => event.type === "toolsList" && event.convId === old.convId && event.tools.includes("other")))
-    check("system update reaches the pending MCP result", delivered?.result?.content?.some(part => part.text?.includes("tool catalog changed")))
+    const replay = lastOf("user")
+    check("tool growth replays once in a new session", stopOf(final) === "end_turn" && replay.convId !== old.convId && replay.text.includes("completed-before-change") && replay.text.includes("tool catalog changed"))
+    check("old tool result is not delivered twice", !logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("completed-before-change")))
+    check("new tool is present for replay", inits().at(-1)?.tools?.some(tool => tool.name === "other"))
   } else {
+    check("live model change continues the pending turn", stopOf(final) === "end_turn" && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
     const next = (await readSSE(await callFetch({ ...nextTurn(second, final, "MODEL next prompt"), model: legacyModel }))).events
     check("live model change applies to the next prompt", stopOf(next) === "end_turn" && lastOf("user").model === "gemini-test-low" && lastOf("user").convId === old.convId)
   }
@@ -2196,6 +2213,25 @@ for (const location of ["inline", "system", "developer", "user"]) {
   check("cancelled prompt teaches its cache ratio to next tool step", stopOf(events) === "tool_use" && inits().length === before + 1 && usage?.cache_read_input_tokens === Math.round(window / 3), JSON.stringify(usage))
   await readSSE(await callFetch(continuation(next, events, "cancel ratio result")))
   delete process.env.AGY_BRIDGE_STEP_USAGE
+}
+
+{
+  const body = { model, tools: [echoTool], metadata: { user_id: "late-store-cancel" }, messages: [{ role: "user", content: "SLOW LATE_STORE_CANCEL" }] }
+  const response = await callFetch(body)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 150))
+  const next = { ...body, messages: [...body.messages, { role: "assistant", content: [{ type: "text", text: "partial slow answer" }] }, { role: "user", content: "LATE_STORE_NEXT" }] }
+  const events = (await readSSE(await callFetch(next))).events
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("cancelled late SQLite row cannot contaminate next prompt", stopOf(events) === "tool_use" && lastOf("lateStoreWrite")?.sqlite === true && usage?.input_tokens < 10000 && usage?.output_tokens < 900, JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(next, events, "late row ignored")))
 }
 
 {
@@ -2670,24 +2706,25 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const searchFinal = (await readSSE(searchRes)).events
   const searchDelivered = logs().filter(event => event.type === "mcpResult" && event.convId === searchConv).at(-1)
   const searchText = searchDelivered?.result?.content?.map(part => part.text).join("\n") || ""
-  check("ToolSearch tool_reference and Tool loaded. companion continue live turn",
-    searchRes.status === 200 && stopOf(searchFinal) === "tool_use" && inits().length === beforeSearch &&
-    searchText.includes("Loaded tool: WebFetch") && searchText.includes("Tool loaded."), searchText)
+  const searchReplay = lastOf("user")
+  check("ToolSearch growth replays the result once in a new session",
+    searchRes.status === 200 && stopOf(searchFinal) === "tool_use" && inits().length === beforeSearch + 1 &&
+    searchReplay.convId !== searchConv && searchReplay.text.includes("Loaded tool: WebFetch") && !searchText.includes("Loaded tool: WebFetch"), searchReplay.text)
   check("schema-less ToolSearch exposes usable search parameters",
     inits().at(-1)?.tools?.find(tool => tool.name === "ToolSearch")?.inputSchema?.properties?.query?.type === "string")
-  check("loaded deferred tool is callable after catalog refresh in the same turn",
+  check("loaded deferred tool is callable only after replay",
     toolCall(searchFinal)?.name === "WebFetch" && toolCall(searchFinal)?.input?.url === "https://example.com" &&
-    logs().some(event => event.type === "toolsList" && event.reason === "list_changed" && event.convId === searchConv && event.tools.includes("WebFetch")))
+    !logs().some(event => event.type === "unknownTool" && event.convId === searchConv))
   const searchThird = continuation(searchSecond, searchFinal, "Fetched example successfully")
   const loadedEvents = (await readSSE(await callFetch(searchThird))).events
   check("loaded tool result completes the original search turn",
-    stopOf(loadedEvents) === "end_turn" && inits().length === beforeSearch &&
-    logs().some(event => event.type === "mcpResult" && event.convId === searchConv && event.name === "WebFetch" && event.result?.content?.some(part => part.text?.includes("Fetched example successfully"))))
+    stopOf(loadedEvents) === "end_turn" && inits().length === beforeSearch + 1 &&
+    logs().some(event => event.type === "mcpResult" && event.convId === searchReplay.convId && event.name === "WebFetch" && event.result?.content?.some(part => part.text?.includes("Fetched example successfully"))))
   const afterSearch = nextTurn(searchThird, loadedEvents, "MEMORY after tool search")
   const afterSearchRes = await callFetch(afterSearch)
   await readSSE(afterSearchRes)
   check("turn after ToolSearch tool_reference reuses the live session",
-    afterSearchRes.status === 200 && inits().length === beforeSearch)
+    afterSearchRes.status === 200 && inits().length === beforeSearch + 1)
 }
 
 {
@@ -3468,7 +3505,7 @@ for (const steering of [false, true]) {
     check("lineage sibling prompt runs independently instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
     check("lineage replacement replays only the client's branch", inits().length === before + 1 && lastOf("user").convId !== old.convId && lastOf("user").text.includes("continue main without recap") && !lastOf("user").text.includes("PARALLEL recap branch"))
     const forks = events.filter(event => event.action === "isolated" && event.reason === "lineage_fork")
-    check("lineage isolation emits one content-free event", forks.length === 1 && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"))
+    check("lineage isolation emits one content-free event", forks.length === 1 && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"), JSON.stringify(forks))
     check("lineage isolation keeps the old process and its MCP sockets alive", fs.existsSync(old.cwd) && replies.length === 0)
     const resumed = await drive(recap, orphan, "original branch result")
     check("original branch still accepts its live results after a sibling completes", stopOf(resumed.events) === "end_turn" &&
@@ -3515,7 +3552,7 @@ for (const steering of [false, true]) {
     continued[i] = continuation(requests[i], pending[i], `result for branch ${i}`)
     // Replay just this isolated owner while the other two siblings still wait.
     if (i === 1) continued[i].messages.at(-1).content.push({ type: "text", text: "queued branch instruction" })
-    if (i === 2) continued[i].tools = [echoTool, { ...echoTool, name: "extraBranchTool" }]
+    if (i === 2) continued[i].tools = [{ ...echoTool, description: "Updated branch tool" }]
     if (i === 3) {
       continued[i].messages.at(-2).content.find(block => block.type === "tool_use").id = "toolu_renamed_isolated_branch"
       continued[i].messages.at(-1).content[0].tool_use_id = "toolu_renamed_isolated_branch"
@@ -3750,7 +3787,7 @@ for (const steering of [false, true]) {
     const pending = (await readSSE(await fetchAccepting(first))).events
     const owner = inits().at(-1)
     const continued = continuation(first, pending, "accepted result survives catalog wait")
-    continued.tools = [echoTool, { name: "delayed_other", input_schema: { type: "object" } }]
+    continued.tools = [{ ...echoTool, description: "Updated while result is pending" }]
     for (const block of continued.messages.at(-2).content) if (block.type === "tool_use") block.id = `renamed-${block.id}`
     for (const block of continued.messages.at(-1).content) block.tool_use_id = `renamed-${block.tool_use_id}`
     const accepting = fetchAccepting(continued)

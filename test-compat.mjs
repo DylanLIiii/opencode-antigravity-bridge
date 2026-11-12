@@ -17,12 +17,12 @@ const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
 source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(new URL("./package.json", entry).pathname))
-source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute };\n"
+source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels };\n"
 fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts };\n")
 const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
-const { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+const { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 
 test("reclaimed routing is bounded, expires and rejects ambiguous or incompatible owners", () => {
   const history = [{ role: "user", content: "opening" }, { role: "assistant", content: [
@@ -47,6 +47,20 @@ test("reclaimed routing is bounded, expires and rejects ambiguous or incompatibl
     assert.equal(matchingReclaimedRoute("family-0", opts), undefined)
     assert.equal(matchingReclaimedRoute("family-128", opts)?.key, "family-128")
   } finally { reclaimedRoutes.clear() }
+})
+
+test("conversation key and history distinguish users, openings and tool names", () => {
+  const base = { metadata: { user_id: "user-a" }, system: "Today: 2026-11-12", messages: [{ role: "user", content: "opening" }] }
+  const key = conversationKey(base)
+  assert.notEqual(conversationKey({ ...base, metadata: { user_id: "user-b" } }), key)
+  assert.notEqual(conversationKey({ ...base, messages: [{ role: "user", content: "changed" }] }), key)
+  const tool = { ...base, messages: [{ role: "user", content: "opening" }, { role: "assistant", content: [{ type: "tool_use", id: "toolu_0123456789abcdef01234567", name: "Read", input: { path: "a" } }] }] }
+  assert.notEqual(historyKey(tool.messages), historyKey([{ ...tool.messages[0] }, { role: "assistant", content: [{ ...tool.messages[1].content[0], name: "Write" }] }]))
+})
+
+test("probe failure is bounded and does not throw", async () => {
+  const result = await probeOfferedModels("/definitely/missing/agy", { key: "default", dir: null })
+  assert.equal(result, null)
 })
 
 test("process capacity and detached grace use defaults for invalid overrides", () => {

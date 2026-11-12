@@ -24,3 +24,12 @@ test('inferred array items preserve resolved refs and sanitize nested patterns',
   assert.equal(pattern.items.pattern, undefined)
   assert.match(pattern.items.description, /pattern/)
 })
+
+test('explicit untyped array items retain non-string JSON types', () => {
+  for (const items of [{}, true, {description:'anything'}, {pattern:'(?<=x)y'}]) {
+    const result = sanitizeInputSchema({type:'array',items})
+    const types = result.items.anyOf.map(item => item.type)
+    for (const type of ['string','number','boolean','object','null','array']) assert.ok(types.includes(type), `${type}: ${JSON.stringify(result.items)}`)
+    if (items?.pattern) { assert.equal(result.items.pattern, undefined); assert.match(result.items.description, /pattern/) }
+  }
+})

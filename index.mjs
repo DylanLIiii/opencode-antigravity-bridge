@@ -5322,7 +5322,9 @@ export const AntigravityBridgePlugin = async () => {
                   }
                   if (!interrupted) proc.validateResults(results)
                   const sameSession = historyMatches && proc.workDir === workDir && sameInstructions(proc.instructions, instructions)
-                  const canSteer = interrupted && sameSession && !proc.dead &&
+                  const knownTools = new Set(proc.tools.map(tool => tool.name))
+                  const toolsGrew = tools.some(tool => !knownTools.has(tool.name))
+                  const canSteer = interrupted && !toolsGrew && sameSession && !proc.dead &&
                     turn.calls.every(call => call.result || rawResults.some(item => item.call === call))
                   // Answered IDs remain registered for duplicate validation,
                   // but a request ending at an earlier step cannot replace the
@@ -5349,7 +5351,7 @@ export const AntigravityBridgePlugin = async () => {
                     if (promptHasImage(content) && !proc.supportsImages) throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
                     const next = await proc.steerTurn(turn, rawResults, content, body, model, selection, claim(), promptGuardMatched, init.signal)
                     return streamResponse(proc, next, body, init.signal)
-                  } else if (interrupted || !historyMatches ||
+                  } else if (interrupted || !historyMatches || toolsGrew ||
                     proc.workDir !== workDir || !sameInstructions(proc.instructions, instructions)) {
                     if (replayHistoryProblem(body, resultBlocks)) {
                       throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
@@ -5443,7 +5445,10 @@ export const AntigravityBridgePlugin = async () => {
         const out = {}
         await Promise.all(accounts.map(async account => {
           const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)
-          const offered = agy ? await probeOfferedModels(agy, account) : null
+          const offered = agy ? await Promise.race([
+            probeOfferedModels(agy, account),
+            new Promise(resolve => setTimeout(() => resolve(null), 500)),
+          ]) : null
           const offeredIds = new Set((offered || []).map(item => item.id))
           const available = offered ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : catalog.models.filter(item => /^gemini-/i.test(item.id))
           const covered = new Set(available.flatMap(item => [item.id, ...[...(catalog.routes.get(item.id)?.byEffort?.values() || [])]]))

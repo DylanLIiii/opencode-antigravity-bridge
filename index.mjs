@@ -4855,16 +4855,23 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             return
           }
           if (event.type === "error") {
+            if (finished) return
             // A long-lived agy whose OAuth token expired mid-session fails the
             // very first model call with 401. Nothing has been streamed yet,
             // so retire it and replay on a fresh process (which reloads the
             // refreshed token file) once, instead of failing the turn.
             if (retryInitialAuth && blockIndex === 0 && !open && !responseContent.length &&
-              !turn.calls.length && event.error?.code === "upstream_unauthenticated") {
+              turn.promptCount === 1 && !turn.calls.length && event.error?.code === "upstream_unauthenticated") {
               const retryFn = retryInitialAuth
               retryInitialAuth = null
               try {
                 const next = await retryFn(proc, turn)
+                if (next && finished) {
+                  dropFromPool(next.proc)
+                  next.proc.abandonTurn(next.turn)
+                  await next.proc.stop().catch(() => {})
+                  return
+                }
                 if (next) {
                   proc = next.proc
                   turn = next.turn
@@ -5487,11 +5494,20 @@ export const AntigravityBridgePlugin = async () => {
                   promptAttempt = null
                 }
                 claim()
-                const fresh = await acquireProc(agy, convKey, acquireOpts, isFresh, false)
-                const freshTurn = await begin(fresh.proc, fresh.history)
-                freshTurn.attach()
-                const freshStep = freshTurn.registerResponse(body)
-                return { proc: fresh.proc, turn: freshTurn, step: freshStep }
+                let freshTurn = null
+                try {
+                  const fresh = await acquireProc(agy, convKey, acquireOpts, isFresh, false)
+                  freshTurn = await begin(fresh.proc, fresh.history)
+                  freshTurn.attach()
+                  const freshStep = freshTurn.registerResponse(body)
+                  return { proc: fresh.proc, turn: freshTurn, step: freshStep }
+                } catch (retryError) {
+                  // The new claim never reached agy; release it so an identical
+                  // retry is not rejected as "already being acquired or running".
+                  if (freshTurn) freshTurn.proc.abandonTurn(freshTurn)
+                  if (promptAttempt && !promptAttempt.submitted) releasePromptAttempt(promptAttempt)
+                  throw retryError
+                }
               }
               return streamResponse(proc, turn, body, init.signal, retryInitialAuth)
             } catch (error) {

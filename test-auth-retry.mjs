@@ -89,6 +89,11 @@ if (argv[0] === "acp" && argv.includes("--login")) {
     const msg = JSON.parse(line)
     const p = msg.params || {}
     try {
+      if (msg.method === "initialize" && fs.existsSync(stateFile("fail-init-once"))) {
+        fs.unlinkSync(stateFile("fail-init-once"))
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "synthetic fresh initialize failure" } })
+        return
+      }
       if (msg.method === "initialize") {
         send({
           jsonrpc: "2.0", id: msg.id,
@@ -114,6 +119,10 @@ if (argv[0] === "acp" && argv.includes("--login")) {
           return
         }
         session = { id, step: 0 }
+        if (msg.method === "session/resume" && fs.existsSync(stateFile("slow-resume"))) {
+          log({ type: "slow-resume-start", pid: process.pid })
+          await new Promise((r) => setTimeout(r, 400))
+        }
         await connectIde()
         log({ type: msg.method, pid: process.pid, sessionId: id, systemAppend: p._meta?.antigravity?.systemPrompt?.append ?? "" })
         send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: id, models: { currentModelId: "gemini-4-carbon-high", availableModels: [] }, configOptions: [] } })
@@ -128,6 +137,17 @@ if (argv[0] === "acp" && argv.includes("--login")) {
         const text = (p.prompt || []).map((b) => b.text || "").join("")
         log({ type: "prompt", pid: process.pid, sessionId: session.id, text })
 
+        if (text.includes("EMPTY_THEN_401") && session.step === 1) {
+          send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "max_tokens" } })
+          return
+        }
+        if (text.includes("VISIBLE_THEN_401") || (text.toLowerCase().includes("continue") && fs.existsSync(stateFile("continuation-401")))) {
+          if (text.includes("VISIBLE_THEN_401")) chunk("Already visible")
+          fs.appendFileSync(agentLog, "E1111 22:00:00.000000 100 errorreport.go:224] agent executor error: UNAUTHENTICATED (code 401): token revoked.\n")
+          chunk("\n⚠ Agent execution terminated due to error.\n")
+          send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } })
+          return
+        }
         if (fs.existsSync(stateFile("fail-401-once"))) {
           fs.unlinkSync(stateFile("fail-401-once"))
           fs.appendFileSync(agentLog, "E1111 22:00:00.000000 100 errorreport.go:224] agent executor error: generating and executing: UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n")
@@ -228,6 +248,68 @@ test("stale-proc OAuth 401 retires stale proc, re-parks pre-turn history, sessio
     })
     assert.equal(t3.status, 502)
     assert.equal(t3.json.error?.code, "upstream_unauthenticated")
+    const t3Prompts = readLogs().filter((e) => e.type === "prompt" && e.text.includes("Brand new conversation with revoked Google login"))
+    assert.equal(t3Prompts.length, 2, "a second 401 never triggers a third prompt")
+    fs.unlinkSync(path.join(stateDir, "fail-401-always"))
+
+    const beforeVisible = readLogs().length
+    const visible = await postJson({ messages: [{ role: "user", content: "VISIBLE_THEN_401" }] })
+    assert.equal(visible.status, 502)
+    assert.equal(readLogs().slice(beforeVisible).filter((e) => e.type === "prompt").length, 1, "visible output prevents replay")
+
+    fs.writeFileSync(path.join(stateDir, "continuation-401"), "1")
+    const beforeContinuation = readLogs().length
+    const continuation = await postJson({ messages: [{ role: "user", content: "EMPTY_THEN_401" }] })
+    assert.equal(continuation.status, 502)
+    assert.equal(readLogs().slice(beforeContinuation).filter((e) => e.type === "prompt").length, 2, "a failed continuation does not replay the initial prompt")
+
+    // A failed fresh-process rebuild must release its new prompt claim.
+    fs.unlinkSync(path.join(stateDir, "continuation-401"))
+    const initHistory = [{ role: "user", content: "INIT_FAIL_WARM" }]
+    const initWarm = await postJson({ messages: initHistory })
+    assert.equal(initWarm.status, 200)
+    const initBody = [...initHistory, { role: "assistant", content: initWarm.json.content }, { role: "user", content: "INIT_FAIL_RETRY" }]
+    fs.writeFileSync(path.join(stateDir, "fail-401-once"), "1")
+    fs.writeFileSync(path.join(stateDir, "fail-init-once"), "1")
+    const initFailed = await postJson({ messages: initBody })
+    assert.equal(initFailed.status, 502)
+    assert.match(initFailed.json.error?.message ?? "", /synthetic fresh initialize failure/)
+    const initRetry = await postJson({ messages: initBody })
+    assert.equal(initRetry.status, 200, `identical retry is not blocked: ${JSON.stringify(initRetry.json)}`)
+    fs.writeFileSync(path.join(stateDir, "continuation-401"), "1")
+
+    // Cancel while the fresh process is still being rebuilt after the 401.
+    fs.unlinkSync(path.join(stateDir, "continuation-401"))
+    const cancelHistory = [
+      { role: "user", content: "CANCEL_WARM" },
+    ]
+    const warm = await postJson({ messages: cancelHistory })
+    assert.equal(warm.status, 200)
+    fs.writeFileSync(path.join(stateDir, "fail-401-once"), "1")
+    fs.writeFileSync(path.join(stateDir, "slow-resume"), "1")
+    const ac = new AbortController()
+    const cancelBody = [...cancelHistory, { role: "assistant", content: warm.json.content }, { role: "user", content: "CANCEL_DURING_REBUILD" }]
+    const beforeCancel = readLogs().length
+    const pending = loader.fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: ac.signal,
+      body: JSON.stringify({ model: "gemini-4-carbon", max_tokens: 1024, stream: false, messages: cancelBody }),
+    }).then((r) => r.text(), (e) => `ERR:${e?.name ?? e}`)
+    const deadline = Date.now() + 5000
+    while (!readLogs().slice(beforeCancel).some((e) => e.type === "slow-resume-start") && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.ok(readLogs().slice(beforeCancel).some((e) => e.type === "slow-resume-start"), "fresh process rebuild started")
+    ac.abort(new Error("client cancelled"))
+    await pending
+    await new Promise((r) => setTimeout(r, 900))
+    const after = readLogs().slice(beforeCancel)
+    assert.equal(after.filter((e) => e.type === "prompt" && e.text.includes("CANCEL_DURING_REBUILD")).length, 1,
+      "no prompt is submitted on the fresh process after cancellation")
+    fs.unlinkSync(path.join(stateDir, "slow-resume"))
+    const followUp = await postJson({ messages: [...cancelBody, { role: "assistant", content: [{ type: "text", text: "x" }] }, { role: "user", content: "after cancel" }] })
+    assert.notEqual(followUp.json?.error?.message?.includes("unfinished response"), true, "no attached/unfinished turn left behind")
   } finally {
     try { fs.unlinkSync(path.join(stateDir, "fail-401-always")) } catch {}
     fs.rmSync(tmpRoot, { recursive: true, force: true })

@@ -76,7 +76,7 @@ magpie plugin add ./opencode-antigravity-bridge
 #    已接入时点击「添加另一个 Antigravity Bridge 账号」，再选择「新增 Google 账号」
 # 3. 填写名称（例如 work），在浏览器完成 Google 登录，
 #    把最终回调页面的完整 URL 或授权码粘贴回 Magpie
-# 4. 选择 work/<模型>（可选思考等级），开始对话
+# 4. 在账号列表选择 work，选择普通模型（可选思考等级），开始对话
 ```
 
 ### 账号管理入口
@@ -91,11 +91,14 @@ magpie plugin add ./opencode-antigravity-bridge
 | 导入账号 | 将已有配置目录或 token 文件导入为一个新名称的账号 |
 | 批量导入账号 | 从 JSON 清单一次导入多个账号 |
 | 新增 Google 账号 | 在浏览器登录 Google，保存为一个新名称的账号 |
+| 使用已保存的 Bridge 账号 | 将旧版本或 CLI 已保存的账号登记到 Magpie，无需重新登录 Google |
 
 新增和导入都会保留已有账号；名称已被使用时会拒绝操作，请换一个名称。
-插件中的 Google 账号按名称独立保存，使用 `<账号>/<模型>` 选择对应账号。
-Magpie 中保留一条 Bridge 连接记录；新增和导入完成后，宿主会按同一个 `agy`
-标记合并连接记录，不会因为新增 Google 账号而增加重复连接。
+Magpie 中每个账号独立显示一行，共用不带账号前缀的模型 ID。可在账号列表设为首选、启用或关闭，
+并使用 Magpie 的账号路由规则。会话、进程和额度按所选账号隔离。
+从 0.6.x 升级时，原默认 CLI 账号保留；对已有的每个命名账号，选择「使用已保存的 Bridge 账号」并填写
+原名称（例如 `Yazi`），不需要再次 Google 授权。刷新模型目录后移除旧的账号前缀型号，保留普通型号。
+删除 Magpie 中的账号登记不会删除其配置目录；重新登记即可恢复，不会在重启时自动恢复被移除的登记。
 WSL 模式仅支持使用发行版内已有的 CLI 登录，不提供命名账号的新增或导入选项。
 
 客户端侧零配置：不需要改全局 MCP 配置，插件为每个 agy 进程创建隔离的临时
@@ -133,10 +136,10 @@ Google Code Assist 后端
 插件在隐藏临时目录里运行官方 `agy acp --login`，完整回调 URL 会先校验来源、路径
 及本次登录的 state，授权码再通过 stdin 交给原 agy 进程。PKCE、换取 token 和之后
 的刷新均由 agy 处理。只有 agy 成功退出、保存了含 refresh token 的文件、且独立
-`agy models` 检查通过，才通过导入后端发布账号并清除模型缓存。选择 `<名称>/<模型>`
-即可使用该账号独立的 ACP 进程池。
+`agy models` 检查通过，才通过导入后端发布账号并清除模型缓存。Magpie 的账号列表随后出现该名称，
+请求使用宿主选中的账号及其独立 ACP 进程池。
 
-凭据仅保存在 Bridge 的账号目录，Magpie 账户存储里仍是 `agy` 标记；不会切换全局
+凭据仅保存在 Bridge 的账号目录，Magpie 账户存储里只有本地账号引用；不会切换全局
 登录态或覆写已有同名账号。登录进程强制使用文件存储，POSIX 上目录为 `0700`、
 发布的 token 为 `0600`；Windows 的文件权限要求见下方。一次登录最多等待 10 分钟；
 新的登录会清理上次未完成的流程。取消开始或完成步骤会立即清理；关闭等待粘贴的
@@ -151,9 +154,10 @@ agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
 ```
 
 登录产生的 `antigravity-cli/antigravity-oauth-token` 会落在该目录里。之后每个
-账号的模型都会以 `<名称>/<模型id>`（显示名带 `[名称]` 前缀）出现在 magpie 模型
-选择器里，选哪个就走哪个账号；会话、进程、快照和额度都按账号隔离。默认账号
-（agy 自己的全局登录态，模型不带前缀）始终保留。要求 agy 支持 `--gemini_dir`
+账号在 Magpie 中登记后独立列出，模型列表共用普通模型 ID。手动准备的目录需要通过
+「使用已保存的 Bridge 账号」登记。默认账号（agy 自己的全局登录态）始终保留。
+直接使用 OpenCode 时仍可通过 `<名称>/<模型id>`（显示名带 `[名称]` 前缀）选择账号。
+要求 agy 支持 `--gemini_dir`
  且账号使用文件 token 登录态——钥匙串/ADC 登录态是整机全局的，无法按目录隔离。
 
 **导入账号**：除了在配置目录里登录，也可以导入已有的 agy 登录——在账号管理操作中选
@@ -169,10 +173,12 @@ agy-bridge accounts list
 
 导入只复制 `antigravity-cli/antigravity-oauth-token`（`0600`，目录 `0700`）到
 `<账号根目录>/<名称>/`，之后仍由 agy 自己刷新。已存在的账号绝不覆盖（换个名称即可）；
-清单会先整体校验再写入，批量导入要么全成功要么全不变；token 不会被打印。导入后刷新
-模型目录。Magpie 自带的 `magpie accounts import antigravity` 是另一套内置账号存储，
+清单会先整体校验，配置文件的批量复制要么全成功要么全不变；token 不会被打印。Magpie UI 导入还会登记
+各账号。如果宿主登记中断，配置目录仍保留，可通过「使用已保存的 Bridge 账号」补齐登记。
+CLI 导入后也需要在 Magpie 登记已有账号。Magpie 自带的 `magpie accounts import antigravity` 是另一套内置账号存储，
 不会流入本插件。
-刷新模型目录会重新扫描账号目录。
+刷新模型目录会检查对应账号的配置；已移除或无效的命名账号不会改用默认账号。
+旧 `<账号>/<模型>` 请求只在与 Magpie 所选账号一致时兼容，请将路由分组及客户端配置改为普通模型 ID。
 
 **Windows 文件登录态**：原生 Windows 上 agy 把默认登录放在 Windows 凭据管理器
 （整机只有一个 `gemini:antigravity` 条目）。只跑
@@ -319,7 +325,7 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
   这些路径已有自动化测试；维护者尚未完成 Windows 实机验证。
 - **账号**：默认一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
   `authenticate` 去切换登录。需要多账号时使用上方"多账号"小节的
-  `--gemini_dir` 隔离方案（模型名 `<账号>/<模型id>` 前缀路由）。Windows 上
+  `--gemini_dir` 隔离方案（Magpie 使用原生账号行，OpenCode 使用 `<账号>/<模型id>` 前缀）。Windows 上
   命名账号还需要该小节的"文件登录态"开关，否则 agy 会读取整机全局的凭据管理器。
 - **Prompt Guard**：默认开启，仅处理 system 中的独立计费元数据和已知 Agent SDK
   身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭。不会全局替换厂商名称或清洗 user 正文。

@@ -196,6 +196,7 @@ function loginEnvironment(stage, inherited, platform) {
 
 export function createAccountLoginMethod(findAgy, {
   env = process.env, platform = process.platform, spawnProcess = spawn, onImport = () => {},
+  resultForAccount = () => ({ type: "success", key: "agy" }),
   urlTimeoutMs = 45_000, finishTimeoutMs = 120_000, probeTimeoutMs = 15_000, loginTimeoutMs = 10 * 60_000,
 } = {}) {
   let pending = null
@@ -326,7 +327,7 @@ export function createAccountLoginMethod(findAgy, {
               if (finishSignal?.aborted || controller.signal.aborted || attempt !== generation) throw new LoginError(CANCELLED)
               importAccount(name, profile, signInEnv)
               onImport()
-              return { type: "success", key: "agy" }
+              return resultForAccount(name)
             } catch (error) { return failed(error) }
             finally {
               clearTimeout(finishTimer)

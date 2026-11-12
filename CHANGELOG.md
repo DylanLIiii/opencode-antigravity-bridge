@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0
+
+- Expose named Google profiles as separate native Magpie account rows sharing ordinary model IDs. Bind requests, model discovery, sessions and quota to the account selected by Magpie, enabling its existing account preferences and routing.
+- Add “Use a saved Bridge account” to register existing profiles without Google authorization. Keep the original `agy` default account and all profile credentials; signing out removes only the host registration. UI imports and Google sign-in now register individual native accounts, including manifest imports.
+- Fail closed when a selected profile is missing, its reference is invalid, or a legacy model prefix names another account. Keep account-prefixed catalogs for OpenCode and default-account-only behavior for Windows-to-WSL mode.
+
 ## 0.6.5
 
 - Fix #49: raise the default `AGY_BRIDGE_TURN_TIMEOUT_MS` from 2 to 10 minutes, so a large tool call that agy generates silently (for example a ~40 KB `Write`) is no longer cut off at 120 seconds. The cost is slower stall detection: a truly silent or metadata-only turn now fails after 10 minutes. The bridge still cannot detect tool-argument generation progress, and clients or gateways keep their own deadlines. Explicit overrides, the 30-minute tool-result wait, cancellation cleanup and the no-replay rule for submitted prompts are unchanged.

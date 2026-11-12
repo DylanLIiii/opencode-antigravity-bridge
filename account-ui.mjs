@@ -16,6 +16,10 @@ export const ACCOUNT_ACTIONS = {
     label: "Add a Google account",
     labels: { zh: "新增 Google 账号", "zh-TW": "新增 Google 帳號", ja: "Google アカウントを追加", de: "Google-Konto hinzufügen" },
   },
+  saved: {
+    label: "Use a saved Bridge account",
+    labels: { zh: "使用已保存的 Bridge 账号", "zh-TW": "使用已儲存的 Bridge 帳號", ja: "保存済み Bridge アカウントを使用", de: "Gespeichertes Bridge-Konto verwenden" },
+  },
 }
 
 export const ACCOUNT_NAME_PROMPT = {

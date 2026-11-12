@@ -1,7 +1,7 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.6.5",
-  "description": "Connect to Antigravity via the official agy CLI to help reduce account risk from client impersonation. Lean prompts and session reuse cut redundant context and token usage. Multiple Google accounts supported via per-account agy profiles (`<account>/<model>` in the picker).",
+  "version": "0.7.0",
+  "description": "Connect to Antigravity via the official agy CLI with lean prompts and session reuse. Native Magpie accounts share model IDs and use the host account router; OpenCode supports account-prefixed models.",
   "type": "module",
   "main": "./index.mjs",
   "bin": {
@@ -10,6 +10,7 @@
   "files": [
     "index.mjs",
     "accounts.mjs",
+    "native-accounts.mjs",
     "accounts-import.mjs",
     "accounts-login.mjs",
     "account-ui.mjs",
@@ -38,7 +39,7 @@
     "README.en.md"
   ],
   "scripts": {
-    "test": "node --test test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
+    "test": "node --test test-native-accounts.mjs test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [
@@ -54,8 +55,8 @@
   "magpie": {
     "name": "Antigravity Bridge",
     "summary": {
-      "en": "Official agy CLI bridge with lean prompts and session reuse. Native account actions: add a Google account or import accounts. For an existing connection, Add another account opens these actions; existing accounts are kept. Pick `<account>/<model>`.",
-      "zh": "通过官方 agy CLI 接入，精简提示词并复用会话。原生模式支持新增 Google 账号、导入和批量导入。已有连接点「添加另一个账号」打开操作，已有账号会保留；选择 `<账号>/<模型>` 使用对应账号。"
+      "en": "Official agy CLI bridge with lean prompts and session reuse. Magpie lists each account separately with shared model IDs and native account routing. Add Google accounts, import profiles, or register saved Bridge accounts; existing logins are kept.",
+      "zh": "通过官方 agy CLI 接入，精简提示词并复用会话。Magpie 独立显示每个账号，共用模型 ID，支持原生账号切换与路由。可新增 Google 账号、导入配置或登记已保存的 Bridge 账号，保留已有登录。"
     },
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
     "maxConcurrency": 16

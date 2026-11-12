@@ -630,9 +630,13 @@ class AgentTurnError extends Error {
   constructor(message, kind = "api_error", classification = null) {
     super(message)
     this.kind = kind
-    this.keepProcess = true
+    // An expired OAuth token stays expired inside this agy process: it does
+    // not refresh mid-session, so the process is dropped instead of reused.
+    this.keepProcess = classification?.category !== "unauthenticated"
     if (classification) {
-      this.code = classification.reasonCode
+      this.code = classification.category === "unauthenticated"
+        ? "upstream_unauthenticated"
+        : classification.reasonCode
       this.retryable = classification.retryable
       this.retryAfterMs = classification.retryAfterMs
       this.noRetry = !classification.retryable
@@ -4674,7 +4678,7 @@ function thinkingSignature(sessionId, thinking) {
     createHmac("sha256", THINKING_KEY).update(String(sessionId) + "\n" + thinking).digest("base64url")
 }
 
-function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body)) {
+function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body), retryInitialAuth = null) {
   const encoder = new TextEncoder()
   const responseContent = []
   const forwardThinking = FORWARD_THINKING && body.thinking?.type !== "disabled"
@@ -4851,6 +4855,39 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             return
           }
           if (event.type === "error") {
+            if (finished) return
+            // A long-lived agy whose OAuth token expired mid-session fails the
+            // very first model call with 401. Nothing has been streamed yet,
+            // so retire it and replay on a fresh process (which reloads the
+            // refreshed token file) once, instead of failing the turn.
+            if (retryInitialAuth && blockIndex === 0 && !open && !responseContent.length &&
+              turn.promptCount === 1 && !turn.calls.length && event.error?.code === "upstream_unauthenticated") {
+              const retryFn = retryInitialAuth
+              retryInitialAuth = null
+              try {
+                const next = await retryFn(proc, turn)
+                if (next && finished) {
+                  dropFromPool(next.proc)
+                  next.proc.abandonTurn(next.turn)
+                  await next.proc.stop().catch(() => {})
+                  return
+                }
+                if (next) {
+                  proc = next.proc
+                  turn = next.turn
+                  step = next.step
+                  step.contentSnapshot = () => [
+                    ...responseContent,
+                    ...(open ? [open.type === "text"
+                      ? { type: "text", text: open.text }
+                      : { type: "thinking", thinking: open.text }] : []),
+                  ]
+                  continue
+                }
+              } catch (retryErr) {
+                event.error = retryErr
+              }
+            }
             closeBlock()
             clearInterval(pingTimer)
             pingTimer = null
@@ -5038,11 +5075,11 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   })
 }
 
-function streamResponse(proc, turn, body, signal) {
+function streamResponse(proc, turn, body, signal, retryInitialAuth = null) {
   turn.attach()
   const step = turn.registerResponse(body)
   const msgId = "msg_" + randomUUID().replace(/-/g, "").slice(0, 24)
-  const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step)
+  const stream = makeAnthropicStream(proc, turn, body, msgId, signal, step, retryInitialAuth)
   if (body.stream === false) {
     return jsonResponseFromStream(stream, body.model, msgId)
   }
@@ -5441,7 +5478,38 @@ export const AntigravityBridgePlugin = async () => {
                 resultBlocks.length > 0,
               )
               const turn = await begin(proc, history)
-              return streamResponse(proc, turn, body, init.signal)
+              const retryInitialAuth = resultBlocks.length > 0 ? null : async (failedProc, failedTurn) => {
+                failedTurn.detach()
+                failedProc.finalizeTurn(failedTurn)
+                if (history.length > 0 && failedProc.sessionId) {
+                  failedProc.expectedMessages = history.map((m) => ({ ...m }))
+                  failedProc.historyInvalid = false
+                  await retire(failedProc.convKey, failedProc)
+                } else {
+                  dropFromPool(failedProc)
+                  await failedProc.stop().catch(() => {})
+                }
+                if (promptAttempt) {
+                  promptAttempts.delete(promptAttempt.key)
+                  promptAttempt = null
+                }
+                claim()
+                let freshTurn = null
+                try {
+                  const fresh = await acquireProc(agy, convKey, acquireOpts, isFresh, false)
+                  freshTurn = await begin(fresh.proc, fresh.history)
+                  freshTurn.attach()
+                  const freshStep = freshTurn.registerResponse(body)
+                  return { proc: fresh.proc, turn: freshTurn, step: freshStep }
+                } catch (retryError) {
+                  // The new claim never reached agy; release it so an identical
+                  // retry is not rejected as "already being acquired or running".
+                  if (freshTurn) freshTurn.proc.abandonTurn(freshTurn)
+                  if (promptAttempt && !promptAttempt.submitted) releasePromptAttempt(promptAttempt)
+                  throw retryError
+                }
+              }
+              return streamResponse(proc, turn, body, init.signal, retryInitialAuth)
             } catch (error) {
               if (promptAttempt && !promptAttempt.submitted) releasePromptAttempt(promptAttempt)
               return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)

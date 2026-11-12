@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Recover from agy's mid-session OAuth expiry. A long-lived `agy acp` process does not refresh its access token inside a session, so after about an hour its first model call fails with `UNAUTHENTICATED (code 401)` and the turn ends. When that happens before anything is streamed or any tool is called, the bridge now drops the process, parks the session with its pre-turn history, and replays the same request once on a fresh process, which loads the refreshed token file and resumes the same agy session. A second 401 is returned as `upstream_unauthenticated` (502). 401 is classified separately from 403 and is never retried on the same process.
+
 ## 0.6.1
 
 - Clarify the Bridge's native account actions with short localized labels for existing CLI access, single-account import, manifest import and adding a Google account.

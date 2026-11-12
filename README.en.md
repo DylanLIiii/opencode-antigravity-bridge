@@ -601,7 +601,8 @@ Set `AGY_BRIDGE_WSL_DISTRO=<distro>` before starting Magpie on Windows. `AGY_PAT
   changes. The MCP helper answers as a `2025-11-25` server, because agy's
   `2026-07-28` mode expects notifications through `subscriptions/listen`.
 - **Timeouts**: process startup defaults to 60 seconds, model/output inactivity
-  to 120 seconds, and waiting for a client tool result to 30 minutes. Set
+  to 10 minutes (120 seconds before 0.6.5), and waiting for a client tool result
+  to 30 minutes. Set
   `AGY_BRIDGE_START_TIMEOUT_MS`, `AGY_BRIDGE_TURN_TIMEOUT_MS`, or
   `AGY_BRIDGE_TOOL_TIMEOUT_MS` to override them.
 
@@ -626,14 +627,15 @@ titles, plans, usage/status updates, empty chunks, stderr/log retry messages and
 downstream pings cannot extend this window. Waiting for a client tool result
 uses the separate tool deadline; agy's status traffic and repeated polls cannot
 extend a detached client's wait. Slow generation with substantive output can
-continue beyond 120 seconds. A model that emits no output may need a larger explicit
-timeout; raising it also allows agy's internal retries to run longer. In
-particular, agy does not expose reliable progress while generating tool-call
-arguments, so a large `Write` can look idle for over 120 seconds. For such
-workloads, set `AGY_BRIDGE_TURN_TIMEOUT_MS=600000` (10 minutes) in the bridge
-host environment and restart the host; choose a shorter or longer **finite**
-value for your workload. This is a workaround, not detection of tool generation,
-and client or gateway deadlines may still cancel the request sooner.
+continue beyond the limit. agy does not expose reliable progress while generating
+tool-call arguments, so a large `Write` can look idle for several minutes; the
+default is therefore 10 minutes. The cost is slower stall detection: a truly
+stuck turn, or agy's internal retries, can now run up to 10 minutes before
+`upstream_idle_timeout`. The bridge does not detect tool-argument generation;
+the longer default only waits longer. For faster stall detection, set a shorter
+**finite** value such as `AGY_BRIDGE_TURN_TIMEOUT_MS=120000` in the bridge host
+environment and restart the host. Clients and gateways have their own deadlines
+and may still cancel the request sooner.
 
 An upstream inactivity timeout produces an SSE `error` with code
 `upstream_idle_timeout`, or HTTP **504** with the same error for non-streaming
@@ -747,7 +749,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume, submitted-prompt dedupe, and in-memory reclaimed-branch routing retention |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
 | `AGY_BRIDGE_ACCOUNTS_DIR` | `~/.config/magpie-agy-bridge/accounts` | root of named account profiles; each subdirectory with its own `antigravity-cli/antigravity-oauth-token` becomes a `<name>/<model-id>` account |
-| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60000 / 120000 / 1800000 | startup, meaningful agy inactivity, client tool result; positive milliseconds |
+| `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60000 / 600000 / 1800000 | startup, meaningful agy inactivity, client tool result; positive milliseconds |
 | `AGY_BRIDGE_PING_INTERVAL_MS` | 15000 | Anthropic SSE heartbeat interval in positive milliseconds; never renews upstream inactivity |
 | `AGY_BRIDGE_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips automatic quota probes entirely |
 | `AGY_BRIDGE_USAGE_TIMEOUT_MS` | 15000 | quota subprocess budget, capped at 18000 ms |

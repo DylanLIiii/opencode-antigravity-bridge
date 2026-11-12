@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.5
+
+- Fix #49: raise the default `AGY_BRIDGE_TURN_TIMEOUT_MS` from 2 to 10 minutes, so a large tool call that agy generates silently (for example a ~40 KB `Write`) is no longer cut off at 120 seconds. The cost is slower stall detection: a truly silent or metadata-only turn now fails after 10 minutes. The bridge still cannot detect tool-argument generation progress, and clients or gateways keep their own deadlines. Explicit overrides, the 30-minute tool-result wait, cancellation cleanup and the no-replay rule for submitted prompts are unchanged.
+
 ## 0.6.4
 
 - Filter standalone agy retry and terminal notices while preserving quoted model text; corroborate terminal failures with this prompt’s log or an abnormal result.

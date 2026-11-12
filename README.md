@@ -328,15 +328,15 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
   （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。system instructions 只在
   `session/new` 安装，resume 不重复 append；恢复失败保留旧快照。
-- **超时**：启动 60s、agy 无实质输出 120s、等客户端工具结果 30min，可用
-  `AGY_BRIDGE_START_TIMEOUT_MS` / `AGY_BRIDGE_TURN_TIMEOUT_MS` /
+- **超时**：启动 60s、agy 无实质输出 10min（0.6.5 起，原为 120s）、等客户端工具结果
+  30min，可用 `AGY_BRIDGE_START_TIMEOUT_MS` / `AGY_BRIDGE_TURN_TIMEOUT_MS` /
   `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整（正毫秒数）。只有非空正文/思考和真实工具调用/结果
   会更新模型进展；标题、状态、空 chunk、日志重试和 SSE 心跳不会续期。
   工具结果等待使用独立期限。生成工具参数期间 agy 没有可靠的进展信号，大型 `Write`
-  可能静默超过 120 秒；此类任务可在 Bridge 宿主环境设置
-  `AGY_BRIDGE_TURN_TIMEOUT_MS=600000`（10 分钟）并重启宿主，按实际任务选择有限值。
-  这是等待时间的权宜调整，不代表能检测到工具参数生成；客户端或网关仍可能更早超时。
-  超时停止自有进程/工具资源并删除临时目录。
+  可能静默数分钟，因此默认值放宽到 10 分钟。代价是真正卡住的轮次要等更久才报
+  `upstream_idle_timeout`；Bridge 并不能检测工具参数生成进度。需要更快发现停滞时可设置更短的
+  有限值（如 `AGY_BRIDGE_TURN_TIMEOUT_MS=120000`）并重启宿主。客户端或网关有自己的期限，
+  仍可能更早取消请求。超时停止自有进程/工具资源并删除临时目录。
 - **Argon 慢响应**：裸 `gemini-4-argon` 默认选 medium（目录存在该等级时），显式
   high/low 仍有效；其他 family 仍优先 high。此默认值不能修复 agy/Google 上游阻塞。
   流式响应附着回合后立即发送已有的 Anthropic `message_start`，等待输出时每 15s 发

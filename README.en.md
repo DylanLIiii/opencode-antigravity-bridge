@@ -58,7 +58,7 @@ magpie plugin add ./opencode-antigravity-bridge
    account, e.g. `work`.
 2. Follow the browser link, sign in with Google, then paste the full address of
    the final callback page (recommended), or its authorization code, into Magpie.
-3. Pick `work/<model>` and, when offered, a thinking level. Effort-specific IDs from
+3. Select the `work` account in Magpie and pick the ordinary model ID and, when offered, a thinking level. Effort-specific IDs from
    `agy models` are grouped into one model with variants, then mapped back to
    the corresponding agy ID for each request.
 
@@ -74,11 +74,20 @@ the action labels in its selected language:
 | Import an account | Import a profile folder or token file under a new account name |
 | Import accounts from a manifest | Add several named accounts from a JSON manifest |
 | Add a Google account | Sign in through Google and save the account under a new name |
+| Use a saved Bridge account | Register a profile saved by an earlier version or the CLI without another Google sign-in |
 
 Adding and importing keep existing accounts. An occupied name is refused;
-choose another name. The plugin keeps named Google accounts separately; select
-one with `<account>/<model>`. Magpie keeps one Bridge connection: successful
-account actions return the same `agy` sentinel, which the host deduplicates.
+choose another name. Magpie displays each account in its own row, sharing ordinary
+model IDs without account prefixes. Use the host's account preferences, switches
+and routing rules to choose between accounts. Requests, sessions and quota use the
+account selected by Magpie.
+
+When upgrading from 0.6.x, keep the existing default CLI account. For each saved
+named profile, choose **Use a saved Bridge account** and enter its existing name
+(for example `Yazi`). No Google authorization is needed. Refresh the model catalog
+to remove old prefixed model selections and use the ordinary model IDs. Signing
+out removes only the host registration, preserving the profile for later reuse;
+restarts do not automatically restore removed registrations.
 WSL mode supports only the distro's existing CLI login; named-account sign-in
 and imports are not offered there.
 
@@ -93,8 +102,8 @@ exchange, credential format and subsequent refresh.
 The account is published through the import backend only after the CLI exits
 successfully, writes a file credential containing a refresh token, and an isolated
 `agy models` check succeeds. Its model caches are invalidated. Credentials stay in
-the bridge's named-account directory; Magpie's auth store receives only the `agy`
-sentinel. The login forces file storage, and existing accounts are never overwritten.
+the bridge's named-account directory; Magpie's auth store receives only a local
+account reference. The login forces file storage, and existing accounts are never overwritten.
 On POSIX, directories are `0700` and published tokens `0600`; see the Windows
 permission requirements below.
 
@@ -114,13 +123,17 @@ agy --gemini_dir=~/.config/magpie-agy-bridge/accounts/work
 ```
 
 The login writes `antigravity-cli/antigravity-oauth-token` into that directory.
-Every account's models then show up in magpie's model picker as
-`<name>/<model-id>` (display name prefixed `[name]`); picking one routes to that
-account. Sessions, processes, parked state and quota are isolated per account.
-The default account (agy's global sign-in, unprefixed model IDs) always remains.
+Register a manually prepared profile through **Use a saved Bridge account**.
+Magpie shows individual account rows with shared model IDs. Sessions, processes,
+parked state and quota remain isolated per account. The default account (agy's
+global sign-in) remains available. Direct OpenCode use retains the
+`<name>/<model-id>` catalog with `[name]` display labels.
 Accounts require an agy that accepts `--gemini_dir` and a file-based token;
 keyring/ADC sign-in is machine-global and cannot be isolated per directory.
-Refreshing the model catalog re-scans the accounts directory.
+Refreshing a native account's catalog checks its profile. A missing or invalid
+profile fails explicitly and never uses the default login. Legacy prefixed IDs
+are accepted only when their prefix matches Magpie's selected account; update
+routing groups and client configuration to ordinary model IDs.
 
 **Importing accounts.** Instead of signing in inside a profile directory, you can
 import an agy login you already have, from the account-action chooser (**Import
@@ -137,8 +150,10 @@ agy-bridge accounts list
 An import copies only `antigravity-cli/antigravity-oauth-token` (written `0600`
 in a `0700` directory) into `<accounts root>/<name>/`; agy keeps refreshing it.
 Existing accounts are never overwritten (pick another name), all manifest entries
-are validated before anything is written and a batch is all-or-nothing. Tokens are
-never printed. Refresh the model catalog afterwards. Magpie's own
+are validated before anything is written and profile copying is all-or-nothing.
+Tokens are never printed. Magpie UI imports also register the accounts. If host
+registration is interrupted, saved profiles remain available through **Use a saved
+Bridge account**. CLI imports need that registration step as well. Magpie's own
 `magpie accounts import antigravity` is a different, built-in account store and
 does not feed this bridge.
 

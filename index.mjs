@@ -11,6 +11,7 @@ import { createUsageReader } from "./usage.mjs"
 import { DEFAULT_ACCOUNT, invalidateAccounts, listAccounts, splitModelAccount } from "./accounts.mjs"
 import { importAccounts, ImportError, readManifest, validateAccountName } from "./accounts-import.mjs"
 import { createAccountLoginMethod } from "./accounts-login.mjs"
+import { NativeAccountError, nativeAccount, nativeAccountResult, nativeAccountSlot, nativeModelId } from "./native-accounts.mjs"
 import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
 import { selectAgy } from "./context-unlock.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
@@ -5142,21 +5143,21 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
 // Native Magpie sign-in forms (auth.methods[].prompts + authorize(inputs)) that
 // import existing agy credentials as named accounts. Paths are on the machine
 // running Magpie. They share importAccounts() with `agy-bridge accounts import`;
-// the host keeps the single "agy" sentinel and routing stays profile-prefixed.
-function importResult(entries) {
+// OpenCode retains its shared sentinel; Magpie registers independent accounts.
+async function importResult(entries, complete = () => ({ type: "success", key: "agy" })) {
   try {
     if (wslDistro()) return { type: "failed", error: "Account import is unavailable in WSL mode; use the distro default account" }
-    importAccounts(entries)
+    const imported = importAccounts(entries)
     accountsCache = null
     invalidateAccounts()
-    return { type: "success", key: "agy" }
+    return await complete(imported)
   } catch (error) {
     if (error instanceof ImportError) return { type: "failed", error: error.message }
     return { type: "failed", error: `account import failed: ${error?.code || "unexpected error"}` }
   }
 }
 
-const ACCOUNT_IMPORT_METHODS = [
+function accountImportMethods(importEntries) { return [
   {
     type: "api",
     keyless: true,
@@ -5179,7 +5180,7 @@ const ACCOUNT_IMPORT_METHODS = [
         validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
       },
     ],
-    authorize: async inputs => importResult([{ name: String(inputs?.name ?? "").trim(), source: expandHome(inputs?.source) }]),
+    authorize: async (inputs, options) => importEntries([{ name: String(inputs?.name ?? "").trim(), source: expandHome(inputs?.source) }], options),
   },
   {
     type: "api",
@@ -5197,21 +5198,54 @@ const ACCOUNT_IMPORT_METHODS = [
       placeholder: "~/agy-accounts.json",
       validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
     }],
-    authorize: async inputs => {
-      try { return importResult(readManifest(expandHome(inputs?.manifest))) }
+    authorize: async (inputs, options) => {
+      try { return await importEntries(readManifest(expandHome(inputs?.manifest)), options) }
       catch (error) { return { type: "failed", error: error instanceof ImportError ? error.message : "could not read the manifest" } }
     },
   },
-]
+] }
 
 function expandHome(value) {
   const text = String(value ?? "").trim()
   return text === "~" || text.startsWith("~/") ? path.join(os.homedir(), text.slice(1)) : text
 }
 
-export const AntigravityBridgePlugin = async () => {
+export const AntigravityBridgePlugin = async (input = {}) => {
+  const magpie = !!input.magpie
+  const native = magpie && !wslDistro()
+  const boundAccount = (auth, options) => {
+    if (wslDistro()) {
+      if ((auth == null && options?.allowMissing) || (auth?.type === "api" && auth.key === "agy")) return DEFAULT_ACCOUNT
+      throw new NativeAccountError("Named Bridge accounts are unavailable in WSL mode; select the distro's default CLI account.", "bridge_account_wsl_unsupported", 400)
+    }
+    return nativeAccount(auth, options)
+  }
   const readUsage = createUsageReader(findAgy, { resolveAccounts: agy => getAccounts(agy) })
-  const accountLogin = createAccountLoginMethod(findAgy, { onImport: () => {
+  const nativeUsage = new Map()
+  const importEntries = async (entries, { signal } = {}) => {
+    if (signal?.aborted) return { type: "failed", error: "Account import was cancelled." }
+    if (native && entries.length > 1 && typeof input.client?.auth?.set !== "function") {
+      return { type: "failed", error: "This host cannot register multiple Bridge accounts. Import them one at a time." }
+    }
+    return importResult(entries, async imported => {
+      if (!native) return { type: "success", key: "agy" }
+      try {
+        // The host saves/settles the first success itself. Other newly imported
+        // profiles get deterministic slots through its supported auth interface.
+        for (const account of imported.slice(1)) {
+          if (signal?.aborted) throw new Error("cancelled")
+          const { type: _, ...record } = nativeAccountResult(account.name)
+          await input.client.auth.set({ path: { id: nativeAccountSlot(account.name) }, body: { type: "api", ...record } })
+        }
+        return nativeAccountResult(imported[0].name)
+      } catch {
+        return { type: "failed", error: "The profiles were saved, but Magpie could not register every account. Use 'Use a saved Bridge account' to register them without signing in again." }
+      }
+    })
+  }
+  const accountLogin = createAccountLoginMethod(findAgy, {
+    resultForAccount: name => native ? nativeAccountResult(name) : { type: "success", key: "agy" },
+    onImport: () => {
     accountsCache = null
     invalidateAccounts()
     catalogCache.clear()
@@ -5219,12 +5253,21 @@ export const AntigravityBridgePlugin = async () => {
   return {
     auth: {
       provider: PROVIDER_ID,
-      // Native profiles add accounts without replacing one another. Magpie
-      // deduplicates successful methods by their shared "agy" sentinel key.
-      // WSL exposes only the distro's existing CLI account.
+      // Each native account has its own local profile reference. WSL exposes
+      // only the distro's existing CLI account.
       single: !!wslDistro(),
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
-      usage: async () => readUsage(),
+      usage: async getAuth => {
+        if (!magpie) return readUsage()
+        try {
+          const account = boundAccount(await getAuth())
+          if (!nativeUsage.has(account.key)) nativeUsage.set(account.key,
+            createUsageReader(findAgy, { resolveAccounts: () => [{ ...account, name: null }] }))
+          return await nativeUsage.get(account.key)()
+        } catch (error) {
+          return { windows: [], error: error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", signIn: "kept" }
+        }
+      },
       methods: [
         {
           type: "api",
@@ -5251,9 +5294,32 @@ export const AntigravityBridgePlugin = async () => {
             return { type: "success", key: "agy" }
           },
         },
-        ...(wslDistro() ? [] : [...ACCOUNT_IMPORT_METHODS, accountLogin]),
+        ...(wslDistro() ? [] : [...accountImportMethods(importEntries), accountLogin]),
+        ...(native ? [{
+          type: "api", keyless: true, ...ACCOUNT_ACTIONS.saved,
+          prompts: [{ type: "text", key: "name", message: "Saved Bridge account name (no new Google sign-in)",
+            messages: { zh: "已保存的 Bridge 账号名称（无需重新登录 Google）", "zh-TW": "已儲存的 Bridge 帳號名稱（無需重新登入 Google）" },
+            placeholder: "work",
+            validate: value => { try { validateAccountName(String(value ?? "").trim()); return undefined } catch (error) { return error.message } },
+          }],
+          authorize: async (inputs, { signal } = {}) => {
+            try {
+              const name = validateAccountName(String(inputs?.name ?? "").trim())
+              const result = nativeAccountResult(name)
+              const account = nativeAccount({ type: "api", key: result.key })
+              const agy = findAgy()
+              if (!agy) return { type: "failed", error: "agy CLI not found. Install the CLI before registering this account." }
+              const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "models"], { timeoutMs: 15_000, env: accountEnv(process.env, account.dir), signal })
+              if (signal?.aborted) return { type: "failed", error: "Account registration was cancelled." }
+              if (probe.err || probe.code !== 0 || !probe.stdout.trim()) return { type: "failed", error: "agy could not verify this saved account. Check its login before registering it." }
+              return result
+            } catch (error) {
+              return { type: "failed", error: error instanceof NativeAccountError || error instanceof ImportError ? error.message : "Could not register the saved Bridge account." }
+            }
+          },
+        }] : []),
       ],
-      loader: async () => {
+      loader: async getAuth => {
         return {
           baseURL: "agy://local",
           apiKey: "agy",
@@ -5297,9 +5363,20 @@ export const AntigravityBridgePlugin = async () => {
             const promptGuardMatched = guarded.diagnostics.length > 0
             const rawModel = body.model || ""
             if (wslDistro() && rawModel.replace(/^antigravity-bridge\//, "").includes("/")) return jsonError(400, "Named account profiles are unavailable in WSL mode; use the distro default account")
-            const accounts = await getAccounts(agy)
-            const { account: accountName, model: modelId } = splitModelAccount(rawModel, accounts)
-            const account = accounts.find(item => item.name === accountName) || DEFAULT_ACCOUNT
+            let account, modelId
+            try {
+              if (magpie) {
+                account = boundAccount(await getAuth())
+                modelId = nativeModelId(rawModel, account)
+              } else {
+                const accounts = await getAccounts(agy)
+                const parsed = splitModelAccount(rawModel, accounts)
+                account = accounts.find(item => item.name === parsed.account) || DEFAULT_ACCOUNT
+                modelId = parsed.model
+              }
+            } catch (error) {
+              return jsonError(error.statusCode ?? 503, error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", error.code, true)
+            }
             const requestedModel = modelId.replace(/\[1m\]$/i, "")
             const layout = canonicalBody(body) === body ? "hoisted" : "inline"
             body = { ...canonicalBody(body), model: requestedModel }
@@ -5549,11 +5626,12 @@ export const AntigravityBridgePlugin = async () => {
     provider: {
       id: PROVIDER_ID,
       npm: NPM_ANTHROPIC,
-      models: async () => {
+      models: async (_provider, context = {}) => {
         const agy = findAgy()
         if (cachedAgyError) throw new Error(cachedAgyError)
         // Refreshing the model catalog also re-discovers named accounts.
-        const accounts = agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
+        const accounts = magpie ? [boundAccount(context.auth, { allowMissing: true })]
+          : agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
         const out = {}
         await Promise.all(accounts.map(async account => {
           const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)
@@ -5567,8 +5645,8 @@ export const AntigravityBridgePlugin = async () => {
           for (const item of offered || []) if (!covered.has(item.id)) available.push({ id: item.id, name: item.name || item.id })
           for (const model of available) {
             // Named accounts expose the same catalog under "<account>/<model>".
-            const id = account.name ? `${account.name}/${model.id}` : model.id
-            const name = account.name ? `[${account.name}] ${model.name}` : model.name
+            const id = !native && account.name ? `${account.name}/${model.id}` : model.id
+            const name = !native && account.name ? `[${account.name}] ${model.name}` : model.name
             const imageModel = /^(?:gemini-|claude-)/.test(model.id)
             out[id] = {
               id,

@@ -360,6 +360,11 @@ async function prompt(params, recorded = false) {
     log({ type: "agentError", convId: session.id })
     return { stopReason: "end_turn" }
   }
+  if (text.includes("INVALID_ARGUMENT_TEST")) {
+    fs.appendFileSync(agentLog, 'agent executor error: {"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}} prompt: "SYNTHETIC_PRIVATE_PROMPT"\n')
+    chunk("\n⚠ Agent execution terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
   if (text.includes("SYSTEM_REJECT429")) {
     fs.appendFileSync(agentLog, "E1103 errorreport.go:224] agent executor error: RESOURCE_EXHAUSTED (code 429): system prompt rejected by server.\n")
     chunk("\n⚠ Agent execution terminated due to error.\n")
@@ -914,12 +919,12 @@ function nextTurn(previous, events, text) {
 }
 
 // Answer tool rounds until the turn ends; returns the final events.
-async function drive(body, events, resultText = "ok") {
+async function drive(body, events, resultText = "ok", fetcher = callFetch) {
   let current = body
   let latest = events
   for (let round = 0; round < 6 && stopOf(latest) === "tool_use"; round++) {
     current = continuation(current, latest, resultText)
-    latest = (await readSSE(await callFetch(current))).events
+    latest = (await readSSE(await fetcher(current))).events
   }
   return { body: current, events: latest }
 }
@@ -1869,6 +1874,30 @@ for (const change of ["tools", "model"]) {
     JSON.stringify({ status: response.status, headers: Object.fromEntries(response.headers), payload }))
 }
 
+for (const streaming of [true, false]) {
+  const body = { model, stream: streaming, messages: [{ role: "user", content: `INVALID_ARGUMENT_TEST ${streaming}` }] }
+  const response = await callFetch(body)
+  const error = streaming
+    ? (await readSSE(response)).events.find(event => event.event === "error")?.data?.error
+    : (await response.json()).error
+  check(`INVALID_ARGUMENT ${streaming ? "stream" : "nonstream"} is redacted and non-retryable`,
+    error?.type === "invalid_request_error" && error.code === "AGY_ERROR_INVALID_ARGUMENT" && error.retryable === false &&
+    !error.message.includes("SYNTHETIC_PRIVATE_PROMPT") &&
+    (streaming || (response.status === 400 && response.headers.get("x-should-retry") === "false")), JSON.stringify(error))
+  const retry = await callFetch(body)
+  await retry.text()
+  check(`INVALID_ARGUMENT ${streaming ? "stream" : "nonstream"} retry never submits a second prompt`, retry.status === 409 &&
+    logs().filter(event => event.type === "user" && event.text === body.messages[0].content).length === 1)
+}
+
+{
+  await readSSE(await callFetch({ model, messages: [{ role: "user", content: "public permissive array schema" }], tools: [{
+    name: "any_json_array", input_schema: { type: "object", properties: { values: { type: "array", items: {} } } },
+  }] }))
+  const item = inits().at(-1)?.tools?.find(tool => tool.name === "any_json_array")?.inputSchema?.properties?.values?.items
+  check("public tools/list retains permissive non-string array items", ["number", "boolean", "object", "null", "array"].every(type => item?.anyOf?.some(branch => branch.type === type)), JSON.stringify(item))
+}
+
 {
   const system = "You are Codex, an agent based on GPT-5"
   const generic = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "GENERIC429 with cloaked system" }] })
@@ -2335,6 +2364,36 @@ for (const location of ["inline", "system", "developer", "user"]) {
     related.length === 3 && related.filter(event => event.resumed).length === 2 &&
     related.filter(event => event.resumed).every(event => event.systemAppend === null),
     JSON.stringify(related.map(event => ({ resumed: event.resumed, append: event.systemAppend }))))
+}
+
+for (const change of ["inputs", "user", "tool", "ids", "history", "workdir"]) {
+  const first = { model, metadata: { user_id: `persisted-canonical-${change}` }, tools: [echoTool], messages: [{ role: "user", content: `TOOL persisted canonical ${change}` }] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const completed = continuation(first, pending, "persisted result")
+  const final = (await readSSE(await callFetch(completed))).events
+  const target = inits().at(-1).convId
+  const next = nextTurn(completed, final, `MEMORY persisted next ${change}`)
+  const use = next.messages.flatMap(message => Array.isArray(message.content) ? message.content : []).find(block => block.type === "tool_use")
+  use.input = { ...use.input, client_default: true }
+  if (change === "user") next.metadata.user_id += "-other"
+  if (change === "tool") use.name = "other_tool"
+  if (change === "history") next.messages[0].content += " changed"
+  if (change === "ids") {
+    const id = use.id
+    use.id = "toolu_000000000000000000000000"
+    for (const message of next.messages) for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block.type === "tool_result" && block.tool_use_id === id) block.tool_use_id = use.id
+    }
+  }
+  const { default: freshDefault } = await import(`./index.mjs?persisted-canonical-${change}`)
+  const fresh = await (await freshDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const fetchFresh = body => fresh.fetch("agy://local/messages", { method: "POST", headers: change === "workdir" ? { "x-magpie-work-dir": stateDir } : {}, body: JSON.stringify(body) })
+  const response = await fetchFresh(next)
+  const resumedEvents = (await readSSE(response)).events
+  const init = inits().at(-1)
+  check(`persisted canonical ${change} ${change === "inputs" ? "resumes with only the new tail" : "rejects foreign identity"}`, response.status === 200 &&
+    (change === "inputs" ? init.resumed && init.convId === target && lastOf("user").text === `MEMORY persisted next ${change}` : !init.resumed && init.convId !== target), JSON.stringify({ init, status: response.status }))
+  await drive(next, resumedEvents, "persisted replay cleanup", fetchFresh)
 }
 
 {
@@ -3475,6 +3534,11 @@ for (const steering of [false, true]) {
 
 // Stale-turn regressions use the same ACP/MCP fake and public fetch path above.
 {
+  // A fresh bridge owns a fresh logging window; earlier scenarios must not
+  // consume the production logger's 30 events/minute allowance for this test.
+  const { default: lineageDefault } = await import("./index.mjs?lineage-log-window")
+  const lineageLoader = await (await lineageDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const fetchLineage = body => lineageLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
   const events = []
   const replies = []
   const { Socket } = await import("node:net")
@@ -3491,15 +3555,15 @@ for (const steering of [false, true]) {
   try {
     const first = { model, metadata: { user_id: "lineage-sibling" }, system: "lineage system",
       messages: [{ role: "user", content: "main before recap" }], tools: [echoTool] }
-    const base = (await readSSE(await callFetch(first))).events
+    const base = (await readSSE(await fetchLineage(first))).events
     const recap = nextTurn(first, base, "PARALLEL recap branch")
-    const orphan = (await readSSE(await callFetch(recap))).events
+    const orphan = (await readSSE(await fetchLineage(recap))).events
     const old = inits().at(-1)
     for (let attempt = 0; attempt < 20 && logs().filter(event => event.type === "mcpPending" && event.convId === old.convId).length < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 5))
     await new Promise(resolve => setTimeout(resolve, 20))
     check("lineage fixture leaves concurrent orphan calls pending", toolCalls(orphan).length >= 1 && logs().filter(event => event.type === "mcpPending" && event.convId === old.convId).length === 2)
     const before = inits().length
-    const response = await callFetch(nextTurn(first, base, "continue main without recap"))
+    const response = await fetchLineage(nextTurn(first, base, "continue main without recap"))
     const final = response.status === 200 ? (await readSSE(response)).events : []
     if (response.status !== 200) await response.text()
     check("lineage sibling prompt runs independently instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
@@ -3507,7 +3571,7 @@ for (const steering of [false, true]) {
     const forks = events.filter(event => event.action === "isolated" && event.reason === "lineage_fork")
     check("lineage isolation emits one content-free event", forks.length === 1 && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"), JSON.stringify(forks))
     check("lineage isolation keeps the old process and its MCP sockets alive", fs.existsSync(old.cwd) && replies.length === 0)
-    const resumed = await drive(recap, orphan, "original branch result")
+    const resumed = await drive(recap, orphan, "original branch result", fetchLineage)
     check("original branch still accepts its live results after a sibling completes", stopOf(resumed.events) === "end_turn" &&
       logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("original branch result")))
   } finally { process.stderr.write = write; Socket.prototype.end = end }

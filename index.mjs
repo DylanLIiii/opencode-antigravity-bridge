@@ -1729,6 +1729,7 @@ class Proc {
     }
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
     const kind = classification.category === "forbidden" ? "permission_error"
+      : classification.category === "request_rejected" ? "invalid_request_error"
       : ["quota_exhausted", "model_capacity", "rate_limit", "prompt_rejected"].includes(classification.category)
         ? "rate_limit_error"
         : "api_error"
@@ -5358,7 +5359,7 @@ export const AntigravityBridgePlugin = async () => {
                     }
                     acquireOpts.validateReplay()
                     acquireOpts.replayReason = proc.dead ? "process_dead" : !historyMatches ? "history_changed"
-                      : proc.workDir !== workDir ? "work_dir_changed"
+                      : toolsGrew ? "tools_grew" : proc.workDir !== workDir ? "work_dir_changed"
                       : !sameInstructions(proc.instructions, instructions) ? "instructions_changed"
                       : turn.done ? "tool_turn_ended" : turn.cancelRequested ? "tool_turn_cancelling" : "incomplete_tool_results"
                     logBridgeEvent(proc, turn, "replay", acquireOpts.replayReason)

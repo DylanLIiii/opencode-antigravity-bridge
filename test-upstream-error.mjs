@@ -5,6 +5,19 @@ import { classifyUpstreamError } from "./upstream-error.mjs"
 const NOW = Date.UTC(2026, 10, 7, 0, 0, 0)
 const isoAfter = milliseconds => new Date(NOW + milliseconds).toISOString()
 
+test("INVALID_ARGUMENT is explicit, redacted and never retryable", () => {
+  const body = JSON.stringify({ error: { code: 400, message: "Request contains an invalid argument.", status: "INVALID_ARGUMENT" } })
+  for (const detail of [body, "INVALID_ARGUMENT (code 400)", body + ' prompt: "SYNTHETIC_PRIVATE_PROMPT"']) {
+    const result = classifyUpstreamError(detail)
+    assert.equal(result.category, "request_rejected")
+    assert.equal(result.reasonCode, "AGY_ERROR_INVALID_ARGUMENT")
+    assert.equal(result.retryable, false)
+    assert.equal(result.retryAfterMs, null)
+    assert.ok(!result.message.includes("SYNTHETIC_PRIVATE_PROMPT"))
+  }
+  assert.equal(classifyUpstreamError("unrelated failure code 400").category, "unknown")
+})
+
 function assertShape(value) {
   assert.deepEqual(Object.keys(value), ["category", "retryable", "message", "retryAfterMs", "reasonCode"])
   assert.equal(typeof value.retryable, "boolean")

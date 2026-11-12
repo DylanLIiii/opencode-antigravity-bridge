@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.4
+
+- Filter standalone agy retry and terminal notices while preserving quoted model text; corroborate terminal failures with this prompt’s log or an abnormal result.
+- Preserve the latest real user task and paired tools during replay trimming; reject protected content that exceeds the prompt budget.
+- Classify FAILED_PRECONDITION as a non-retryable rejected request and document a finite timeout workaround for silent tool argument generation.
+
 ## 0.6.3
 
 - Recover from agy's mid-session OAuth expiry. A long-lived `agy acp` process does not refresh its access token inside a session, so after about an hour its first model call fails with `UNAUTHENTICATED (code 401)` and the turn ends. When that happens before anything is streamed or any tool is called, the bridge now drops the process, parks the session with its pre-turn history, and replays the same request once on a fresh process, which loads the refreshed token file and resumes the same agy session. A second 401 is returned as `upstream_unauthenticated` (502). 401 is classified separately from 403 and is never retried on the same process.

@@ -18,8 +18,8 @@ let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
 source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(new URL("./package.json", entry).pathname))
 source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts };\n"
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
@@ -958,4 +958,42 @@ test("execOnce still collects synchronous and asynchronous spawn failures", asyn
       assert.equal(result.timedOut, false)
     }, mode)
   }
+})
+
+test("issue49 replay keeps the real user task through later tool-only and meta groups", () => {
+  const task = "ISSUE49 current task: build the feature"
+  const messages = [{ role: "user", content: "opening context" },
+    { role: "assistant", content: "old answer" }, { role: "user", content: task }]
+  for (let i = 0; i < 20; i++) {
+    const pair = historyPair(`issue49-${i}`, { command: "x".repeat(12000) })
+    if (i === 18) pair[1].content.push({ type: "text", text: "<system-reminder>metadata only</system-reminder>" })
+    messages.push(...pair)
+  }
+  const body = { messages }
+  const parts = renderReplayPromptParts(body, null, true)
+  validateAcpPromptBudget(parts, "", body)
+  const text = promptText(parts)
+  assert(text.includes(task) && text.includes('id="issue49-19"') && text.includes("older history messages omitted"))
+  for (let i = 0; i < 19; i++) {
+    const records = text.match(new RegExp(`id="issue49-${i}"`, "g")) || []
+    assert([0, 2].includes(records.length), `tool ${i} must retain both call and result`)
+  }
+  const huge = structuredClone(body)
+  huge.messages[2].content += "z".repeat(190000)
+  const tooLarge = renderReplayPromptParts(huge, null, true)
+  assert(promptText(tooLarge).includes(task))
+  assert.throws(() => validateAcpPromptBudget(tooLarge, "", huge), error =>
+    ["context_length_exceeded", "prompt_budget_exceeded"].includes(error.code))
+})
+
+
+test("issue49 error evidence excludes stale log entries", async () => {
+  const file = path.join(workspace, "issue49-agent.log")
+  fs.writeFileSync(file, "E] agent executor error: FAILED_PRECONDITION: old failure\n")
+  const offset = fs.statSync(file).size
+  assert.equal(await lastAgentError(file, offset), "")
+  assert.equal(lastAgentErrorSync(file, offset), false)
+  fs.appendFileSync(file, "E] agent executor error: FAILED_PRECONDITION: current failure\n")
+  assert.match(await lastAgentError(file, offset), /current failure/)
+  assert.equal(lastAgentErrorSync(file, offset), true)
 })

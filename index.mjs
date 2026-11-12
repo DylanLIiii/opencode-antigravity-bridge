@@ -3919,12 +3919,12 @@ function promptUsage(usage) {
   const rawInput = tokenCount(usage.inputTokens)
   const cacheRead = tokenCount(usage.cachedReadTokens)
   const cacheWrite = tokenCount(usage.cachedWriteTokens)
-  const output = tokenCount(usage.outputTokens)
   const thinking = tokenCount(usage.thoughtTokens)
+  const output = Math.max(tokenCount(usage.outputTokens), thinking)
   const total = tokenCount(usage.totalTokens)
   const inclusive = total > 0
-    ? Math.abs(total - (rawInput + output + thinking)) <
-      Math.abs(total - (rawInput + cacheRead + cacheWrite + output + thinking))
+    ? Math.abs(total - (rawInput + output)) <
+      Math.abs(total - (rawInput + cacheRead + cacheWrite + output))
     : cacheRead <= rawInput
   // Prompt input excludes cache creation, which is reported separately.
   const promptInput = inclusive ? rawInput : rawInput + cacheRead
@@ -3933,7 +3933,7 @@ function promptUsage(usage) {
     input: promptInput - read,
     read,
     write: cacheWrite,
-    output: output + thinking,
+    output,
     thinking,
     promptInput,
   }
@@ -4095,7 +4095,7 @@ async function measuredUsage(turn, step, result) {
   const prompt = promptOf(steps)
   if (expected !== null && prompt > expected + Math.max(16, Math.ceil(expected * 0.01))) return null
   const last = steps.at(-1)
-  const output = steps.reduce((sum, item) => sum + item.output + item.thinking, 0)
+  const output = steps.reduce((sum, item) => sum + Math.max(item.output, item.thinking), 0)
   const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
   turn.stepCursor = {
     source: batch.source,

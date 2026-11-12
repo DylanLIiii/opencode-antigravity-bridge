@@ -277,7 +277,7 @@ function finish(reply, extra = {}) {
       cachedReadTokens: cached,
       cachedWriteTokens: 0,
       thoughtTokens: thought,
-      totalTokens: input + cached + reply.length + thought,
+      totalTokens: input + cached + Math.max(reply.length, thought),
     },
   }
 }
@@ -428,6 +428,10 @@ async function prompt(params, recorded = false) {
     }
     chunk("Answer after summaries only.")
     return finish("Answer after summaries only.")
+  }
+  if (text.includes("USAGE_SMALL_CACHE_LARGE_THINKING")) {
+    chunk("usage fixture")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, cachedWriteTokens: 0, outputTokens: 500, thoughtTokens: 400, totalTokens: 10600 } }
   }
   if (text.includes("UNICODE")) {
     const message = { jsonrpc: "2.0", method: "session/update", params: { sessionId: session.id, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "中文😀" } } } }
@@ -1104,7 +1108,7 @@ async function launchedModel(body) {
   const firstEvents = (await readSSE(await callFetch(first))).events
   const firstUsage = firstEvents.find(event => event.event === "message_delta")?.data?.usage
   check("thinking tokens use Anthropic output details", firstUsage?.output_tokens_details?.thinking_tokens === 7, JSON.stringify(firstUsage))
-  check("output tokens include thinking tokens", firstUsage?.output_tokens === "thinking usage".length + 7, JSON.stringify(firstUsage))
+  check("output tokens include thinking tokens", firstUsage?.output_tokens === "thinking usage".length, JSON.stringify(firstUsage))
   check("cached prompt tokens are reported separately", firstUsage?.cache_read_input_tokens === 3 && firstUsage?.input_tokens === 10, JSON.stringify(firstUsage))
   const second = nextTurn(first, firstEvents, "THINKING_USAGE second")
   const secondEvents = (await readSSE(await callFetch(second))).events
@@ -1259,6 +1263,13 @@ for (const [name, system, headers, expectedDir, named] of [
   check(`${name} uses only an available absolute add-dir`, stopOf(final) === "end_turn" && init.addDir === expectedDir)
   check(`${name} identifies where client tools run`, init.systemAppend?.includes(JSON.stringify(named)) && init.systemAppend.includes("where every tool runs"))
   check(`${name} keeps agent configuration isolated`, init.cwd !== expectedDir && init.cwd.includes("magpie-agy-bridge-"))
+}
+
+{
+  const response = await callFetch({ model, messages: [{ role: "user", content: "USAGE_SMALL_CACHE_LARGE_THINKING" }] })
+  const { events } = await readSSE(response)
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("ACP small cache and included thinking are accounted once", usage?.input_tokens === 10000 && usage?.cache_read_input_tokens === 100 && usage?.output_tokens === 500 && usage?.output_tokens_details?.thinking_tokens === 400, JSON.stringify(usage))
 }
 
 let nativeBody
@@ -3944,7 +3955,7 @@ for (const compacted of [true, false]) {
       continue
     }
     check(`${label}: tool step reports its model call from agy's store`,
-      stopOf(firstEvents) === "tool_use" && step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44,
+      stopOf(firstEvents) === "tool_use" && step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 40,
       JSON.stringify(step))
     check(`${label}: final step reports its own call with the cache hit`,
       stopOf(lastEvents) === "end_turn" && final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20,
@@ -3966,7 +3977,7 @@ for (const compacted of [true, false]) {
       const u2 = usageOf(e2)
       const u3 = usageOf(e3)
       check(`${label}: first tool step reports generation #1`,
-        stopOf(e1) === "tool_use" && u1.input_tokens === 3000 && u1.cache_read_input_tokens === 0 && u1.output_tokens === 44,
+        stopOf(e1) === "tool_use" && u1.input_tokens === 3000 && u1.cache_read_input_tokens === 0 && u1.output_tokens === 40,
         JSON.stringify(u1))
       check(`${label}: staggered sibling tool step reports 0 incremental usage without 1s timeout`,
         stopOf(e2) === "tool_use" && u2.input_tokens === 0 && u2.cache_read_input_tokens === 0 &&
@@ -4008,7 +4019,7 @@ for (const compacted of [true, false]) {
     const step = usageOf(firstEvents)
     check("AGY_BRIDGE_STEP_USAGE=0 skips the store and keeps the estimate",
       stopOf(lastEvents) === "end_turn" && step.input_tokens > 0 &&
-        !(step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44),
+        !(step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 40),
       JSON.stringify(step))
   } finally {
     delete process.env.AGY_BRIDGE_STEP_USAGE

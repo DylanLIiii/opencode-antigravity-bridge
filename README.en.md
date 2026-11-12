@@ -763,7 +763,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_DETACHED_EVICT_MS` | 30000 | client inactivity before a detached tool wait can be reclaimed under pool pressure; positive milliseconds |
 | `AGY_BRIDGE_RESUME_TTL_MS` | 21600000 | parked-session resume, submitted-prompt dedupe, and in-memory reclaimed-branch routing retention |
 | `AGY_BRIDGE_STATE_FILE` | `$XDG_STATE_HOME/magpie-agy-bridge/sessions.json` | where resumable sessions are recorded (hashes only) |
-| `AGY_BRIDGE_ACCOUNTS_DIR` | `~/.config/magpie-agy-bridge/accounts` | root of named account profiles; each subdirectory with its own `antigravity-cli/antigravity-oauth-token` becomes a `<name>/<model-id>` account |
+| `AGY_BRIDGE_ACCOUNTS_DIR` | `~/.config/magpie-agy-bridge/accounts` | root of named profiles with their own `antigravity-cli/antigravity-oauth-token`; register each as a native Magpie account, or select `<name>/<model-id>` in OpenCode |
 | `AGY_BRIDGE_START_TIMEOUT_MS` / `_TURN_TIMEOUT_MS` / `_TOOL_TIMEOUT_MS` | 60000 / 600000 / 1800000 | startup, meaningful agy inactivity, client tool result; positive milliseconds |
 | `AGY_BRIDGE_PING_INTERVAL_MS` | 15000 | Anthropic SSE heartbeat interval in positive milliseconds; never renews upstream inactivity |
 | `AGY_BRIDGE_USAGE` | on | `0` (also `false` / `off` / `no` / `disabled`) skips automatic quota probes entirely |

@@ -325,7 +325,7 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
   这些路径已有自动化测试；维护者尚未完成 Windows 实机验证。
 - **账号**：默认一个 Google 账号（agy 自己的登录态）；插件不会调用 ACP
   `authenticate` 去切换登录。需要多账号时使用上方"多账号"小节的
-  `--gemini_dir` 隔离方案（模型名 `<账号>/<模型id>` 前缀路由）。Windows 上
+  `--gemini_dir` 隔离方案（Magpie 使用原生账号行，OpenCode 使用 `<账号>/<模型id>` 前缀）。Windows 上
   命名账号还需要该小节的"文件登录态"开关，否则 agy 会读取整机全局的凭据管理器。
 - **Prompt Guard**：默认开启，仅处理 system 中的独立计费元数据和已知 Agent SDK
   身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭。不会全局替换厂商名称或清洗 user 正文。

@@ -83,3 +83,32 @@ test("partial warning prefixes use bounded buffering", () => {
   assert.equal(f.push(value) + f.flush(), value)
   assert.ok(f.pending.length < 100)
 })
+
+test("terminal candidates survive an unclosed fence until outcome confirmation", () => {
+  for (const fence of ["```js", "~~~js"]) for (const chunked of [false, true]) for (const banner of [ERR, ERR.trimEnd()]) {
+    const prefix = `Here:\n${fence}\nconst a = 1;\n`
+    const f = new AgentNoticeFilter(() => true)
+    let text = f.push(prefix)
+    for (const chunk of chunked ? split(banner) : [banner]) text += f.push(chunk)
+    text += f.flush({ holdTerminal: true })
+    assert.equal(f.failureCandidate, true)
+    assert.equal(text, prefix)
+  }
+})
+
+test("unclosed fenced terminal quotations without log evidence retain every byte", () => {
+  const text = "Here:\n```js\nconst a = 1;\n" + ERR
+  for (const chunks of [[text], split(text)]) assert.equal(run(chunks).text, text)
+})
+
+test("whitespace after a terminal banner is not recovery", () => {
+  for (const chunks of [[ERR, "\n"], [ERR + "\n"], [ERR, " ", "\t", "\n"]]) {
+    const f = new AgentNoticeFilter(() => true)
+    let text = ""
+    for (const chunk of chunks) text += f.push(chunk)
+    text += f.flush({ holdTerminal: true })
+    assert.equal(f.failureCandidate, true)
+    assert.ok(!text.includes("Agent execution"))
+    assert.equal(run(chunks).text, chunks.join(""))
+  }
+})

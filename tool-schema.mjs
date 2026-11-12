@@ -1,3 +1,6 @@
+import { sanitizePatternFields } from "./re2-pattern.mjs"
+import { ensureGeminiArrayItems } from "./array-items.mjs"
+
 // ide-tools passes through agy's JSON Schema -> CloudCode Schema translator.
 // Use a conservative subset here; the client remains responsible for validating
 // real arguments. Constraints that cannot be represented become model hints.
@@ -103,10 +106,10 @@ function resolvePointer(root, ref) {
 }
 
 export function sanitizeInputSchema(root) {
-  let remaining = 2048
+  let referenceExpansions = 0
   const fallback = hint => ({ type: "string", description: hint })
   function visit(schema, depth = 0, active = new Set()) {
-    if (depth > 32 || --remaining < 0) return fallback("Schema expansion limit reached; follow the tool's original argument contract.")
+    if (depth > 32) return fallback("Schema expansion limit reached; follow the tool's original argument contract.")
     if (!isObject(schema)) return fallback(schema === false ? "No value is allowed by the original schema." : "Accepts any JSON value.")
     if (active.has(schema)) return fallback("Recursive schema; follow the tool's original argument contract.")
     const nextActive = new Set(active).add(schema)
@@ -151,7 +154,8 @@ export function sanitizeInputSchema(root) {
     if (schema.additionalProperties !== undefined || schema.patternProperties !== undefined) out.type ??= "object"
     if (typeof schema.$ref === "string") {
       const target = resolvePointer(root, schema.$ref)
-      if (target !== undefined) out = mergeSchemas([child(target), out], true)
+      if (target !== undefined && ++referenceExpansions <= 512) out = mergeSchemas([child(target), out], true)
+      else if (target !== undefined) appendHint(out, "Schema expansion limit reached; follow the tool's original argument contract.")
       else appendHint(out, `Unresolved schema reference: ${schema.$ref}`)
     }
     for (const key of ["allOf", "anyOf", "oneOf"]) {
@@ -176,8 +180,17 @@ export function sanitizeInputSchema(root) {
       if (out.type === "string" && values.length && values.every(value => typeof value === "string" && value.length)) out.enum = [...values]
       else if (values.length) appendHint(out, `${Object.hasOwn(schema, "const") ? "Must equal" : "Allowed values"}: ${values.map(value => JSON.stringify(value)).join(", ")}`)
     }
-    if (out.type === "array") out.items ??= fallback("Accepts any JSON value.")
+    const untypedItems = schema.items === true || (isObject(schema.items) && !schema.items.type && !schema.items.$ref && !schema.items.anyOf && !schema.items.oneOf && !schema.items.allOf && !schema.items.properties && !schema.items.enum && !Object.hasOwn(schema.items, "const"))
+    if (out.type === "array" && (untypedItems || (!out.items && schema.items === undefined)) && !tuple) {
+      const inferred = structuredClone(schema)
+      ensureGeminiArrayItems(inferred)
+      if (inferred.items) {
+        out.items = untypedItems ? inferred.items : child(inferred.items)
+        if (untypedItems) sanitizePatternFields(out.items)
+      }
+    }
     if (out.type === "object") out.properties ??= {}
+    sanitizePatternFields(out)
     return cleanTypeFields(out)
   }
   // A required-only allOf branch may refer to properties supplied by a sibling.

@@ -159,6 +159,10 @@ function saveState() {
 }
 
 async function invoke(name, args) {
+  if (activePrompt?.known && !activePrompt.known.has(name)) {
+    log({ type: "unknownTool", convId: session.id, name })
+    throw new Error("tool not in prompt snapshot")
+  }
   update({ sessionUpdate: "tool_call", toolCallId: "call_" + (++nextMcpId), name: "mcp_ide-tools_" + name, status: "in_progress", kind: "other", rawInput: args })
   log({ type: "mcpPending", convId: session.id, name, arguments: args })
   let result
@@ -277,7 +281,7 @@ function finish(reply, extra = {}) {
       cachedReadTokens: cached,
       cachedWriteTokens: 0,
       thoughtTokens: thought,
-      totalTokens: input + cached + reply.length + thought,
+      totalTokens: input + cached + Math.max(reply.length, thought),
     },
   }
 }
@@ -346,13 +350,24 @@ async function prompt(params, recorded = false) {
     chunk("partial slow answer")
     await new Promise(resolve => { cancelWaiter = resolve })
     log({ type: "cancelled", convId: session.id })
-    return { stopReason: "cancelled" }
+    if (text.includes("LATE_STORE_CANCEL")) setTimeout(() => { recordModelCall({ input: 99000, output: 900 }); log({ type: "lateStoreWrite", convId: session.id, sqlite: !!sqliteOpen }) }, 350)
+    return text.includes("RATIO_CANCEL") ? { stopReason: "cancelled", usage: { inputTokens: 10000, cachedReadTokens: 5000, outputTokens: 10, totalTokens: 15010 } } : { stopReason: "cancelled" }
   }
   if (text.includes("AGENTERROR")) {
     chunk("partial before failure")
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: FAILED_PRECONDITION (code 400): fake upstream failure.\n")
     chunk("\n⚠ Agent execution terminated due to error.\n")
     log({ type: "agentError", convId: session.id })
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("INVALID_ARGUMENT_TEST")) {
+    fs.appendFileSync(agentLog, 'E1103 errorreport.go:224] agent executor error: {"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}} prompt: "SYNTHETIC_PRIVATE_PROMPT"\n')
+    chunk("\n⚠ Agent execution terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("SYSTEM_REJECT429")) {
+    fs.appendFileSync(agentLog, "E1103 errorreport.go:224] agent executor error: RESOURCE_EXHAUSTED (code 429): system prompt rejected by server.\n")
+    chunk("\n⚠ Agent execution terminated due to error.\n")
     return { stopReason: "end_turn" }
   }
   if (text.includes("GENERIC429")) {
@@ -429,6 +444,22 @@ async function prompt(params, recorded = false) {
     chunk("Answer after summaries only.")
     return finish("Answer after summaries only.")
   }
+  if (text.includes("RATIO_ZERO")) {
+    chunk("ratio zero acknowledged")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 0, outputTokens: 500, totalTokens: 10500 } }
+  }
+  if (text.includes("RATIO_INITIAL")) {
+    chunk("ratio acknowledged")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, cachedWriteTokens: 900, outputTokens: 500, totalTokens: 11500 } }
+  }
+  if (text.includes("USAGE_THINKING_EXCEEDS_OUTPUT")) {
+    chunk("usage fixture")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, outputTokens: 10, thoughtTokens: 400, totalTokens: 10110 } }
+  }
+  if (text.includes("USAGE_SMALL_CACHE_LARGE_THINKING")) {
+    chunk("usage fixture")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, cachedWriteTokens: 0, outputTokens: 500, thoughtTokens: 400, totalTokens: 10600 } }
+  }
   if (text.includes("UNICODE")) {
     const message = { jsonrpc: "2.0", method: "session/update", params: { sessionId: session.id, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "中文😀" } } } }
     const wire = Buffer.from(JSON.stringify(message) + "\n")
@@ -482,7 +513,7 @@ async function prompt(params, recorded = false) {
     return finish("Before skill.\nAfter skill.\n")
   }
   if (text.includes("TOOLSEARCHCALL")) {
-    await invoke("ToolSearch", { query: "select:WebFetch" })
+    if (!text.includes("<conversation_history>")) await invoke("ToolSearch", { query: "select:WebFetch" })
     if (text.includes("use loaded tool")) {
       if (!tools.some(tool => tool.name === "WebFetch")) throw new Error("Loaded WebFetch missing from catalog")
       await invoke("WebFetch", { url: "https://example.com" })
@@ -511,6 +542,12 @@ async function prompt(params, recorded = false) {
     session.cutOff = text.includes("CUTOFF_ALWAYS") ? "always" : "once"
     chunk("part one, ")
     return { stopReason: "max_tokens", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } }
+  }
+  if (text.includes("LATE_STORE_NEXT")) {
+    await new Promise(resolve => setTimeout(resolve, 450))
+    await invoke("echo", { text: "late store next" })
+    chunk("late store done")
+    return finish("late store done")
   }
   if (text.includes("MEASURED_INFLATED")) {
     // One call whose recorded prompt wildly exceeds ACP's total for the turn.
@@ -565,6 +602,10 @@ async function prompt(params, recorded = false) {
     // ACP reports one accumulated total for both model steps of this prompt.
     return finish("Step one.\nStep two.\n", { input: 9000 })
   }
+  if (text.includes("TOOL live configuration tools") && text.includes("<conversation_history>")) {
+    chunk("Tool growth replay completed.")
+    return finish("Tool growth replay completed.")
+  }
   if (text.includes("TOOL")) {
     chunk("Before tool.\n")
     await invoke("echo", { text: "probe" })
@@ -612,7 +653,7 @@ function configOptions() {
   const family = model.replace(/-(low|medium|high|xhigh|max)$/, "")
   const configurable = family === "gemini-test" || family === "gemini-config-only" || family === "gemini-4-argon"
   const grouped = process.env.FAKE_AGY_CONFIG === "grouped"
-  const models = ["gemini-test", "gemini-config-only", "gemini-4-argon", "claude-test-medium"].map(value => ({ value, name: value }))
+  const models = ["gemini-test", "gemini-config-only", "gemini-4-argon", "claude-test-medium", "gpt-oss-120b-medium"].map(value => ({ value, name: value }))
   return [
     { id: grouped ? "model-picker" : "model", name: "Model", category: "model", type: "select", currentValue: configurable ? family : model,
       options: grouped ? [{ group: "Test models", options: models }] : models },
@@ -700,7 +741,7 @@ async function handle(message) {
         // Acceptance is not completion: the original prompt keeps streaming.
         return { stopReason: "end_turn" }
       }
-      const context = { steers: [], delivering: false }
+      const context = { steers: [], delivering: false, known: new Set(tools.map(tool => tool.name)) }
       activePrompt = context
       const result = await prompt(params)
       const drain = async () => {
@@ -754,7 +795,7 @@ fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} $
 fs.chmodSync(wrapper, 0o755)
 process.env.AGY_PATH = wrapper
 
-const { default: pluginDefault } = await import("./index.mjs")
+const { default: pluginDefault } = await import(process.env.AGY_BRIDGE_TEST_INDEX || "./index.mjs")
 const plugin = await pluginDefault.server({ client: null, directory: os.tmpdir() }, {})
 const loader = await plugin.auth.loader(async () => ({ key: "agy" }))
 let failures = 0
@@ -878,12 +919,12 @@ function nextTurn(previous, events, text) {
 }
 
 // Answer tool rounds until the turn ends; returns the final events.
-async function drive(body, events, resultText = "ok") {
+async function drive(body, events, resultText = "ok", fetcher = callFetch) {
   let current = body
   let latest = events
   for (let round = 0; round < 6 && stopOf(latest) === "tool_use"; round++) {
     current = continuation(current, latest, resultText)
-    latest = (await readSSE(await callFetch(current))).events
+    latest = (await readSSE(await fetcher(current))).events
   }
   return { body: current, events: latest }
 }
@@ -915,7 +956,11 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
 
 {
   const probesBefore = logs().filter(event => event.type === "models").length
+  const promptsBefore = logs().filter(event => event.type === "user").length
+  const initBefore = inits().length
   const models = await plugin.provider.models()
+  const discovery = inits().slice(initBefore)
+  check("model discovery opens ACP without submitting a prompt", discovery.length === 1 && logs().filter(event => event.type === "user").length === promptsBefore && discovery[0].update === "true", JSON.stringify(discovery))
   const probes = logs().filter(event => event.type === "models").slice(probesBefore)
   check("directory refresh disables auto update even when the parent enables it", probes.length > 0 && probes.every(event => event.update === "true"))
   check("dynamic models accept tab-separated agy output", !!models["gemini-test"])
@@ -1050,8 +1095,9 @@ async function launchedModel(body) {
   check("input_tokens reported", (usage?.input_tokens ?? 0) > 0)
   const init = inits().at(-1)
   const user = lastOf("user")
-  check("ACP session uses the minimal isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true"].every(line => init.agentConfig.includes(line)), init.agentConfig)
-  check("ACP client identifies as an allowlisted client", init.clientInfo?.name === "zed" && init.clientInfo?.version === "0.0.0")
+  check("ACP session uses the default minimal isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true"].every(line => init.agentConfig.includes(line)), init.agentConfig)
+  const pkg = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
+  check("ACP client identifies as this package", init.clientInfo?.name === pkg.name && init.clientInfo?.version === pkg.version)
   check("client system prompt is appended to the session instructions", init.systemAppend?.includes("SYSTEM-PROMPT-MARKER"))
   check("fresh prompt carries only the user text", user.text === "hello world", JSON.stringify(user.text))
   check("client tools are served through the ide-tools port", !!init.idePort && !logs().some(event => event.type === "ncExit"))
@@ -1089,6 +1135,18 @@ async function launchedModel(body) {
 }
 
 {
+  process.env.AGY_BRIDGE_MINIMAL_AGENT = "0"
+  const { default: offModule } = await import("./index.mjs?minimal-explicit-off")
+  const offPlugin = await offModule.server({ client: null, directory: os.tmpdir() }, {})
+  const offLoader = await offPlugin.auth.loader(async () => ({ key: "agy" }))
+  const response = await offLoader.fetch("agy://local/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [{ role: "user", content: "minimal explicitly off" }] }) })
+  const { events } = await readSSE(response)
+  const config = inits().at(-1)?.agentConfig
+  check("explicit minimal agent 0 disables default component exclusion", stopOf(events) === "end_turn" && config?.includes("inheritMcp: false") && !config?.includes("excludeDefaultComponents: true"), config)
+  delete process.env.AGY_BRIDGE_MINIMAL_AGENT
+}
+
+{
   const initialInits = inits().length
   const first = { model, messages: [{ role: "user", content: "first message" }] }
   const firstEvents = (await readSSE(await callFetch(first))).events
@@ -1104,7 +1162,7 @@ async function launchedModel(body) {
   const firstEvents = (await readSSE(await callFetch(first))).events
   const firstUsage = firstEvents.find(event => event.event === "message_delta")?.data?.usage
   check("thinking tokens use Anthropic output details", firstUsage?.output_tokens_details?.thinking_tokens === 7, JSON.stringify(firstUsage))
-  check("output tokens include thinking tokens", firstUsage?.output_tokens === "thinking usage".length + 7, JSON.stringify(firstUsage))
+  check("output tokens include thinking tokens", firstUsage?.output_tokens === "thinking usage".length, JSON.stringify(firstUsage))
   check("cached prompt tokens are reported separately", firstUsage?.cache_read_input_tokens === 3 && firstUsage?.input_tokens === 10, JSON.stringify(firstUsage))
   const second = nextTurn(first, firstEvents, "THINKING_USAGE second")
   const secondEvents = (await readSSE(await callFetch(second))).events
@@ -1259,6 +1317,58 @@ for (const [name, system, headers, expectedDir, named] of [
   check(`${name} uses only an available absolute add-dir`, stopOf(final) === "end_turn" && init.addDir === expectedDir)
   check(`${name} identifies where client tools run`, init.systemAppend?.includes(JSON.stringify(named)) && init.systemAppend.includes("where every tool runs"))
   check(`${name} keeps agent configuration isolated`, init.cwd !== expectedDir && init.cwd.includes("magpie-agy-bridge-"))
+}
+
+{
+  const response = await callFetch({ model, messages: [{ role: "user", content: "USAGE_SMALL_CACHE_LARGE_THINKING" }] })
+  const { events } = await readSSE(response)
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("ACP small cache and included thinking are accounted once", usage?.input_tokens === 10000 && usage?.cache_read_input_tokens === 100 && usage?.output_tokens === 500 && usage?.output_tokens_details?.thinking_tokens === 400, JSON.stringify(usage))
+}
+
+{
+  const response = await callFetch({ model, messages: [{ role: "user", content: "USAGE_THINKING_EXCEEDS_OUTPUT" }] })
+  const { events } = await readSSE(response)
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("ACP input shape uses raw output before thinking floor", usage?.input_tokens === 10000 && usage?.cache_read_input_tokens === 100 && usage?.output_tokens === 400 && usage?.output_tokens_details?.thinking_tokens === 400, JSON.stringify(usage))
+}
+
+{
+  const before = inits().length
+  const first = { model, metadata: { user_id: "flatten-regression" }, messages: [{ role: "user", content: "flattened opening unique" }] }
+  const events = (await readSSE(await callFetch(first))).events
+  const reply = textOf(events)
+  const second = { ...first, messages: [{ role: "user", content: `flattened opening unique\n${reply}\nflattened new tail` }] }
+  const result = (await readSSE(await callFetch(second))).events
+  check("flattened history reuses session and sends only new tail", stopOf(result) === "end_turn" && inits().length === before + 1 && lastOf("user").text === "flattened new tail", JSON.stringify(lastOf("user")))
+  const third = { ...first, messages: [{ role: "user", content: `${second.messages[0].content}\n${textOf(result)}\nthird flattened tail` }] }
+  const thirdEvents = (await readSSE(await callFetch(third))).events
+  check("three flattened turns retain session and send only newest tail", stopOf(thirdEvents) === "end_turn" && inits().length === before + 1 && lastOf("user").text === "third flattened tail", JSON.stringify(lastOf("user")))
+}
+
+{
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  const first = { model, metadata: { user_id: "ratio-write-regression" }, messages: [{ role: "user", content: "RATIO_INITIAL" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const second = nextTurn(first, firstEvents, "MULTISTEP " + "x".repeat(100000))
+  const toolEvents = (await readSSE(await callFetch(second))).events
+  const usage = toolEvents.find(event => event.event === "message_delta")?.data?.usage
+  const window = (usage?.input_tokens || 0) + (usage?.cache_read_input_tokens || 0)
+  check("real prompt cache ratio survives final response with cache writes", stopOf(toolEvents) === "tool_use" && window > 1000 && usage.cache_read_input_tokens === Math.round(window * 100 / 10100), JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(second, toolEvents, "ratio result")))
+  delete process.env.AGY_BRIDGE_STEP_USAGE
+}
+
+{
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  const first = { model, metadata: { user_id: "ratio-zero-regression" }, messages: [{ role: "user", content: "RATIO_ZERO" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const second = nextTurn(first, firstEvents, "MULTISTEP zero ratio " + "y".repeat(10000))
+  const events = (await readSSE(await callFetch(second))).events
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("recorded zero cache ratio stays zero during later tool step", stopOf(events) === "tool_use" && usage?.cache_read_input_tokens === 0 && usage?.input_tokens > 0, JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(second, events, "zero ratio result")))
+  delete process.env.AGY_BRIDGE_STEP_USAGE
 }
 
 let nativeBody
@@ -1662,22 +1772,31 @@ for (const [summaryTool, withNotice] of [[false, false], [true, false], [false, 
   check("model change switches inside the live session", inits().length === before && user.convId === convId && user.model === "gemini-test-low" && stopOf(secondEvents) === "end_turn")
 }
 
-for (const change of ["tools", "model"]) {
-  const first = { model, messages: [{ role: "user", content: `TOOL live configuration ${change}` }], tools: [echoTool] }
+for (const change of ["tools", "tools-steering", "tools-shrink", "model"]) {
+  const growing = change === "tools" || change === "tools-steering"
+  const other = { name: "other", input_schema: { type: "object" } }
+  const first = { model, messages: [{ role: "user", content: `TOOL live configuration ${change}` }], tools: change === "tools-shrink" ? [echoTool, other] : [echoTool] }
   const events = (await readSSE(await callFetch(first))).events
   const old = inits().at(-1)
+  const before = inits().length
   const second = continuation(first, events, "completed-before-change")
-  if (change === "tools") {
-    second.tools = [...second.tools, { name: "other", input_schema: { type: "object" } }]
+  if (growing) {
+    second.tools = [...second.tools, other]
     second.messages.push({ role: "user", content: [{ type: "text", text: "<system-update>tool catalog changed</system-update>" }] })
-  } else second.model = legacyModel
+    if (change === "tools-steering") second.messages.at(-1).content.push({ type: "text", text: "Use the new tool after this instruction." })
+  } else if (change === "tools-shrink") second.tools = [echoTool]
+  else second.model = legacyModel
   const final = (await readSSE(await callFetch(second))).events
   const delivered = logs().filter(event => event.type === "mcpResult" && event.convId === old.convId).at(-1)
-  check(`live ${change} change continues the pending turn`, stopOf(final) === "end_turn" && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
-  if (change === "tools") {
-    check("live tool change reaches agy", logs().some(event => event.type === "toolsList" && event.convId === old.convId && event.tools.includes("other")))
-    check("system update reaches the pending MCP result", delivered?.result?.content?.some(part => part.text?.includes("tool catalog changed")))
+  if (growing) {
+    const replay = lastOf("user")
+    check(`${change}: growth replays exactly once in a new session`, stopOf(final) === "end_turn" && inits().length === before + 1 && replay.convId !== old.convId && replay.text.includes("completed-before-change") && replay.text.includes("tool catalog changed"))
+    check(`${change}: old tool result is not delivered twice`, !logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("completed-before-change")))
+    check(`${change}: new tool is present for replay`, inits().at(-1)?.tools?.some(tool => tool.name === "other"))
+  } else if (change === "tools-shrink") {
+    check("tool catalog shrink preserves the live pending turn", stopOf(final) === "end_turn" && inits().length === before && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
   } else {
+    check("live model change continues the pending turn", stopOf(final) === "end_turn" && inits().at(-1).convId === old.convId && delivered?.result?.content?.[0]?.text === "completed-before-change")
     const next = (await readSSE(await callFetch({ ...nextTurn(second, final, "MODEL next prompt"), model: legacyModel }))).events
     check("live model change applies to the next prompt", stopOf(next) === "end_turn" && lastOf("user").model === "gemini-test-low" && lastOf("user").convId === old.convId)
   }
@@ -1760,6 +1879,41 @@ for (const change of ["tools", "model"]) {
     response.status === 429 && response.headers.get("x-should-retry") === "false" &&
     payload.error?.code === "AGY_ERROR_RESOURCE_EXHAUSTED_UNSPECIFIED" && payload.error?.retryable === false,
     JSON.stringify({ status: response.status, headers: Object.fromEntries(response.headers), payload }))
+}
+
+for (const streaming of [true, false]) {
+  const body = { model, stream: streaming, messages: [{ role: "user", content: `INVALID_ARGUMENT_TEST ${streaming}` }] }
+  const response = await callFetch(body)
+  const error = streaming
+    ? (await readSSE(response)).events.find(event => event.event === "error")?.data?.error
+    : (await response.json()).error
+  check(`INVALID_ARGUMENT ${streaming ? "stream" : "nonstream"} is redacted and non-retryable`,
+    error?.type === "invalid_request_error" && error.code === "AGY_ERROR_INVALID_ARGUMENT" && error.retryable === false &&
+    !error.message.includes("SYNTHETIC_PRIVATE_PROMPT") &&
+    (streaming || (response.status === 400 && response.headers.get("x-should-retry") === "false")), JSON.stringify(error))
+  const retry = await callFetch(body)
+  await retry.text()
+  check(`INVALID_ARGUMENT ${streaming ? "stream" : "nonstream"} retry never submits a second prompt`, retry.status === 409 &&
+    logs().filter(event => event.type === "user" && event.text === body.messages[0].content).length === 1)
+}
+
+{
+  await readSSE(await callFetch({ model, messages: [{ role: "user", content: "public permissive array schema" }], tools: [{
+    name: "any_json_array", input_schema: { type: "object", properties: { values: { type: "array", items: {} } } },
+  }] }))
+  const item = inits().at(-1)?.tools?.find(tool => tool.name === "any_json_array")?.inputSchema?.properties?.values?.items
+  check("public tools/list retains permissive non-string array items", ["number", "boolean", "object", "null", "array"].every(type => item?.anyOf?.some(branch => branch.type === type)), JSON.stringify(item))
+}
+
+{
+  const system = "You are Codex, an agent based on GPT-5"
+  const generic = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "GENERIC429 with cloaked system" }] })
+  const genericPayload = await generic.json()
+  const sent = inits().at(-1)?.systemAppend
+  check("cloaked system retains generic 429 classification", generic.status === 429 && genericPayload.error?.type === "rate_limit_error" && sent !== system && sent?.includes("\u200b"), JSON.stringify({ status: generic.status, error: genericPayload.error }))
+  const rejected = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "SYSTEM_REJECT429 with cloaked system" }] })
+  const rejectedPayload = await rejected.json()
+  check("specific system prompt rejection maps to invalid request", rejected.status === 400 && rejectedPayload.error?.type === "invalid_request_error", JSON.stringify(rejectedPayload))
 }
 
 {
@@ -2075,6 +2229,48 @@ for (const location of ["inline", "system", "developer", "user"]) {
 }
 
 {
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  const before = inits().length
+  const body = { model, tools: [echoTool], metadata: { user_id: "cancel-ratio" }, messages: [{ role: "user", content: "SLOW RATIO_CANCEL" }] }
+  const response = await callFetch(body)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  const next = { ...body, messages: [...body.messages, { role: "assistant", content: [{ type: "text", text: "partial slow answer" }] }, { role: "user", content: "MULTISTEP after cancel " + "x".repeat(10000) }] }
+  const { events } = await readSSE(await callFetch(next))
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  const window = (usage?.input_tokens || 0) + (usage?.cache_read_input_tokens || 0)
+  check("cancelled prompt teaches its cache ratio to next tool step", stopOf(events) === "tool_use" && inits().length === before + 1 && usage?.cache_read_input_tokens === Math.round(window / 3), JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(next, events, "cancel ratio result")))
+  delete process.env.AGY_BRIDGE_STEP_USAGE
+}
+
+{
+  const body = { model, tools: [echoTool], metadata: { user_id: "late-store-cancel" }, messages: [{ role: "user", content: "SLOW LATE_STORE_CANCEL" }] }
+  const response = await callFetch(body)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 150))
+  const next = { ...body, messages: [...body.messages, { role: "assistant", content: [{ type: "text", text: "partial slow answer" }] }, { role: "user", content: "LATE_STORE_NEXT" }] }
+  const events = (await readSSE(await callFetch(next))).events
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("cancelled late SQLite row cannot contaminate next prompt", stopOf(events) === "tool_use" && lastOf("lateStoreWrite")?.sqlite === true && usage?.input_tokens < 10000 && usage?.output_tokens < 900, JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(next, events, "late row ignored")))
+}
+
+{
   const first = { model, messages: [{ role: "user", content: "before an early cancel" }] }
   const firstEvents = (await readSSE(await callFetch(first))).events
   const convId = inits().at(-1).convId
@@ -2175,6 +2371,36 @@ for (const location of ["inline", "system", "developer", "user"]) {
     related.length === 3 && related.filter(event => event.resumed).length === 2 &&
     related.filter(event => event.resumed).every(event => event.systemAppend === null),
     JSON.stringify(related.map(event => ({ resumed: event.resumed, append: event.systemAppend }))))
+}
+
+for (const change of ["inputs", "user", "tool", "ids", "history", "workdir"]) {
+  const first = { model, metadata: { user_id: `persisted-canonical-${change}` }, tools: [echoTool], messages: [{ role: "user", content: `TOOL persisted canonical ${change}` }] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const completed = continuation(first, pending, "persisted result")
+  const final = (await readSSE(await callFetch(completed))).events
+  const target = inits().at(-1).convId
+  const next = nextTurn(completed, final, `MEMORY persisted next ${change}`)
+  const use = next.messages.flatMap(message => Array.isArray(message.content) ? message.content : []).find(block => block.type === "tool_use")
+  use.input = { ...use.input, client_default: true }
+  if (change === "user") next.metadata.user_id += "-other"
+  if (change === "tool") use.name = "other_tool"
+  if (change === "history") next.messages[0].content += " changed"
+  if (change === "ids") {
+    const id = use.id
+    use.id = "toolu_000000000000000000000000"
+    for (const message of next.messages) for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block.type === "tool_result" && block.tool_use_id === id) block.tool_use_id = use.id
+    }
+  }
+  const { default: freshDefault } = await import(`./index.mjs?persisted-canonical-${change}`)
+  const fresh = await (await freshDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const fetchFresh = body => fresh.fetch("agy://local/messages", { method: "POST", headers: change === "workdir" ? { "x-magpie-work-dir": stateDir } : {}, body: JSON.stringify(body) })
+  const response = await fetchFresh(next)
+  const resumedEvents = (await readSSE(response)).events
+  const init = inits().at(-1)
+  check(`persisted canonical ${change} ${change === "inputs" ? "resumes with only the new tail" : "rejects foreign identity"}`, response.status === 200 &&
+    (change === "inputs" ? init.resumed && init.convId === target && lastOf("user").text === `MEMORY persisted next ${change}` : !init.resumed && init.convId !== target), JSON.stringify({ init, status: response.status }))
+  await drive(next, resumedEvents, "persisted replay cleanup", fetchFresh)
 }
 
 {
@@ -2426,6 +2652,12 @@ for (const location of ["inline", "system", "developer", "user"]) {
 {
   const prefillOnly = await callFetch({ model, messages: [{ role: "assistant", content: "prefill" }] })
   const prefillTail = await callFetch({ model, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "prefill" }] })
+  const prefillEvents = (await readSSE(prefillTail)).events
+  const prefillSent = lastOf("user")?.text
+  process.env.AGY_BRIDGE_PREFILL = "0"
+  const prefillOff = await callFetch({ model, messages: [{ role: "user", content: "hi disabled" }, { role: "assistant", content: "prefill" }] })
+  delete process.env.AGY_BRIDGE_PREFILL
+  check("prefill sends an unfinished reply carrier and explicit off rejects", stopOf(prefillEvents) === "end_turn" && prefillSent?.includes("unfinished reply") && prefillSent?.includes("prefill") && prefillOff.status === 400, prefillSent)
   const loneSystem = await callFetch({ model, messages: [{ role: "system", content: "system without user or history" }] })
   const nonTextSystem = await callFetch({
     model,
@@ -2435,8 +2667,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
     ],
   })
   const nonTextPayload = await nonTextSystem.json()
-  check("assistant prefill and lone system messages return 400",
-    prefillOnly.status === 400 && prefillTail.status === 400 && loneSystem.status === 400,
+  check("assistant prefill after a user is accepted while lone messages are rejected",
+    prefillOnly.status === 400 && prefillTail.status === 200 && loneSystem.status === 400,
     `${prefillOnly.status},${prefillTail.status},${loneSystem.status}`)
   check("unsupported system content block error names the block type",
     nonTextSystem.status === 400 && nonTextPayload.error?.message?.includes('"audio_chunk"'),
@@ -2540,24 +2772,25 @@ for (const location of ["inline", "system", "developer", "user"]) {
   const searchFinal = (await readSSE(searchRes)).events
   const searchDelivered = logs().filter(event => event.type === "mcpResult" && event.convId === searchConv).at(-1)
   const searchText = searchDelivered?.result?.content?.map(part => part.text).join("\n") || ""
-  check("ToolSearch tool_reference and Tool loaded. companion continue live turn",
-    searchRes.status === 200 && stopOf(searchFinal) === "tool_use" && inits().length === beforeSearch &&
-    searchText.includes("Loaded tool: WebFetch") && searchText.includes("Tool loaded."), searchText)
+  const searchReplay = lastOf("user")
+  check("ToolSearch growth replays the result once in a new session",
+    searchRes.status === 200 && stopOf(searchFinal) === "tool_use" && inits().length === beforeSearch + 1 &&
+    searchReplay.convId !== searchConv && searchReplay.text.includes("Loaded tool: WebFetch") && !searchText.includes("Loaded tool: WebFetch"), searchReplay.text)
   check("schema-less ToolSearch exposes usable search parameters",
     inits().at(-1)?.tools?.find(tool => tool.name === "ToolSearch")?.inputSchema?.properties?.query?.type === "string")
-  check("loaded deferred tool is callable after catalog refresh in the same turn",
+  check("loaded deferred tool is callable only after replay",
     toolCall(searchFinal)?.name === "WebFetch" && toolCall(searchFinal)?.input?.url === "https://example.com" &&
-    logs().some(event => event.type === "toolsList" && event.reason === "list_changed" && event.convId === searchConv && event.tools.includes("WebFetch")))
+    !logs().some(event => event.type === "unknownTool" && event.convId === searchConv))
   const searchThird = continuation(searchSecond, searchFinal, "Fetched example successfully")
   const loadedEvents = (await readSSE(await callFetch(searchThird))).events
   check("loaded tool result completes the original search turn",
-    stopOf(loadedEvents) === "end_turn" && inits().length === beforeSearch &&
-    logs().some(event => event.type === "mcpResult" && event.convId === searchConv && event.name === "WebFetch" && event.result?.content?.some(part => part.text?.includes("Fetched example successfully"))))
+    stopOf(loadedEvents) === "end_turn" && inits().length === beforeSearch + 1 &&
+    logs().some(event => event.type === "mcpResult" && event.convId === searchReplay.convId && event.name === "WebFetch" && event.result?.content?.some(part => part.text?.includes("Fetched example successfully"))))
   const afterSearch = nextTurn(searchThird, loadedEvents, "MEMORY after tool search")
   const afterSearchRes = await callFetch(afterSearch)
   await readSSE(afterSearchRes)
   check("turn after ToolSearch tool_reference reuses the live session",
-    afterSearchRes.status === 200 && inits().length === beforeSearch)
+    afterSearchRes.status === 200 && inits().length === beforeSearch + 1)
 }
 
 {
@@ -3308,6 +3541,11 @@ for (const steering of [false, true]) {
 
 // Stale-turn regressions use the same ACP/MCP fake and public fetch path above.
 {
+  // A fresh bridge owns a fresh logging window; earlier scenarios must not
+  // consume the production logger's 30 events/minute allowance for this test.
+  const { default: lineageDefault } = await import("./index.mjs?lineage-log-window")
+  const lineageLoader = await (await lineageDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+  const fetchLineage = body => lineageLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
   const events = []
   const replies = []
   const { Socket } = await import("node:net")
@@ -3324,23 +3562,23 @@ for (const steering of [false, true]) {
   try {
     const first = { model, metadata: { user_id: "lineage-sibling" }, system: "lineage system",
       messages: [{ role: "user", content: "main before recap" }], tools: [echoTool] }
-    const base = (await readSSE(await callFetch(first))).events
+    const base = (await readSSE(await fetchLineage(first))).events
     const recap = nextTurn(first, base, "PARALLEL recap branch")
-    const orphan = (await readSSE(await callFetch(recap))).events
+    const orphan = (await readSSE(await fetchLineage(recap))).events
     const old = inits().at(-1)
     for (let attempt = 0; attempt < 20 && logs().filter(event => event.type === "mcpPending" && event.convId === old.convId).length < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 5))
     await new Promise(resolve => setTimeout(resolve, 20))
     check("lineage fixture leaves concurrent orphan calls pending", toolCalls(orphan).length >= 1 && logs().filter(event => event.type === "mcpPending" && event.convId === old.convId).length === 2)
     const before = inits().length
-    const response = await callFetch(nextTurn(first, base, "continue main without recap"))
+    const response = await fetchLineage(nextTurn(first, base, "continue main without recap"))
     const final = response.status === 200 ? (await readSSE(response)).events : []
     if (response.status !== 200) await response.text()
     check("lineage sibling prompt runs independently instead of returning 503", response.status === 200 && stopOf(final) === "end_turn", `got ${response.status}`)
     check("lineage replacement replays only the client's branch", inits().length === before + 1 && lastOf("user").convId !== old.convId && lastOf("user").text.includes("continue main without recap") && !lastOf("user").text.includes("PARALLEL recap branch"))
     const forks = events.filter(event => event.action === "isolated" && event.reason === "lineage_fork")
-    check("lineage isolation emits one content-free event", forks.length === 1 && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"))
+    check("lineage isolation emits one content-free event", forks.length === 1 && forks[0].layout === "hoisted" && !JSON.stringify(forks).includes("recap branch"), JSON.stringify(forks))
     check("lineage isolation keeps the old process and its MCP sockets alive", fs.existsSync(old.cwd) && replies.length === 0)
-    const resumed = await drive(recap, orphan, "original branch result")
+    const resumed = await drive(recap, orphan, "original branch result", fetchLineage)
     check("original branch still accepts its live results after a sibling completes", stopOf(resumed.events) === "end_turn" &&
       logs().some(event => event.type === "mcpResult" && event.convId === old.convId && JSON.stringify(event.result).includes("original branch result")))
   } finally { process.stderr.write = write; Socket.prototype.end = end }
@@ -3385,7 +3623,7 @@ for (const steering of [false, true]) {
     continued[i] = continuation(requests[i], pending[i], `result for branch ${i}`)
     // Replay just this isolated owner while the other two siblings still wait.
     if (i === 1) continued[i].messages.at(-1).content.push({ type: "text", text: "queued branch instruction" })
-    if (i === 2) continued[i].tools = [echoTool, { ...echoTool, name: "extraBranchTool" }]
+    if (i === 2) continued[i].tools = [{ ...echoTool, description: "Updated branch tool" }]
     if (i === 3) {
       continued[i].messages.at(-2).content.find(block => block.type === "tool_use").id = "toolu_renamed_isolated_branch"
       continued[i].messages.at(-1).content[0].tool_use_id = "toolu_renamed_isolated_branch"
@@ -3620,7 +3858,7 @@ for (const steering of [false, true]) {
     const pending = (await readSSE(await fetchAccepting(first))).events
     const owner = inits().at(-1)
     const continued = continuation(first, pending, "accepted result survives catalog wait")
-    continued.tools = [echoTool, { name: "delayed_other", input_schema: { type: "object" } }]
+    continued.tools = [{ ...echoTool, description: "Updated while result is pending" }]
     for (const block of continued.messages.at(-2).content) if (block.type === "tool_use") block.id = `renamed-${block.id}`
     for (const block of continued.messages.at(-1).content) block.tool_use_id = `renamed-${block.tool_use_id}`
     const accepting = fetchAccepting(continued)
@@ -3944,7 +4182,7 @@ for (const compacted of [true, false]) {
       continue
     }
     check(`${label}: tool step reports its model call from agy's store`,
-      stopOf(firstEvents) === "tool_use" && step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44,
+      stopOf(firstEvents) === "tool_use" && step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 40,
       JSON.stringify(step))
     check(`${label}: final step reports its own call with the cache hit`,
       stopOf(lastEvents) === "end_turn" && final.input_tokens === 500 && final.cache_read_input_tokens === 3000 && final.output_tokens === 20,
@@ -3966,7 +4204,7 @@ for (const compacted of [true, false]) {
       const u2 = usageOf(e2)
       const u3 = usageOf(e3)
       check(`${label}: first tool step reports generation #1`,
-        stopOf(e1) === "tool_use" && u1.input_tokens === 3000 && u1.cache_read_input_tokens === 0 && u1.output_tokens === 44,
+        stopOf(e1) === "tool_use" && u1.input_tokens === 3000 && u1.cache_read_input_tokens === 0 && u1.output_tokens === 40,
         JSON.stringify(u1))
       check(`${label}: staggered sibling tool step reports 0 incremental usage without 1s timeout`,
         stopOf(e2) === "tool_use" && u2.input_tokens === 0 && u2.cache_read_input_tokens === 0 &&
@@ -4008,7 +4246,7 @@ for (const compacted of [true, false]) {
     const step = usageOf(firstEvents)
     check("AGY_BRIDGE_STEP_USAGE=0 skips the store and keeps the estimate",
       stopOf(lastEvents) === "end_turn" && step.input_tokens > 0 &&
-        !(step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 44),
+        !(step.input_tokens === 3000 && step.cache_read_input_tokens === 0 && step.output_tokens === 40),
       JSON.stringify(step))
   } finally {
     delete process.env.AGY_BRIDGE_STEP_USAGE
@@ -4178,7 +4416,11 @@ for (const compacted of [true, false]) {
   process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
   const { default: multiDefault } = await import("./index.mjs?multi-account")
   const multiPlugin = await multiDefault.server({ client: null, directory: os.tmpdir() }, {})
+  const probeLogStart = logs().length
+  const promptsBeforeCatalog = logs().filter(event => event.type === "user").length
   const multiModels = await multiPlugin.provider.models()
+  const discoveryInits = logs().slice(probeLogStart).filter(event => event.type === "init")
+  check("each account model discovery uses its own ACP credentials without a prompt", [null, path.join(accountsDir, "work"), path.join(accountsDir, "personal")].every(dir => discoveryInits.some(event => event.geminiDir === dir && event.update === "true")) && logs().filter(event => event.type === "user").length === promptsBeforeCatalog, JSON.stringify(discoveryInits.map(item => [item.geminiDir, item.update])))
   check("models lists default plus per-account prefixed ids",
     !!multiModels["gemini-test"] && !!multiModels["work/gemini-test"] && !!multiModels["personal/gemini-test"] &&
     !multiModels["no-token/gemini-test"], Object.keys(multiModels).join(","))

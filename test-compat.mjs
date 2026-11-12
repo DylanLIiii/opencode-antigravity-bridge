@@ -16,12 +16,13 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute };\n"
+source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(new URL("./package.json", entry).pathname))
+source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts };\n"
 fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts };\n")
 const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
-const { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+const { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 
 test("reclaimed routing is bounded, expires and rejects ambiguous or incompatible owners", () => {
   const history = [{ role: "user", content: "opening" }, { role: "assistant", content: [
@@ -46,6 +47,105 @@ test("reclaimed routing is bounded, expires and rejects ambiguous or incompatibl
     assert.equal(matchingReclaimedRoute("family-0", opts), undefined)
     assert.equal(matchingReclaimedRoute("family-128", opts)?.key, "family-128")
   } finally { reclaimedRoutes.clear() }
+})
+
+test("conversation key and history distinguish users, openings and tool names", () => {
+  const base = { metadata: { user_id: "user-a" }, system: "Today: 2026-11-12", messages: [{ role: "user", content: "opening" }] }
+  const key = conversationKey(base)
+  assert.notEqual(conversationKey({ ...base, metadata: { user_id: "user-b" } }), key)
+  assert.notEqual(conversationKey({ ...base, messages: [{ role: "user", content: "changed" }] }), key)
+  const tool = { ...base, messages: [{ role: "user", content: "opening" }, { role: "assistant", content: [{ type: "tool_use", id: "toolu_0123456789abcdef01234567", name: "Read", input: { path: "a" } }] }] }
+  assert.notEqual(historyKey(tool.messages), historyKey([{ ...tool.messages[0] }, { role: "assistant", content: [{ ...tool.messages[1].content[0], name: "Write" }] }]))
+})
+
+test("probe failure is bounded and does not throw", async () => {
+  const result = await probeOfferedModels("/definitely/missing/agy", { key: "default", dir: null })
+  assert.equal(result, null)
+})
+
+test("account probes share in-flight work, cache failures, time out and clean workspaces", async () => {
+  const originalSpawn = childProcess.spawn
+  const originalTimer = globalThis.setTimeout
+  const originalNow = Date.now
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")
+  const oldDistro = process.env.AGY_BRIDGE_WSL_DISTRO
+  const calls = []
+  let mode = "success"
+  const delays = []
+  try {
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      delays.push(delay)
+      return originalTimer(callback, delay === 5000 ? 20 : delay, ...args)
+    }
+    childProcess.spawn = (file, args, options) => {
+      const record = { file, args, options, methods: [], ended: false }
+      calls.push(record)
+      const child = new EventEmitter()
+      child.stdin = new PassThrough()
+      child.stdout = new PassThrough()
+      child.stderr = new PassThrough()
+      child.stdin.on("finish", () => { record.ended = true })
+      child.stdin.on("data", data => {
+        for (const line of String(data).trim().split("\n")) {
+          const request = JSON.parse(line)
+          record.methods.push(request.method)
+          record.lastParams = request.params
+          if (mode === "hang") continue
+          const result = request.method === "initialize"
+            ? { agentInfo: { version: "1.5.4" }, agentCapabilities: { sessionCapabilities: { close: true } } }
+            : request.method === "session/new" ? { sessionId: "probe-fixture", models: { availableModels: [{ modelId: "gemini-fixture", name: "Fixture" }] } } : {}
+          queueMicrotask(() => child.stdout.write(JSON.stringify(mode === "fail"
+            ? { jsonrpc: "2.0", id: request.id, error: { code: -32603, message: "fixture failure" } }
+            : { jsonrpc: "2.0", id: request.id, result }) + "\n"))
+        }
+      })
+      return child
+    }
+    syncBuiltinESMExports()
+    const account = { key: "singleflight-fixture", dir: path.join(workspace, "account-a") }
+    const [one, two] = await Promise.all([probeOfferedModels("fixture-agy", account), probeOfferedModels("fixture-agy", account)])
+    assert.deepEqual(one, [{ id: "gemini-fixture", name: "Fixture" }])
+    assert.deepEqual(two, one)
+    assert.equal(calls.length, 1)
+    assert.ok(calls[0].args.includes(`--gemini_dir=${account.dir}`))
+    assert.deepEqual(calls[0].methods, ["initialize", "session/new", "session/close"])
+    assert.equal(calls[0].options.env.AGY_CLI_DISABLE_AUTO_UPDATE, "true")
+    assert.equal(calls[0].ended, true)
+    assert.equal(fs.existsSync(calls[0].options.cwd), false)
+    await probeOfferedModels("fixture-agy", { ...account, key: "other-account" })
+    assert.equal(calls.length, 2)
+    mode = "fail"
+    const failed = { key: "failed-fixture", dir: null }
+    assert.equal(await probeOfferedModels("fixture-agy", failed), null)
+    assert.equal(await probeOfferedModels("fixture-agy", failed), null)
+    assert.equal(calls.length, 3)
+    const later = originalNow() + 61_000
+    Date.now = () => later
+    await probeOfferedModels("fixture-agy", failed)
+    assert.equal(calls.length, 4)
+    Date.now = originalNow
+    mode = "hang"
+    assert.equal(await probeOfferedModels("fixture-agy", { key: "timeout-fixture", dir: null }), null)
+    assert.ok(delays.includes(5000))
+    assert.equal(fs.existsSync(calls.at(-1).options.cwd), false)
+    mode = "success"
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" })
+    process.env.AGY_BRIDGE_WSL_DISTRO = "FixtureUbuntu"
+    assert.equal((await getAccounts("fixture-agy", { refresh: true })).length, 1)
+    assert.deepEqual(await probeOfferedModels("agy", { key: "wsl-fixture", dir: null }), one)
+    assert.equal(calls.at(-1).file, "wsl.exe")
+    assert.ok(calls.at(-1).args.includes("FixtureUbuntu"))
+    assert.ok(!calls.at(-1).args.some(arg => arg.startsWith("--gemini_dir=")))
+    assert.ok(calls.every(call => !call.methods.includes("session/prompt")))
+  } finally {
+    childProcess.spawn = originalSpawn
+    syncBuiltinESMExports()
+    globalThis.setTimeout = originalTimer
+    Date.now = originalNow
+    Object.defineProperty(process, "platform", platform)
+    if (oldDistro === undefined) delete process.env.AGY_BRIDGE_WSL_DISTRO
+    else process.env.AGY_BRIDGE_WSL_DISTRO = oldDistro
+  }
 })
 
 test("process capacity and detached grace use defaults for invalid overrides", () => {
@@ -165,6 +265,17 @@ const result = (id, name, text) => ({
   result: { content: [{ type: "text", text }], isError: false },
 })
 const bodyFor = content => ({ messages: [{ role: "assistant", content: [] }, { role: "user", content }] })
+
+test("quoted unclosed notice follows its author while truncated protocol notice is rejected", () => {
+  const item = result("t1", "echo", "ok")
+  const user = bodyFor([{ type: "tool_result", tool_use_id: "t1", content: "ok" }, { type: "text", text: "please explain <system-reminder> syntax" }])
+  assert.equal(inspectToolTurn([item], user).userSteered, true)
+  const system = { messages: [{ role: "assistant", content: [] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] }, { role: "developer", content: "please explain <system-reminder> syntax" }] }
+  const parsed = inspectToolTurn([item], system)
+  assert.equal(parsed.userSteered, false)
+  assert.match(JSON.stringify(parsed.results), /please explain/)
+  assert.throws(() => inspectToolTurn([item], bodyFor([{ type: "tool_result", tool_use_id: "t1", content: "ok" }, { type: "text", text: "<system-update>unfinished" }])))
+})
 
 test("prompt budget counts UTF-8 text and installed instructions, preserving complete parts", () => {
   const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES

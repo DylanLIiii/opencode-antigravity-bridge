@@ -11,8 +11,7 @@ that `agy acp` serves on stdio, following the approach of
 [T3 Code's Antigravity driver](https://github.com/pingdotgg/t3code/tree/main/apps/server/src/provider/acp).
 It keeps agy sessions for conversation branches and serves the client's tools to agy
 as its IDE tools over MCP. Google sees requests made by the real CLI; ACP keeps
-the `zed / 0.0.0` compatibility identity required by agy's non-Gemini model
-allowlist. This is not a guarantee against account restrictions or changes to
+this package’s own name and version as the ACP client identity. This is not a guarantee against account restrictions or changes to
 Google's policies.
 
 ```
@@ -29,6 +28,9 @@ agy acp --agent magpie-bridge --ide-mcp-port <port>
   ▼
 Google Code Assist backend
 ```
+
+
+The minimal agent is enabled by default; set `AGY_BRIDGE_MINIMAL_AGENT=0` to disable it. This intentionally differs from agy-cli’s opt-in default. When per-call records are unavailable, tool-round cache figures are bounded estimates, not evidence of actual Google cache hits. ACP output includes thinking once.
 
 ## Requirements
 
@@ -175,9 +177,7 @@ user profile or VM.
   This is a content heuristic: no native source marker has been verified. Some
   chunk splits can leak through, and legitimate reasoning echoing the same
   signature can also be suppressed.
-- **All account models.** The ACP client identifies as `zed / 0.0.0`, the
-  allowlisted compatibility identity used by T3 Code, which is how agy offers
-  Claude and GPT-OSS models besides Gemini. Changing the model, or the effort
+- **All account models.** The ACP client identifies with this package’s name and version. The bridge probes each account’s offered models before listing them; offerings depend on the installed agy and account. Changing the model, or the effort
   level, uses the server's ACP
   `model` and `thought_level` configuration options inside the live session.
   Model changes refresh the available thinking levels; configuration update

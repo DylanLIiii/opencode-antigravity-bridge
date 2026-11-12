@@ -9,13 +9,14 @@ const EXPLICIT_RATE_LIMIT_RE = /\bToo\s+Many\s+Requests\b|\brate[\s_-]*limit(?:e
 const RESOURCE_EXHAUSTED_RE = /\bRESOURCE_EXHAUSTED\b/i
 const HTTP_429_RE = /\bcode\s*[:=]?\s*429\b|\bstatus(?:code)?\s*[:=]?\s*429\b|\bhttp(?:\/\d(?:\.\d)?)?\s+429\b/i
 const PROMPT_CONTENT_RE = /["']?\b(?:prompt(?:[\s_-]?text)?|input|contents?|messages?|text)\b["']?\s*[:=]/i
+const INVALID_ARGUMENT_RE = /\bINVALID_ARGUMENT\b/i
 
 /**
  * Classify an agy/Antigravity log detail without inspecting or returning prompt content.
  *
  * @param {unknown} detail agy log detail, normally the text after "agent executor error:"
  * @param {{ promptGuardMatched?: boolean, nowMs?: number }} [context]
- * @returns {{ category: "quota_exhausted"|"model_capacity"|"rate_limit"|"prompt_rejected"|"forbidden"|"unknown", retryable: boolean, message: string, retryAfterMs: number|null, reasonCode: string }}
+ * @returns {{ category: "quota_exhausted"|"model_capacity"|"rate_limit"|"prompt_rejected"|"request_rejected"|"forbidden"|"unknown", retryable: boolean, message: string, retryAfterMs: number|null, reasonCode: string }}
  */
 export function classifyUpstreamError(detail, context = {}) {
   const text = detail == null ? "" : String(detail)
@@ -24,6 +25,16 @@ export function classifyUpstreamError(detail, context = {}) {
   const retryAfterMs = parseRetryAfterMs(text, nowMs)
   const generic429 = RESOURCE_EXHAUSTED_RE.test(text) || HTTP_429_RE.test(text)
 
+  if (INVALID_ARGUMENT_RE.test(text)) {
+    return result(
+      "request_rejected",
+      false,
+      "Antigravity rejected an invalid request argument; the upstream error may not identify the field and automatic retry is disabled",
+      "AGY_ERROR_INVALID_ARGUMENT",
+      text,
+      null,
+    )
+  }
   if (FORBIDDEN_RE.test(text)) {
     return result(
       "forbidden",

@@ -1,4 +1,6 @@
 // Per-model-call usage from agy's local conversation store.
+// Adapted from magpie-community/plugins packages/agy-cli at b829a5541ecc0790b05a63308447bf87e952efbe.
+// MIT; Copyright (c) 2026 DylanLIiii, gitxm, yce. See NOTICE-upstream-license.txt.
 //
 // ACP reports usage once, accumulated over a whole session/prompt. Prefer
 // `gen_metadata`, written when generation ends, before client tools return.
@@ -6,12 +8,15 @@
 // step_type 15 and status 3 (done), the counts in Protobuf field 9 of
 // `metadata` (2 uncached input, 3 output, 4 cache write, 5 cache read,
 // 9 thinking). Summed over a prompt they equal the ACP total exactly.
-// Format first decoded by lili-luo/dsh-plugin-bundle (dsh-llm-antigravity-acp,
-// MIT). Any failure here returns null and the caller keeps its estimate.
+// Protobuf layout first decoded by lili-luo/dsh-plugin-bundle
+// (dsh-llm-antigravity-acp, MIT); SQLite reader adapted from
+// DylanLIiii/opencode-antigravity-bridge (MIT). Any failure here returns null
+// and the caller keeps its estimate.
 import { createRequire } from "node:module"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 
 const MODEL_STEP = 15
 const STEP_DONE = 3
@@ -19,26 +24,46 @@ const require = createRequire(import.meta.url)
 
 let opener
 
-// node:sqlite (Node >= 22.5, Bun) or bun:sqlite; null when neither loads.
+// Prefer bun:sqlite under Bun (Bun's node:sqlite keeps an unfinalized statement's
+// file handle open until GC, locking the store on Windows); fall back to
+// node:sqlite on Node >= 22.5. Never open a read-write handle or wait on locks.
 function loadOpener() {
   if (opener !== undefined) return opener
   opener = null
   try {
-    const { DatabaseSync } = require("node:sqlite")
-    if (typeof DatabaseSync === "function") {
-      opener = (file) => {
-        const db = new DatabaseSync(file, { readOnly: true, timeout: 50 })
-        return { all: (sql, ...args) => db.prepare(sql).all(...args), close: () => db.close() }
+    const { Database, constants } = require("bun:sqlite")
+    if (typeof Database === "function") {
+      // Bun's bundled SQLite on Linux/Windows disables URI filenames unless SQLITE_OPEN_URI is passed.
+      const flags = constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI
+      opener = (target) => {
+        const db = new Database(target, flags)
+        return {
+          all: (sql, ...args) => {
+            const stmt = db.prepare(sql)
+            try {
+              return stmt.all(...args)
+            } finally {
+              stmt.finalize()
+            }
+          },
+          close: () => db.close(),
+        }
       }
       return opener
     }
   } catch {}
   try {
-    const { Database } = require("bun:sqlite")
-    opener = (file) => {
-      const db = new Database(file, { readonly: true })
-      db.exec("PRAGMA busy_timeout = 50")
-      return { all: (sql, ...args) => db.query(sql).all(...args), close: () => db.close() }
+    const { DatabaseSync } = require("node:sqlite")
+    if (typeof DatabaseSync === "function") {
+      // Only plain Node reaches this fallback; Node's DatabaseSync.close() finalizes prepared statements.
+      opener = (target) => {
+        const db = new DatabaseSync(target, { readOnly: true, timeout: 0 })
+        return {
+          all: (sql, ...args) => db.prepare(sql).all(...args),
+          close: () => db.close(),
+        }
+      }
+      return opener
     }
   } catch {}
   return opener
@@ -128,11 +153,14 @@ export function decodeStepUsage(metadata) {
 // Its pre-send local context estimate is separate, at 1 -> 9 -> 10 -> 1.
 // A context estimate alone is not a completed, billed model call.
 export function decodeGenerationUsage(data) {
-  if (!(data instanceof Uint8Array)) return null
+  const buf = data instanceof Uint8Array ? data
+    : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+      : null
+  if (!buf) return null
   let stats = null
   let context = null
   let valid = true
-  const ok = walk(data, (field, wire, chat) => {
+  const ok = walk(buf, (field, wire, chat) => {
     if (field !== 1 || wire !== 2) return
     valid = walk(chat, (sub, subWire, value) => {
       if (subWire !== 2) return
@@ -152,56 +180,94 @@ export function decodeGenerationUsage(data) {
   return ok && valid && stats ? { ...stats, ...(context !== null ? { context } : {}) } : null
 }
 
-function query(file, sql, ...args) {
-  if (!file || !fs.existsSync(file)) return null
-  const open = loadOpener()
-  if (!open) return null
+function runReadOnly(open, target, fn) {
   let db
   try {
-    db = open(file)
-    return db.all(sql, ...args)
-  } catch {
-    return null
+    db = open(target)
+    return fn(db)
   } finally {
     try { db?.close() } catch {}
   }
 }
 
-// Highest completed model-call index, -1 for an empty or missing store, null
-// when the store exists but cannot be read.
-export function lastModelStep(file) {
-  if (!file) return null
-  if (!fs.existsSync(file)) return -1
-  const rows = query(file,
+function tableQuery(db, sql, ...args) {
+  try {
+    return db.all(sql, ...args)
+  } catch (error) {
+    if (/no such table|no such column/i.test(String(error?.message || ""))) return null
+    throw error
+  }
+}
+
+function isCheckpointedWal(file) {
+  if (fs.existsSync(`${file}-wal`) || fs.existsSync(`${file}-shm`) || fs.existsSync(`${file}-journal`)) return false
+  let fd
+  try {
+    fd = fs.openSync(file, "r")
+    const header = new Uint8Array(20)
+    if (fs.readSync(fd, header, 0, 20, 0) < 20) return false
+    return header[18] === 2 && header[19] === 2
+  } catch {
+    return false
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd) } catch {}
+    }
+  }
+}
+
+function resolveStorePath(file) {
+  if (typeof file !== "string" || !file || file.includes("\0")) return null
+  return path.resolve(file)
+}
+
+// SQLite rejects non-localhost URI authorities (`file://server/share/...`) unless
+// compiled with SQLITE_ALLOW_URI_AUTHORITY, strips `localhost` from `\\localhost\...`,
+// and pathToFileURL rejects `\\?\...` extended paths. Prefixing Windows `\\...` paths
+// directly after `file:` (with `%`, `?`, `#`, space percent-encoded) avoids any
+// `//authority` segment so sqlite3ParseUri hands the exact `\\...` path to winOpen.
+function immutableUri(resolved) {
+  if (process.platform === "win32" && resolved.startsWith("\\\\")) {
+    return `file:${resolved.replace(/[%?# ]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)}?immutable=1`
+  }
+  return `${pathToFileURL(resolved).href}?immutable=1`
+}
+
+// When a WAL-flagged store (header bytes 18..19 = 2, 2) has neither -wal nor
+// -shm on disk, no writer holds it open, yet SQLITE_OPEN_READONLY fails with
+// SQLITE_CANTOPEN under Apple's libsqlite3 on macOS and creates -wal/-shm
+// sidecars under upstream SQLite. Opening with ?immutable=1 keeps that closed
+// WAL read strictly side-effect-free; if -wal appears concurrently, re-read
+// once against the resolved live file path (never a relative `file:...` string).
+function withStore(file, fn) {
+  const resolved = resolveStorePath(file)
+  if (!resolved || !fs.existsSync(resolved)) return null
+  const open = loadOpener()
+  if (!open) return null
+  if (isCheckpointedWal(resolved)) {
+    try {
+      const result = runReadOnly(open, immutableUri(resolved), fn)
+      if (!fs.existsSync(`${resolved}-wal`)) return result
+    } catch {
+      if (!fs.existsSync(`${resolved}-wal`)) return null
+    }
+  }
+  try {
+    return runReadOnly(open, resolved, fn)
+  } catch {
+    return null
+  }
+}
+
+function maxCompletedStep(db) {
+  const rows = tableQuery(db,
     `SELECT COALESCE(MAX(idx), -1) AS idx FROM steps WHERE step_type = ${MODEL_STEP} AND status = ${STEP_DONE}`)
   const idx = Number(rows?.[0]?.idx)
   return Number.isSafeInteger(idx) ? idx : null
 }
 
-// Highest model-call step index regardless of status, -1 for an empty or
-// missing store, null when the store exists without `steps` or cannot be read.
-export function latestModelStep(file) {
-  if (!file) return null
-  if (!fs.existsSync(file)) return -1
-  const rows = query(file,
-    `SELECT COALESCE(MAX(idx), -1) AS idx FROM steps WHERE step_type = ${MODEL_STEP}`)
-  const idx = Number(rows?.[0]?.idx)
-  return Number.isSafeInteger(idx) ? idx : null
-}
-
-// Highest generation record index, -1 for an empty or missing store, null when
-// `gen_metadata` is absent or cannot be read.
-export function latestGenerationIdx(file) {
-  if (!file) return null
-  if (!fs.existsSync(file)) return -1
-  const rows = query(file, "SELECT COALESCE(MAX(idx), -1) AS idx FROM gen_metadata")
-  const idx = Number(rows?.[0]?.idx)
-  return Number.isSafeInteger(idx) ? idx : null
-}
-
-// Completed model calls after `afterIdx`, oldest first: [{ idx, input, output, write, read, thinking }].
-export function modelStepsAfter(file, afterIdx) {
-  const rows = query(file,
+function stepsAfter(db, afterIdx) {
+  const rows = tableQuery(db,
     `SELECT idx, metadata FROM steps WHERE step_type = ${MODEL_STEP} AND status = ${STEP_DONE} AND idx > ? ORDER BY idx`,
     afterIdx)
   if (!rows) return null
@@ -215,40 +281,87 @@ export function modelStepsAfter(file, afterIdx) {
   return steps
 }
 
+// Highest completed model-call index, -1 for an empty or missing store, null
+// when the store exists but cannot be read.
+export function lastModelStep(file) {
+  const resolved = resolveStorePath(file)
+  if (!resolved) return null
+  if (!fs.existsSync(resolved)) return -1
+  return withStore(resolved, (db) => maxCompletedStep(db))
+}
+
+// Local sibling safety checks need the highest row including pending rows.
+export function latestModelStep(file) {
+  if (!file) return null
+  if (!fs.existsSync(file)) return -1
+  return withStore(file, db => {
+    const rows = tableQuery(db, `SELECT COALESCE(MAX(idx), -1) AS idx FROM steps WHERE step_type = ${MODEL_STEP}`)
+    const idx = Number(rows?.[0]?.idx)
+    return Number.isSafeInteger(idx) ? idx : null
+  })
+}
+
+export function latestGenerationIdx(file) {
+  if (!file) return null
+  if (!fs.existsSync(file)) return -1
+  return withStore(file, db => {
+    const rows = tableQuery(db, "SELECT COALESCE(MAX(idx), -1) AS idx FROM gen_metadata")
+    const idx = Number(rows?.[0]?.idx)
+    return Number.isSafeInteger(idx) ? idx : null
+  })
+}
+
+// Completed model calls after `afterIdx`, oldest first: [{ idx, input, output, write, read, thinking }].
+export function modelStepsAfter(file, afterIdx) {
+  return withStore(file, (db) => stepsAfter(db, afterIdx))
+}
+
 // Pin a turn to one table. Reading both tables for a turn would bill the same
 // generation twice. A new store is discovered after its first generation.
 export function modelUsageCursor(file) {
-  if (!file) return null
-  if (!fs.existsSync(file)) return { source: null, idx: -1, generationIdx: -1, modelStep: -1 }
-  const generationIdx = latestGenerationIdx(file)
-  const step = lastModelStep(file)
-  const modelStep = latestModelStep(file)
-  if (generationIdx !== null) {
-    return step === null ? { source: "gen_metadata", idx: generationIdx, modelStep }
-      : { source: null, idx: step, generationIdx, modelStep }
-  }
-  return step === null ? null : { source: "steps", idx: step, modelStep }
+  const resolved = resolveStorePath(file)
+  if (!resolved) return null
+  if (!fs.existsSync(resolved)) return { source: null, idx: -1, generationIdx: -1 }
+  return withStore(resolved, (db) => {
+    const genRows = tableQuery(db, "SELECT COALESCE(MAX(idx), -1) AS idx FROM gen_metadata")
+    const generationIdx = Number(genRows?.[0]?.idx)
+    const step = maxCompletedStep(db)
+    if (Number.isSafeInteger(generationIdx)) {
+      return step === null ? { source: "gen_metadata", idx: generationIdx }
+        : { source: null, idx: step, generationIdx }
+    }
+    return step === null ? null : { source: "steps", idx: step }
+  })
 }
 
 export function modelUsageAfter(file, cursor) {
   if (!cursor) return null
-  if (cursor.source !== "steps") {
-    const after = cursor.source === "gen_metadata" ? cursor.idx : cursor.generationIdx
-    const rows = query(file, "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx", after)
-    if (rows) {
-      const steps = []
-      for (const row of rows) {
-        const idx = Number(row.idx)
-        const usage = decodeGenerationUsage(row.data)
-        if (!Number.isSafeInteger(idx)) return null
-        // Failed generations and pre-send estimates carry no billing counters.
-        if (!usage || !(usage.input + usage.read + usage.write + usage.output + usage.thinking)) continue
-        steps.push({ idx, ...usage })
+  return withStore(file, (db) => {
+    if (cursor.source !== "steps") {
+      const after = cursor.source === "gen_metadata" ? cursor.idx : cursor.generationIdx
+      const rows = tableQuery(db, "SELECT idx, data FROM gen_metadata WHERE idx > ? ORDER BY idx", after)
+      if (rows) {
+        const steps = []
+        let pending = false
+        for (const row of rows) {
+          const idx = Number(row.idx)
+          const usage = decodeGenerationUsage(row.data)
+          if (!Number.isSafeInteger(idx)) return null
+          // Failed generations and pre-send estimates carry no billing counters.
+          if (!usage || !(usage.input + usage.read + usage.write + usage.output + usage.thinking)) {
+            pending = true
+            continue
+          }
+          pending = false
+          steps.push({ idx, ...usage })
+        }
+        if (steps.length || pending || cursor.source === "gen_metadata") {
+          return { source: "gen_metadata", steps, ...(pending ? { pending: true } : {}) }
+        }
       }
-      if (steps.length || cursor.source === "gen_metadata") return { source: "gen_metadata", steps }
+      if (cursor.source === "gen_metadata") return null
     }
-    if (cursor.source === "gen_metadata") return null
-  }
-  const steps = modelStepsAfter(file, cursor.idx)
-  return steps === null ? null : { source: "steps", steps }
+    const steps = stepsAfter(db, cursor.idx)
+    return steps === null ? null : { source: "steps", steps }
+  })
 }

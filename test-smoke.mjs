@@ -2527,6 +2527,12 @@ for (const location of ["inline", "system", "developer", "user"]) {
 {
   const prefillOnly = await callFetch({ model, messages: [{ role: "assistant", content: "prefill" }] })
   const prefillTail = await callFetch({ model, messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "prefill" }] })
+  const prefillEvents = (await readSSE(prefillTail)).events
+  const prefillSent = lastOf("user")?.text
+  process.env.AGY_BRIDGE_PREFILL = "0"
+  const prefillOff = await callFetch({ model, messages: [{ role: "user", content: "hi disabled" }, { role: "assistant", content: "prefill" }] })
+  delete process.env.AGY_BRIDGE_PREFILL
+  check("prefill sends an unfinished reply carrier and explicit off rejects", stopOf(prefillEvents) === "end_turn" && prefillSent?.includes("unfinished reply") && prefillSent?.includes("prefill") && prefillOff.status === 400, prefillSent)
   const loneSystem = await callFetch({ model, messages: [{ role: "system", content: "system without user or history" }] })
   const nonTextSystem = await callFetch({
     model,

@@ -1059,7 +1059,8 @@ async function launchedModel(body) {
   const init = inits().at(-1)
   const user = lastOf("user")
   check("ACP session uses the minimal isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true"].every(line => init.agentConfig.includes(line)), init.agentConfig)
-  check("ACP client identifies as an allowlisted client", init.clientInfo?.name === "zed" && init.clientInfo?.version === "0.0.0")
+  const pkg = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
+  check("ACP client identifies as this package", init.clientInfo?.name === pkg.name && init.clientInfo?.version === pkg.version)
   check("client system prompt is appended to the session instructions", init.systemAppend?.includes("SYSTEM-PROMPT-MARKER"))
   check("fresh prompt carries only the user text", user.text === "hello world", JSON.stringify(user.text))
   check("client tools are served through the ide-tools port", !!init.idePort && !logs().some(event => event.type === "ncExit"))
@@ -2457,8 +2458,8 @@ for (const location of ["inline", "system", "developer", "user"]) {
     ],
   })
   const nonTextPayload = await nonTextSystem.json()
-  check("assistant prefill and lone system messages return 400",
-    prefillOnly.status === 400 && prefillTail.status === 400 && loneSystem.status === 400,
+  check("assistant prefill after a user is accepted while lone messages are rejected",
+    prefillOnly.status === 400 && prefillTail.status === 200 && loneSystem.status === 400,
     `${prefillOnly.status},${prefillTail.status},${loneSystem.status}`)
   check("unsupported system content block error names the block type",
     nonTextSystem.status === 400 && nonTextPayload.error?.message?.includes('"audio_chunk"'),

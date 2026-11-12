@@ -18,7 +18,20 @@ import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter
 import { OutputLimitFilter } from "./output-limit.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
+import { cloak, hint, turnsAway } from "./cloak.mjs"
 
+const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
+export const MIN_AGY_VERSION = "1.4.12"
+export function agyTooOld(version) {
+  const parsed = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? "").trim())
+  if (!parsed) return null
+  const have = parsed.slice(1).map(Number), need = [1, 4, 12]
+  for (let i = 0; i < 3; i++) {
+    if (have[i] > need[i]) return null
+    if (have[i] < need[i]) return `agy ${version} is older than ${MIN_AGY_VERSION}; update agy.`
+  }
+  return null
+}
 const PROVIDER_ID = "antigravity-bridge"
 const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
@@ -880,7 +893,6 @@ class Turn {
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
     if (calibrate && total > 0) {
       this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
-      this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
     }
   }
 
@@ -1102,6 +1114,7 @@ class Proc {
     // estimate used for tool-step responses that carry no exact usage.
     this.inputTokenScale = 1
     this.lastCacheRatio = undefined
+    this.stepUsageTrusted = true
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -1221,11 +1234,12 @@ class Proc {
   async #handshake() {
     const init = await this.conn.request("initialize", {
       protocolVersion: 1,
-      // agy offers non-Gemini models only to allowlisted ACP clients.
-      clientInfo: { name: "zed", version: "0.0.0" },
+      clientInfo: { name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version },
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
     })
     this.agentVersion = init?.agentInfo?.version ?? null
+    const versionError = agyTooOld(this.agentVersion)
+    if (versionError) throw new Error(versionError)
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
@@ -1233,7 +1247,7 @@ class Proc {
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
-      ? { _meta: { antigravity: { systemPrompt: { append: this.instructions } } } }
+      ? { _meta: { antigravity: { systemPrompt: { append: cloak(this.instructions) } } } }
       : {}
 
     let session = null
@@ -1510,13 +1524,14 @@ class Proc {
     try {
       turn.arm()
       if (model) await this.#setModel(model, selection)
-      const stepUsageEnabled = !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
+      const stepUsageEnabled = this.stepUsageTrusted && !/^(?:0|false|off|no|disabled)$/i.test(process.env.AGY_BRIDGE_STEP_USAGE || "")
       // A named account keeps its conversation store inside its own Gemini dir.
       const stepsEnv = this.geminiDir
         ? { AGY_BRIDGE_CONVERSATIONS_DIR: path.join(this.geminiDir, "antigravity-cli", "conversations") }
         : process.env
       turn.stepsFile = stepUsageEnabled && !wslDistro() ? sessionDbPath(this.sessionId, stepsEnv) : null
       turn.stepCursor = modelUsageCursor(turn.stepsFile)
+      if (turn.stepsFile && turn.stepCursor === null) this.stepUsageTrusted = false
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
       this.unsentPrompt = null
@@ -1661,6 +1676,9 @@ class Proc {
   }
 
   #formatAgentError(detail, promptGuardMatched = false) {
+    if (/code 429\b/i.test(detail) && /resource has been exhausted/i.test(detail) && turnsAway(this.instructions)) {
+      return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "invalid_request_error")
+    }
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
     const kind = classification.category === "forbidden" ? "permission_error"
       : ["quota_exhausted", "model_capacity", "rate_limit", "prompt_rejected"].includes(classification.category)
@@ -1675,6 +1693,7 @@ class Proc {
     if (turn.cancelRequested || turn.done || turn.finalized) return false
     if (turn.hasPendingMcp() || this.dead) return false
     turn.cancelRequested = true
+    if (turn.stepsFile) this.stepUsageTrusted = false
     turn.detach()
     if (this.expectedMessages && partialContent.length) {
       this.expectedMessages.push({ role: "assistant", content: partialContent })
@@ -2863,6 +2882,99 @@ function stripMagpiePlaceholderNotice(text) {
 
 // Compare conversation content, not transport metadata or client-assigned IDs.
 // Keep argument values, result contents and internal whitespace significant.
+function stripBillingHeader(text) {
+  let s = String(text ?? "")
+  s = s.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*\n?/gmi, "")
+  s = s.replace(/^[ \t]*cch=[0-9a-fA-F]+;?[ \t]*\n?/gmi, "")
+  return s
+}
+
+const ISO_DATE = String.raw`20\d{2}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?`
+const LOCALE_DATE = String.raw`(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}(?:\s+\d{2}:\d{2}(?::\d{2})?)?`
+const CLOCK_VALUE = String.raw`(?:${ISO_DATE}|${LOCALE_DATE}|\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?)`
+const AGENT_CLOCK_LINE_RE = new RegExp(
+  String.raw`^(?:#{1,6}\s*)?(?:(?:(?:current\s+)?(?:date|time|datetime|today|now)|today(?:'s)?\s+date|(?:the\s+)?current\s+(?:date|time|datetime))\s*[:：]\s*${CLOCK_VALUE}|(?:(?:the\s+)?current\s+(?:date|time|datetime)|today(?:'s)?\s+date)\s+is\s+${CLOCK_VALUE})\s*\.?$`,
+  "i",
+)
+
+function isAgentClockLine(line) {
+  return AGENT_CLOCK_LINE_RE.test(String(line ?? "").trim())
+}
+
+function stripAgentClockLines(text) {
+  const s = String(text ?? "")
+  if (!s) return s
+  return s.split(/(\n)/).map((part) => (part === "\n" || !isAgentClockLine(part) ? part : "")).join("")
+}
+
+// System prompt and session instructions: billing headers plus known agent
+// clock lines. User text is never passed through this helper.
+function stripVolatileSystem(text) {
+  return stripAgentClockLines(stripBillingHeader(text))
+}
+
+function instructionsIdentity(text) {
+  return compactIdentity(stripVolatileSystem(text))
+}
+
+// Message text used for conversation/history identity: billing header lines,
+// and clock lines only inside <system-reminder> blocks (Claude Code injects
+// these on later turns too, so a mid-chat clock change must not rewrite the
+// history). Ordinary user/assistant text is left alone, including lines that
+// start with "Today:" or contain a date.
+// Walk closed <system-reminder>…</system-reminder> blocks with indexOf so an
+// unclosed opener does not rescan the rest of the string from every match
+// (the previous /[\s\S]*?/ regex was quadratic in the number of open tags).
+// Length-preserving ASCII fold. s.toLowerCase() maps İ (U+0130) to two
+// code units ("i" + combining dot), which would shift later indexes.
+function asciiLower(s) {
+  return String(s ?? "").replace(/[A-Z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 32))
+}
+
+function replaceClosedSystemReminders(text, replacer) {
+  const s = String(text ?? "")
+  if (!s) return s
+  const open = "<system-reminder"
+  const close = "</system-reminder>"
+  const lower = asciiLower(s)
+  let out = ""
+  let i = 0
+  while (i < s.length) {
+    const start = lower.indexOf(open, i)
+    if (start === -1) {
+      out += s.slice(i)
+      break
+    }
+    const afterName = start + open.length
+    if (afterName < s.length && /[A-Za-z0-9_]/.test(s[afterName])) {
+      out += s.slice(i, afterName)
+      i = afterName
+      continue
+    }
+    const gt = s.indexOf(">", afterName)
+    if (gt === -1) {
+      out += s.slice(i)
+      break
+    }
+    const closeAt = lower.indexOf(close, gt + 1)
+    if (closeAt === -1) {
+      // No closer after this tag means none exists later either; keep the rest
+      // verbatim so later openers do not rescan the same suffix.
+      out += s.slice(i)
+      break
+    }
+    const end = closeAt + close.length
+    out += s.slice(i, start) + replacer(s.slice(start, end))
+    i = end
+  }
+  return out
+}
+
+function stripVolatileOpening(text) {
+  return replaceClosedSystemReminders(stripBillingHeader(text), (block) => stripAgentClockLines(block))
+}
+
+
 function historyKey(messages) {
   const rows = []
   const ids = new Map()
@@ -2874,7 +2986,7 @@ function historyKey(messages) {
         block.type === "tool_addition" || block.type === "tool_removal") continue
       let value
       if (typeof block === "string" || block.type === "text") {
-        value = { type: "text", text: stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "") }
+        value = { type: "text", text: stripVolatileOpening(stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "")) }
       } else if (block.type === "document") {
         value = { type: "text", text: parseUserDocumentText(block) }
       } else if (block.type === "search_result") {
@@ -2910,8 +3022,54 @@ function historyKey(messages) {
   return stableJSON(rows.filter(row => row.content.length))
 }
 
+const prefillTailEnabled = () => process.env.AGY_BRIDGE_PREFILL !== "0"
+const prefillCarrierNote = () => process.env.AGY_BRIDGE_PREFILL_CARRIER_NOTE
+  || "(system note: the fragment below is part of your own unfinished reply; continue exactly from where it stops, and do not repeat it.)"
+
+// Concatenated text of an assistant message, or null when the message carries
+// anything other than plain text blocks. An empty string means "no content".
+function assistantTextOf(message) {
+  if (!message || message.role !== "assistant") return null
+  if (typeof message.content === "string") return message.content
+  if (!Array.isArray(message.content)) return null
+  let text = ""
+  for (const block of message.content) {
+    if (!block || block.type !== "text" || typeof block.text !== "string") return null
+    text += block.text
+  }
+  return text
+}
+
+// History/tail positions for a request that ends with an assistant prefill
+// run: runStart = first message of the trailing text-only assistant run,
+// boundary = history split point (after the last assistant message before the
+// run, the session ledger's newest entry). Returns null when the request does
+// not end with a text-only assistant run. Known limits: a request combining a
+// live tool_result with a prefill tail is rejected in validateBody; a run with
+// no user message before it (contiguous assistant tail, e.g. a client re-sending
+// a completed reply with a prefill appended) puts the whole run in the tail, so
+// that one turn degrades to a fresh session (safe, self-healing).
+function prefillRun(messages) {
+  const last = messages.at(-1)
+  if (!last || last.role !== "assistant") return null
+  if (assistantTextOf(last) === null) return null
+  let runStart = messages.length
+  while (runStart > 0 && messages[runStart - 1]?.role === "assistant" && assistantTextOf(messages[runStart - 1]) !== null) runStart--
+  let boundary = runStart
+  while (boundary > 0 && messages[boundary - 1]?.role !== "assistant") boundary--
+  return { runStart, boundary }
+}
+
+function renderPrefillCarrierParts(message) {
+  const body = (assistantTextOf(message) || "").trim()
+  if (!body) return []
+  return [{ type: "text", text: `${prefillCarrierNote()}\n${body}` }]
+}
+
 function trailingMessages(body) {
   body = canonicalBody(body)
+  const run = prefillTailEnabled() ? prefillRun(body.messages) : null
+  if (run) return { history: body.messages.slice(0, run.boundary), messages: body.messages.slice(run.boundary) }
   let start = body.messages.length
   while (start > 0 && body.messages[start - 1].role !== "assistant") start--
   return { history: body.messages.slice(0, start), messages: body.messages.slice(start) }
@@ -3002,13 +3160,13 @@ function compactIdentity(text) {
 }
 
 function sameInstructions(a, b) {
-  return compactIdentity(a) === compactIdentity(b)
+  return instructionsIdentity(a) === instructionsIdentity(b)
 }
 
 // The model is not part of the key: agy switches models inside a live session.
 function conversationKey(rawBody) {
   const body = canonicalBody(rawBody)
-  const system = historyKey([{ role: "system", content: compactIdentity(systemText(body)) }])
+  const system = historyKey([{ role: "system", content: instructionsIdentity(systemText(body)) }])
   const first = body.messages?.[0]
   const firstText = first ? historyKey([first]) : ""
   const discriminator = body.metadata?.user_id || ""
@@ -3340,7 +3498,8 @@ function renderTurnMessage(message) {
 
 function renderTurnMessageParts(message, historical = false, stripResults = false) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
-    const text = renderTurnMessage(message)
+    let text = renderTurnMessage(message)
+    if (message.role === "system" || message.role === "developer") text = cloak(text)
     return text === "" ? [] : [{ type: "text", text }]
   }
   const parts = []
@@ -3371,7 +3530,14 @@ function renderTurnMessageParts(message, historical = false, stripResults = fals
 }
 
 function renderTurnMessagesParts(messages) {
-  const groups = messages.map(message => renderTurnMessageParts(message)).filter((group) => group.length > 0)
+  // A trailing assistant prefill run renders as a continuation carrier rather
+  // than the system-reminder treatment (see prefillRun above).
+  const run = prefillTailEnabled() && messages.length ? prefillRun(messages) : null
+  const prefillStart = run ? run.runStart : -1
+  const groups = messages.map((message, index) =>
+    prefillStart >= 0 && index >= prefillStart
+      ? renderPrefillCarrierParts(message)
+      : renderTurnMessageParts(message)).filter((group) => group.length > 0)
   const out = []
   for (let i = 0; i < groups.length; i++) {
     if (i > 0) out.push({ type: "text", text: "\n\n" })
@@ -3380,13 +3546,16 @@ function renderTurnMessagesParts(messages) {
   return toPromptParts(out)
 }
 
+// agy's ACP server cuts a prompt at 128 KiB and appends "<truncated N bytes>",
+// which would drop </conversation_history> and the whole <current_turn> of a
+// long replay. Keep the initial prompt's text under this budget instead.
 function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, stripResults = false, replay = null) {
   const { history: originalHistory, messages: current } = trailingMessages(body)
   const history = replay?.history ?? originalHistory
   const out = []
   if (!instructionsInSession) {
     const system = systemText(body)
-    if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${system}\n</external_system_instructions>\n`)
+    if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${cloak(system)}\n</external_system_instructions>\n`)
     if (callerWorkDir) appendPrompt(out, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   if (history.length) {
@@ -3488,7 +3657,9 @@ function validateBody(body) {
   }
   const trailing = trailingMessages(body)
   const lastRole = body.messages.at(-1)?.role
-  const validTailRole = lastRole === "user" || lastRole === "system" || lastRole === "developer"
+  const prefillTail = prefillTailEnabled() && lastRole === "assistant" && assistantTextOf(body.messages.at(-1)) !== null
+  if (prefillTail && extractToolResults(body).length) throw new UnsupportedContent("a request combining a live tool_result with an assistant prefill tail")
+  const validTailRole = lastRole === "user" || lastRole === "system" || lastRole === "developer" || prefillTail
   if (!validTailRole || (!extractToolResults(body).length &&
     !trailing.messages.some((message) => message.role === "user") && !trailing.history.length)) {
     throw new UnsupportedContent("a request whose last message is not from the user or a tool-result notification")
@@ -4142,6 +4313,7 @@ async function settleUsage(proc, turn, step, content, result) {
   if (measured) return measured
   // The store's later calls would no longer line up with what was reported.
   turn.stepCursor = null
+  if (turn.stepsFile) proc.stepUsageTrusted = false
   return responseUsage(proc, turn, step, content, result)
 }
 

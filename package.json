@@ -21,6 +21,9 @@
     "mcp-server.mjs",
     "prompt-guard.mjs",
     "tool-schema.mjs",
+    "re2-pattern.mjs",
+    "cloak.mjs",
+    "array-items.mjs",
     "upstream-error.mjs",
     "usage.mjs",
     "output-limit.mjs",
@@ -32,7 +35,7 @@
     "README.en.md"
   ],
   "scripts": {
-    "test": "node --test test-step-usage.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-upstream-error.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test-smoke.mjs",
+    "test": "node --test test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-schema-parity.mjs test-upstream-error.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [

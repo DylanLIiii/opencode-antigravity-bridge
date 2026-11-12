@@ -10,14 +10,13 @@ const run = chunks => {
   let text = ""
   for (const c of chunks) text += f.push(c)
   text += f.flush()
-  return { text, error: false, dropped: f.dropped }
+  return { text, failureCandidate: f.failureCandidate, dropped: f.dropped }
 }
 const split = s => [...s]
 
 test("standalone retry warnings are dropped however chunked, issue #49 sample", () => {
   for (const chunks of [[INT + API], split(INT + API), ["a", INT, API, "b"]]) {
     const r = run(chunks)
-    assert.equal(r.error, false)
     assert.equal(r.dropped, 2)
     assert.equal(r.text.replace(/[ab]/g, ""), "")
   }
@@ -44,7 +43,6 @@ test("quoted banners in prose, inline code and fences are model text (issue #49 
     "- ⚠ API error (attempt 2): quoted\n",
   ]) for (const chunks of [[text], split(text)]) {
     const r = run(chunks)
-    assert.equal(r.error, false, text)
     assert.equal(r.text, text)
   }
 })
@@ -58,13 +56,13 @@ test("a look-alike held at a step boundary is released unchanged", () => {
 
 test("a terminal-looking line followed by normal output does not permanently fail the turn", () => {
   const r = run([ERR, "Normal answer after recovery."])
-  assert.equal(r.error, false)
+  assert.equal(r.failureCandidate, false)
   assert.ok(r.text.includes("Normal answer after recovery."))
 })
 
 test("a standalone terminal-looking model quotation is preserved without corroboration", () => {
   const r = run([ERR])
-  assert.equal(r.error, false)
+  assert.equal(r.failureCandidate, true)
   assert.equal(r.text, ERR)
 })
 

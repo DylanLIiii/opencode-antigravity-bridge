@@ -258,3 +258,17 @@ test("FAILED_PRECONDITION is a non-retryable rejected request", () => {
   assert.equal(result.retryable, false)
   assert.equal(result.reasonCode, "AGY_ERROR_FAILED_PRECONDITION")
 })
+
+test("UNAUTHENTICATED / HTTP 401 is classified separately from 403 and never retried in place", () => {
+  for (const detail of [
+    "agent executor error: generating and executing: UNAUTHENTICATED (code 401): Request had invalid authentication credentials.",
+    "HTTP 401 Unauthorized",
+    JSON.stringify({ error: { code: 401, status: "UNAUTHENTICATED" } }),
+  ]) {
+    const result = classifyUpstreamError(detail)
+    assert.equal(result.category, "unauthenticated")
+    assert.equal(result.reasonCode, "AGY_ERROR_UNAUTHENTICATED")
+    assert.equal(result.retryable, false)
+  }
+  assert.equal(classifyUpstreamError("PERMISSION_DENIED (code 403)").category, "forbidden")
+})

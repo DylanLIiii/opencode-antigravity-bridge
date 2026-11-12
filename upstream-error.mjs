@@ -2,6 +2,7 @@ const MAX_DETAIL_LENGTH = 2000
 const MAX_PARSE_LENGTH = 8000
 const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000
 
+const UNAUTHENTICATED_RE = /\bUNAUTHENTICATED\b|\bcode\s*[:=]?\s*401\b|\bstatus(?:code)?\s*[:=]?\s*401\b|\bhttp(?:\/\d(?:\.\d)?)?\s+401\b|\b401\s+Unauthorized\b/i
 const FORBIDDEN_RE = /\bTOS_VIOLATION\b|\bPERMISSION_DENIED\b|\bVALIDATION_REQUIRED\b|\bcode\s*[:=]?\s*403\b|\bstatus(?:code)?\s*[:=]?\s*403\b|\bhttp(?:\/\d(?:\.\d)?)?\s+403\b|\b403\s+Forbidden\b/i
 const MODEL_CAPACITY_RE = /\bMODEL_CAPACITY_EXHAUSTED\b/i
 const QUOTA_RE = /\bQUOTA_EXHAUSTED\b|\bquota\s+(?:has\s+been\s+)?exhausted\b|\bindividual\s+quota\b|\bquota\s+(?:limit\s+)?exceeded\b|\bexceeded\s+(?:your\s+)?(?:current\s+)?quota\b|\binsufficient\s+quota\b|\bquota[\s_-]*reset/i
@@ -25,6 +26,16 @@ export function classifyUpstreamError(detail, context = {}) {
   const retryAfterMs = parseRetryAfterMs(text, nowMs)
   const generic429 = RESOURCE_EXHAUSTED_RE.test(text) || HTTP_429_RE.test(text)
 
+  if (UNAUTHENTICATED_RE.test(text)) {
+    return result(
+      "unauthenticated",
+      false,
+      "Antigravity reported expired or rejected Google authentication",
+      "AGY_ERROR_UNAUTHENTICATED",
+      text,
+      retryAfterMs,
+    )
+  }
   if (/\bFAILED_PRECONDITION\b/i.test(text)) {
     return result("request_rejected", false,
       "Antigravity rejected the request because an upstream precondition was not met; automatic retry is disabled",

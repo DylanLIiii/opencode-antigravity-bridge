@@ -361,7 +361,7 @@ async function prompt(params, recorded = false) {
     return { stopReason: "end_turn" }
   }
   if (text.includes("INVALID_ARGUMENT_TEST")) {
-    fs.appendFileSync(agentLog, 'agent executor error: {"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}} prompt: "SYNTHETIC_PRIVATE_PROMPT"\n')
+    fs.appendFileSync(agentLog, 'E1103 errorreport.go:224] agent executor error: {"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}} prompt: "SYNTHETIC_PRIVATE_PROMPT"\n')
     chunk("\n⚠ Agent execution terminated due to error.\n")
     return { stopReason: "end_turn" }
   }

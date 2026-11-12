@@ -1317,6 +1317,9 @@ for (const [name, system, headers, expectedDir, named] of [
   const second = { ...first, messages: [{ role: "user", content: `flattened opening unique\n${reply}\nflattened new tail` }] }
   const result = (await readSSE(await callFetch(second))).events
   check("flattened history reuses session and sends only new tail", stopOf(result) === "end_turn" && inits().length === before + 1 && lastOf("user").text === "flattened new tail", JSON.stringify(lastOf("user")))
+  const third = { ...first, messages: [{ role: "user", content: `${second.messages[0].content}\n${textOf(result)}\nthird flattened tail` }] }
+  const thirdEvents = (await readSSE(await callFetch(third))).events
+  check("three flattened turns retain session and send only newest tail", stopOf(thirdEvents) === "end_turn" && inits().length === before + 1 && lastOf("user").text === "third flattened tail", JSON.stringify(lastOf("user")))
 }
 
 {
@@ -4260,7 +4263,11 @@ for (const compacted of [true, false]) {
   process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
   const { default: multiDefault } = await import("./index.mjs?multi-account")
   const multiPlugin = await multiDefault.server({ client: null, directory: os.tmpdir() }, {})
+  const probeLogStart = logs().length
+  const promptsBeforeCatalog = logs().filter(event => event.type === "user").length
   const multiModels = await multiPlugin.provider.models()
+  const discoveryInits = logs().slice(probeLogStart).filter(event => event.type === "init")
+  check("each account model discovery uses its own ACP credentials without a prompt", [null, path.join(accountsDir, "work"), path.join(accountsDir, "personal")].every(dir => discoveryInits.some(event => event.geminiDir === dir && event.update === "true")) && logs().filter(event => event.type === "user").length === promptsBeforeCatalog, JSON.stringify(discoveryInits.map(item => [item.geminiDir, item.update])))
   check("models lists default plus per-account prefixed ids",
     !!multiModels["gemini-test"] && !!multiModels["work/gemini-test"] && !!multiModels["personal/gemini-test"] &&
     !multiModels["no-token/gemini-test"], Object.keys(multiModels).join(","))

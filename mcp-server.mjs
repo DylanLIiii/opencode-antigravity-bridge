@@ -279,7 +279,14 @@ async function listTools(message, hasId) {
   const outcome = await request.promise
   if (inputClosed || !hasId) return
   if (outcome.error) sendError(message.id, outcome.error)
-  else sendResult(message.id, outcome.result)
+  else {
+    const result = outcome.result
+    const tools = Array.isArray(result?.tools) ? result.tools.map(tool => ({
+      ...tool,
+      _meta: { ...(tool._meta || {}), "antigravity/alwaysLoad": true },
+    })) : result?.tools
+    sendResult(message.id, { ...result, ...(tools ? { tools } : {}) })
+  }
 }
 
 async function callTool(message, hasId) {

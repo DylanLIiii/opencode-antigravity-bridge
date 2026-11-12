@@ -31,7 +31,7 @@ async function withTimeout(promise, description, timeoutMs = 3000) {
   }
 }
 
-async function createControlServer(t) {
+async function createControlServer(t, tools = []) {
   const requests = []
   const sockets = new Set()
   const watchers = new Set()
@@ -70,7 +70,7 @@ async function createControlServer(t) {
         return
       }
       if (message.kind === "list") {
-        socket.end(JSON.stringify({ result: { tools: [] } }) + "\n")
+        socket.end(JSON.stringify({ result: { tools } }) + "\n")
         return
       }
       if (message.kind === "call") {
@@ -174,6 +174,21 @@ async function initialize(mcp) {
   assert.equal(response.result.protocolVersion, "2025-11-25")
   assert.equal(response.result.capabilities.tools.listChanged, true)
 }
+
+test("tools/list marks every tool always loaded and preserves metadata", async t => {
+  const control = await createControlServer(t, [
+    { name: "one", inputSchema: { type: "object" }, _meta: { source: "client" } },
+    { name: "two", inputSchema: { type: "object" } },
+  ])
+  const mcp = createMcpProcess(t, control.port)
+  await initialize(mcp)
+  const result = await mcp.request("list", "tools/list")
+  assert.deepEqual(result.result.tools.map(tool => tool._meta), [
+    { source: "client", "antigravity/alwaysLoad": true },
+    { "antigravity/alwaysLoad": true },
+  ])
+  await mcp.close()
+})
 
 test("tools/call forwards exact string and numeric JSON-RPC request ids", async t => {
   const control = await createControlServer(t)

@@ -862,6 +862,10 @@ class Turn {
     if (!this.accountedPrompts.has(number)) {
       this.accountedPrompts.add(number)
       this.rawUsage = addUsage(this.rawUsage, usage)
+      if (usage && typeof usage === "object") {
+        const parts = promptUsage(usage)
+        if (parts.promptInput > 0) this.proc.lastCacheRatio = Math.min(1, parts.read / parts.promptInput)
+      }
     }
     return this.rawUsage
   }
@@ -1097,7 +1101,7 @@ class Proc {
     // Learned from settled single-model-call responses; scales the local input
     // estimate used for tool-step responses that carry no exact usage.
     this.inputTokenScale = 1
-    this.lastCacheRatio = 0
+    this.lastCacheRatio = undefined
     this.configOptions = []
     this.configMethodUnsupported = false
     this.currentSelectionKey = null
@@ -3920,7 +3924,7 @@ function promptUsage(usage) {
   const cacheRead = tokenCount(usage.cachedReadTokens)
   const cacheWrite = tokenCount(usage.cachedWriteTokens)
   const thinking = tokenCount(usage.thoughtTokens)
-  const output = Math.max(tokenCount(usage.outputTokens), thinking)
+  const output = tokenCount(usage.outputTokens)
   const total = tokenCount(usage.totalTokens)
   const inclusive = total > 0
     ? Math.abs(total - (rawInput + output)) <
@@ -3933,7 +3937,7 @@ function promptUsage(usage) {
     input: promptInput - read,
     read,
     write: cacheWrite,
-    output,
+    output: Math.max(output, thinking),
     thinking,
     promptInput,
   }
@@ -4008,6 +4012,14 @@ function responseUsage(proc, turn, step, content, result) {
     const bounded = Math.min(tokenCount(estimate * 1.5), combined)
     write = combined > 0 ? Math.min(bounded, tokenCount(bounded * (write / combined))) : 0
     input = bounded - write
+  } else if (!Number.isFinite(proc.lastCacheRatio)) {
+    // Earlier windows already include their own prefixes; never sum them.
+    const prior = turn.responseSteps.reduce((largest, item) => {
+      if (item === step || !item.settled || !item.usage) return largest
+      return Math.max(largest, tokenCount(item.usage.input_tokens) +
+        tokenCount(item.usage.cache_read_input_tokens) + tokenCount(item.usage.cache_creation_input_tokens))
+    }, 0)
+    if (prior > 0) cacheRatio = Math.min(1, prior / input)
   }
   const read = Math.min(input, tokenCount(input * cacheRatio))
   const emitted = responseOutputEstimate(content)
@@ -4050,7 +4062,7 @@ async function measuredUsage(turn, step, result) {
   const expected = acp ? acp.promptInput + acp.write : null
   const promptOf = (steps) => steps.reduce((sum, item) => sum + item.input + item.read + item.write, measured.prompt)
   const complete = (steps) => {
-    if (!steps?.length) return false
+    if (batch?.pending || !steps?.length) return false
     if (expected === null) return true
     return promptOf(steps) >= expected
   }
@@ -4063,11 +4075,11 @@ async function measuredUsage(turn, step, result) {
   // produce no new model step or generation row. Confirm after one poll grace
   // tick so WAL commits settle, then emit 0 incremental usage without clearing
   // turn.stepCursor or stalling 1000ms per sibling call.
-  if (!final && turn.measured && Array.isArray(batch?.steps) && batch.steps.length === 0 &&
+  if (!final && turn.measured && !batch?.pending && Array.isArray(batch?.steps) && batch.steps.length === 0 &&
       isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
     await new Promise((resolve) => setTimeout(resolve, STEP_USAGE_POLL_MS))
     batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
-    if (Array.isArray(batch?.steps) && batch.steps.length === 0 &&
+    if (!batch?.pending && Array.isArray(batch?.steps) && batch.steps.length === 0 &&
         isCausalSiblingSubstep(turn.stepsFile, turn.stepCursor)) {
       step.usageKind = "agy_sibling"
       step.modelCalls = 0

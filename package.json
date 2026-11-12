@@ -26,6 +26,7 @@
     "output-limit.mjs",
     "thought-filter.mjs",
     "step-usage.mjs",
+    "NOTICE-upstream-license.txt",
     "CHANGELOG.md",
     "README.md",
     "README.en.md"

@@ -429,6 +429,10 @@ async function prompt(params, recorded = false) {
     chunk("Answer after summaries only.")
     return finish("Answer after summaries only.")
   }
+  if (text.includes("USAGE_THINKING_EXCEEDS_OUTPUT")) {
+    chunk("usage fixture")
+    return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, outputTokens: 10, thoughtTokens: 400, totalTokens: 10110 } }
+  }
   if (text.includes("USAGE_SMALL_CACHE_LARGE_THINKING")) {
     chunk("usage fixture")
     return { stopReason: "end_turn", usage: { inputTokens: 10000, cachedReadTokens: 100, cachedWriteTokens: 0, outputTokens: 500, thoughtTokens: 400, totalTokens: 10600 } }
@@ -1270,6 +1274,13 @@ for (const [name, system, headers, expectedDir, named] of [
   const { events } = await readSSE(response)
   const usage = events.find(event => event.event === "message_delta")?.data?.usage
   check("ACP small cache and included thinking are accounted once", usage?.input_tokens === 10000 && usage?.cache_read_input_tokens === 100 && usage?.output_tokens === 500 && usage?.output_tokens_details?.thinking_tokens === 400, JSON.stringify(usage))
+}
+
+{
+  const response = await callFetch({ model, messages: [{ role: "user", content: "USAGE_THINKING_EXCEEDS_OUTPUT" }] })
+  const { events } = await readSSE(response)
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  check("ACP input shape uses raw output before thinking floor", usage?.input_tokens === 10000 && usage?.cache_read_input_tokens === 100 && usage?.output_tokens === 400 && usage?.output_tokens_details?.thinking_tokens === 400, JSON.stringify(usage))
 }
 
 let nativeBody

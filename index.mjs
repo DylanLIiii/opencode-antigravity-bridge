@@ -17,6 +17,7 @@ import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
+import { AgentNoticeFilter } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 import { cloak, hint, turnsAway } from "./cloak.mjs"
@@ -98,9 +99,6 @@ const CONTINUE_PROMPT = "Continue exactly where your previous output stopped. Do
 // agy commits a model call to its conversation store just after the call ends.
 const STEP_USAGE_WAIT_MS = 1_000
 const STEP_USAGE_POLL_MS = 25
-// agy reports an upstream failure as an ordinary message chunk followed by end_turn.
-const AGENT_ERROR_MARKER = "\n⚠ Agent execution terminated due to error.\n"
-const AGENT_ERROR_CORE = AGENT_ERROR_MARKER.trim()
 // Only the minimal agent costs ~500 input tokens; the default agy agent costs ~8,400.
 const MINIMAL_AGENT = process.env.AGY_BRIDGE_MINIMAL_AGENT !== "0"
 const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
@@ -820,7 +818,7 @@ class Turn {
     this.finalized = false
     this.cancelRequested = false
     this.agentError = false
-    this.heldText = ""
+    this.notices = new AgentNoticeFilter(() => !!lastAgentErrorSync(this.proc.logPath, this.logOffset))
     this.outputLimit = new OutputLimitFilter()
     // agy's title summarizer shares this session's thought stream (#39).
     this.summaryThoughts = FILTER_SUMMARY_THOUGHTS ? new SummaryThoughtFilter() : null
@@ -994,38 +992,23 @@ class Turn {
     if (text && !this.done && !this.finalized) this.push({ type: "thinking", text })
   }
 
-  // Withholds a possible prefix of agy's error marker until it can be classified.
+  // agy reports an upstream failure as an ordinary message chunk followed by
+  // end_turn, and its retry notices the same way. Only standalone lines count.
   #pushVisible(chunk) {
-    let text = this.heldText + chunk
-    this.heldText = ""
-    const marker = text.indexOf(AGENT_ERROR_CORE)
-    if (marker >= 0) {
-      this.agentError = true
-      text = text.slice(0, marker).replace(/\n$/, "")
-      if (text) this.push({ type: "text", text })
-      return
-    }
-    for (let keep = Math.min(text.length, AGENT_ERROR_MARKER.length - 1); keep > 0; keep--) {
-      if (AGENT_ERROR_MARKER.startsWith(text.slice(-keep))) {
-        this.heldText = text.slice(-keep)
-        text = text.slice(0, -keep)
-        break
-      }
-    }
+    const text = this.notices.push(chunk)
     if (text) this.push({ type: "text", text })
   }
 
-  flushText() {
+  flushText(holdTerminal = false) {
     if (this.agentError) return
     // Buffered thought text belongs to this response and must precede the text
     // or tool call that ended the burst.
     this.flushThoughts()
     const rest = this.outputLimit.flush()
     if (rest) this.#pushVisible(rest)
-    if (!this.heldText || this.agentError) return
-    const text = this.heldText
-    this.heldText = ""
-    this.push({ type: "text", text })
+    if (this.agentError) return
+    const text = this.notices.flush({ holdTerminal })
+    if (text) this.push({ type: "text", text })
   }
 
   complete(result) {
@@ -1630,8 +1613,16 @@ class Proc {
           turn.complete({ stopReason: "cancelled" })
           return
         }
-        if (turn.agentError) {
-          throw await this.#agentError(turn)
+        // Only a final diagnostic followed by an error in this prompt's log (or
+        // an abnormal protocol outcome) can fail the turn. Recovered output
+        // clears the candidate, even when an earlier retry logged an error.
+        turn.flushText(true)
+        if (turn.notices.failureCandidate) {
+          const detail = await lastAgentError(this.logPath, turn.logOffset)
+          if (detail || result?.stopReason === "refusal") {
+            turn.agentError = true
+            throw this.#formatAgentError(detail, turn.promptGuardMatched)
+          }
         }
         if (result?.stopReason === "refusal") {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
@@ -1981,7 +1972,7 @@ class Proc {
         // Buffered output predates the user's steering. Delivered messages stay
         // in history; new updates still belong to this same live ACP turn.
         turn.events = turn.events.filter(event => !["text", "thinking"].includes(event.type))
-        turn.heldText = ""
+        turn.notices = new AgentNoticeFilter(() => !!lastAgentErrorSync(this.logPath, turn.logOffset))
         turn.outputLimit = new OutputLimitFilter()
         // Buffered thought text predates the steering prompt too, and its
         // summarizer probe no longer continues from what was held.
@@ -2251,6 +2242,20 @@ function addUsage(total, usage) {
 
 async function fileSize(file) {
   try { return (await fs.promises.stat(file)).size } catch { return 0 }
+}
+
+// Only invoked when a terminal-looking line is followed by more output. Read
+// a bounded tail so a recovered diagnostic is suppressed before streaming on.
+function lastAgentErrorSync(file, offset) {
+  let fd
+  try {
+    fd = fs.openSync(file, "r")
+    const size = fs.fstatSync(fd).size
+    const start = Math.max(offset || 0, size - LOG_TAIL_BYTES)
+    const buffer = Buffer.alloc(Math.max(0, size - start))
+    fs.readSync(fd, buffer, 0, buffer.length, start)
+    return /\] (?:agent executor error|failed to construct executor): .+/.test(buffer.toString("utf8"))
+  } catch { return false } finally { if (fd !== undefined) fs.closeSync(fd) }
 }
 
 // agy writes the real upstream error only to its log; read what this turn added.
@@ -3933,6 +3938,25 @@ function replayHistoryGroups(history, current) {
   return groups
 }
 
+// Tool results and host-generated reminders are not new user tasks. A mixed
+// message can contain a real instruction alongside a tool result or reminders.
+function isReplayUserTask(message) {
+  if (message?.role !== "user" || isCompactionSummary(message)) return false
+  const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }]
+    : Array.isArray(message.content) ? message.content : []
+  return blocks.some(block => {
+    if (block?.type === "image") return true
+    if (block?.type !== "text" || typeof block.text !== "string") return false
+    const queued = extractQueuedPrompt(block.text)
+    if (queued !== null) return !!queued.trim()
+    const text = stripMagpiePlaceholderNotice(block.text).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "").trim()
+    if (!text || /^\[(?:MESSAGE FROM NON-USER SOURCE - NOT USER INPUT|Request interrupted by user(?:\s+for tool use)?)\]/i.test(text) ||
+      /^(?:<task-notification\b|<system-reminder\b|<local-command-|<command-|<bash-|<available-deferred-tools\b)/i.test(text) ||
+      /^(?:Your response (?:above was cut off|was cut off)|\[Your previous response|The previous response failed to produce a valid tool call|Your tool call was malformed|Output token limit hit|(?:Stop|SubagentStop|PreCompact|PostCompact) hook feedback:)/i.test(text)) return false
+    return true
+  })
+}
+
 // Try lossless replay, then compact tool skeletons, then the newest complete
 // exchanges. Keep the opening context, summaries and latest exchange intact.
 // This also lets client summarization requests recover from oversized history.
@@ -3946,7 +3970,8 @@ function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, ins
 
   const { history, messages: current } = trailingMessages(body)
   const groups = replayHistoryGroups(history, current)
-  const removable = groups.filter((group, i) => i > 0 && i < groups.length - 1 && !group.some(isCompactionSummary))
+  const taskGroup = groups.findLastIndex(group => group.some(isReplayUserTask))
+  const removable = groups.filter((group, i) => i > 0 && i < groups.length - 1 && i !== taskGroup && !group.some(isCompactionSummary))
   if (!removable.length) return stripped
   const window = count => {
     const dropped = new Set(removable.slice(0, count))

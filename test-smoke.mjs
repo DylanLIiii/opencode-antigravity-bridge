@@ -353,6 +353,22 @@ async function prompt(params, recorded = false) {
     if (text.includes("LATE_STORE_CANCEL")) setTimeout(() => { recordModelCall({ input: 99000, output: 900 }); log({ type: "lateStoreWrite", convId: session.id, sqlite: !!sqliteOpen }) }, 350)
     return text.includes("RATIO_CANCEL") ? { stopReason: "cancelled", usage: { inputTokens: 10000, cachedReadTokens: 5000, outputTokens: 10, totalTokens: 15010 } } : { stopReason: "cancelled" }
   }
+  if (text.includes("ISSUE49_RECOVERED")) {
+    fs.appendFileSync(agentLog, "E1103 errorreport.go:224] agent executor error: FAILED_PRECONDITION: transient synthetic failure\n")
+    chunk("\n⚠ The stream was interrupted. Please continue the task you were working on.\n\n⚠ API error (attempt 2): request failed: EOF\n")
+    chunk("\n⚠ Agent execution terminated due to error.\n")
+    chunk("Recovered normal answer.")
+    return finish("Recovered normal answer.")
+  }
+  if (text.includes("ISSUE49_QUOTE")) {
+    const quoted = "Example \`⚠ Agent execution terminated due to error.\`\n\`\`\`\n⚠ API error (attempt 2): example\n⚠ The stream was interrupted. Please continue the task you were working on.\n\`\`\`"
+    chunk(quoted)
+    return finish(quoted)
+  }
+  if (text.includes("ISSUE49_NO_LOG")) {
+    chunk("\n⚠ Agent execution terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
   if (text.includes("AGENTERROR")) {
     chunk("partial before failure")
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: FAILED_PRECONDITION (code 400): fake upstream failure.\n")
@@ -1810,6 +1826,16 @@ for (const change of ["tools", "tools-steering", "tools-shrink", "model"]) {
   check("a denied built-in tool does not fail the turn", stopOf(events) === "end_turn")
 }
 
+for (const [prompt, expected] of [
+  ["ISSUE49_RECOVERED", "Recovered normal answer."],
+  ["ISSUE49_QUOTE", "Example `⚠ Agent execution terminated due to error.`\n```\n⚠ API error (attempt 2): example\n⚠ The stream was interrupted. Please continue the task you were working on.\n```"],
+  ["ISSUE49_NO_LOG", "\n⚠ Agent execution terminated due to error.\n"],
+]) {
+  const { events } = await readSSE(await callFetch({ model, messages: [{ role: "user", content: prompt }] }))
+  check(`${prompt} preserves normal output and ends successfully`, stopOf(events) === "end_turn" && (prompt === "ISSUE49_RECOVERED" ? textOf(events).trim() === expected : textOf(events) === expected),
+    JSON.stringify({ text: textOf(events), error: events.find(event => event.event === "error") }))
+}
+
 {
   const opening = { model, messages: [{ role: "user", content: "before the upstream error" }] }
   const openingEvents = (await readSSE(await callFetch(opening))).events
@@ -1855,7 +1881,7 @@ for (const change of ["tools", "tools-steering", "tools-shrink", "model"]) {
   const retry = await callFetch({ ...body, stream: true })
   const error = await retry.json()
   check("a non-streaming failure also blocks its streaming retry without resending",
-    failed.status === 502 && retry.status === 409 && error.error?.code === "prompt_outcome_unknown" && promptCount() === 1,
+    failed.status === 400 && retry.status === 409 && error.error?.code === "prompt_outcome_unknown" && promptCount() === 1,
     JSON.stringify({ first: failed.status, retry: retry.status, prompts: promptCount() }))
 }
 
@@ -3033,6 +3059,29 @@ for (const oversizedPart of ["arguments", "assistant-text"]) {
     check(`windowed ${label} follow-up matches full client history and keeps its session`, stopOf(final) === "end_turn" &&
       lastOf("user").convId === replay?.convId && lastOf("user").text === followupText && inits().length === before + 1)
   }
+}
+
+// A real task in historical user text must survive a replay of a tool loop.
+{
+  const task = "ISSUE49 active user task: implement the requested feature."
+  const messages = [{ role: "user", content: "ISSUE49 opening context" },
+    { role: "assistant", content: "Earlier answer" },
+    { role: "user", content: task }]
+  for (let i = 0; i < 10; i++) messages.push(
+    { role: "assistant", content: [{ type: "tool_use", id: `issue49-${i}`, name: "echo", input: { text: "x".repeat(30000) } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: `issue49-${i}`, content: "done" },
+      ...(i === 8 ? [{ type: "text", text: "<system-reminder>background metadata only</system-reminder>" }] : [])] },
+  )
+  const response = await callFetch({ model, metadata: { user_id: "issue49-task-window" }, tools: [echoTool], messages })
+  const events = response.status === 200 ? (await readSSE(response)).events : []
+  const text = lastOf("user")?.text || ""
+  check("issue49 replay retains active task and latest tool call", response.status === 200 && stopOf(events) === "end_turn" &&
+    text.includes(task) && text.includes("issue49-9") && text.includes("older history messages omitted") && Buffer.byteLength(text) <= 180000)
+  const oversized = messages.map(message => message.content === task ? { ...message, content: task + "z".repeat(190000) } : message)
+  const rejected = await callFetch({ model, metadata: { user_id: "issue49-task-too-large" }, tools: [echoTool], messages: oversized })
+  const payload = await rejected.json()
+  check("issue49 rejects a protected task that exceeds the replay budget", rejected.status === 400 &&
+    ["context_length_exceeded", "prompt_budget_exceeded"].includes(payload.error?.code) && rejected.headers.get("x-should-retry") === "false", JSON.stringify(payload))
 }
 
 for (const recent of [true, false]) {

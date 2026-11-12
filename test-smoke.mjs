@@ -346,7 +346,7 @@ async function prompt(params, recorded = false) {
     chunk("partial slow answer")
     await new Promise(resolve => { cancelWaiter = resolve })
     log({ type: "cancelled", convId: session.id })
-    return { stopReason: "cancelled" }
+    return text.includes("RATIO_CANCEL") ? { stopReason: "cancelled", usage: { inputTokens: 10000, cachedReadTokens: 5000, outputTokens: 10, totalTokens: 15010 } } : { stopReason: "cancelled" }
   }
   if (text.includes("AGENTERROR")) {
     chunk("partial before failure")
@@ -2173,6 +2173,29 @@ for (const location of ["inline", "system", "developer", "user"]) {
   }
   const { events } = await readSSE(await callFetch(next))
   check("conversation continues in the cancelled session", stopOf(events) === "end_turn" && lastOf("user").convId === init.convId && lastOf("user").text === "after cancel" && inits().length === before + 1)
+}
+
+{
+  process.env.AGY_BRIDGE_STEP_USAGE = "0"
+  const before = inits().length
+  const body = { model, tools: [echoTool], metadata: { user_id: "cancel-ratio" }, messages: [{ role: "user", content: "SLOW RATIO_CANCEL" }] }
+  const response = await callFetch(body)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  const next = { ...body, messages: [...body.messages, { role: "assistant", content: [{ type: "text", text: "partial slow answer" }] }, { role: "user", content: "MULTISTEP after cancel " + "x".repeat(10000) }] }
+  const { events } = await readSSE(await callFetch(next))
+  const usage = events.find(event => event.event === "message_delta")?.data?.usage
+  const window = (usage?.input_tokens || 0) + (usage?.cache_read_input_tokens || 0)
+  check("cancelled prompt teaches its cache ratio to next tool step", stopOf(events) === "tool_use" && inits().length === before + 1 && usage?.cache_read_input_tokens === Math.round(window / 3), JSON.stringify(usage))
+  await readSSE(await callFetch(continuation(next, events, "cancel ratio result")))
+  delete process.env.AGY_BRIDGE_STEP_USAGE
 }
 
 {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+- Fix #43 with explicit Windows-to-WSL agy launch mode, coherent ACP paths and host MCP interop; preserve native defaults and literal argv.
+- Forward control environment variables bidirectionally and resolve Windows environment names case-insensitively. WSL mode uses only the distro default account and explicitly excludes host profiles/import, quota and context unlock.
+- Add deterministic launch/path regressions and a simulated sign-in/models/ACP/MCP tool roundtrip; real Windows/WSL teardown remains unverified.
+
 ## 0.5.0
 
 - Add **Sign in a new agy account with Google** to Magpie's native sign-in list.

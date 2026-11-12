@@ -4,6 +4,8 @@ import { accountsRootDir, listAccounts } from "../accounts.mjs"
 import { ImportError, importAccount, importManifest } from "../accounts-import.mjs"
 import { ContextError, contextStatus, disableContext, unlockContext } from "../context-unlock.mjs"
 
+import { wslDistro } from "../platform.mjs"
+
 const USAGE = `Usage:
   agy-bridge accounts list
   agy-bridge accounts import <name> <agy-profile-dir | antigravity-oauth-token file>
@@ -26,6 +28,10 @@ function printStatus(status, out) {
 export function main(argv, { out = console.log, env = process.env } = {}) {
   const [area, action, ...rest] = argv
   try {
+    if (wslDistro(env) && ["accounts", "context"].includes(area)) {
+      out("Windows-to-WSL mode supports only the distro default account; host account import/list and context unlock are unavailable. Run agy inside the configured distro.")
+      return 1
+    }
     if (area === "accounts" && action === "list") {
       out(`accounts root: ${accountsRootDir(env)}`)
       for (const account of listAccounts(env, { refresh: true })) out(account.name ?? "(default: agy global sign-in)")

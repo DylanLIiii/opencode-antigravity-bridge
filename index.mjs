@@ -1,4 +1,4 @@
-import { agyCandidates, spawnAgy, windowsMcpShim } from "./platform.mjs"
+import { agyCandidates, spawnAgy, windowsMcpShim, wslAgyPath, wslDistro, wslMcpShim, wslPath } from "./platform.mjs"
 import { spawn } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -147,9 +147,17 @@ function contextWindow(model) {
 // unlock`. Changing that setting takes effect after Magpie restarts, so a live
 // process pool and its sessions never switch context mode mid-conversation.
 let cachedAgyUnlocked = false
+let cachedAgyError = null
 
 function findAgy() {
   if (cachedAgyPath) return cachedAgyPath
+  try {
+    const wslPath = wslAgyPath(process.env)
+    if (wslPath) return cachedAgyPath = wslPath
+  } catch (error) {
+    cachedAgyError = error.message
+    return null
+  }
   const candidates = agyCandidates(process.env, os.homedir())
   for (const candidate of candidates) {
     try {
@@ -213,10 +221,11 @@ function accountEnv(env, geminiDir) {
 
 async function listAgyModels(agyPath, extraArgs = []) {
   const geminiDir = extraArgs.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
-  const { err, stdout, code } = await execOnce(agyPath, [...extraArgs, "models"], {
+  const { err, stdout, stderr, code } = await execOnce(agyPath, [...extraArgs, "models"], {
     timeoutMs: 15_000,
     env: accountEnv(process.env, geminiDir),
   })
+  if (wslDistro() && (err || code !== 0 || !stdout.trim())) throw new Error(`WSL agy models failed: ${err?.message || stderr?.trim() || "empty model response"}. Check wsl.exe, the configured distro and AGY_PATH; run agy in that same distro to sign in.`)
   if (err || code !== 0) return FALLBACK_MODELS
   const out = []
   for (const raw of stdout.split("\n")) {
@@ -229,6 +238,7 @@ async function listAgyModels(agyPath, extraArgs = []) {
     const effort = /-(high|medium|low|minimal|xhigh|max)$/i.exec(id)?.[1]?.toLowerCase()
     out.push({ id, name, effort })
   }
+  if (wslDistro() && !out.length) throw new Error("WSL agy returned no models. Run agy in the configured distro to sign in.")
   return out.length ? out : FALLBACK_MODELS
 }
 
@@ -244,6 +254,8 @@ let accountsCache = null
 async function getAccounts(agy, { refresh = false } = {}) {
   if (accountsCache && !refresh) return accountsCache
   invalidateAccounts()
+  // WSL uses only the selected distro's default account. Never inspect host profiles.
+  if (wslDistro()) return accountsCache = [DEFAULT_ACCOUNT]
   const accounts = listAccounts()
   const usable = [DEFAULT_ACCOUNT]
   await Promise.all(accounts.slice(1).map(async account => {
@@ -581,10 +593,15 @@ function shellQuote(value) {
 // earlier in agy's PATH runs the bridge's stdio MCP server instead, so the
 // connection is authenticated by the per-process token in its environment.
 function ensureShimDir() {
+  const distro = wslDistro()
   if (shimDirPromise) return shimDirPromise
   shimDirPromise = (async () => {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-bin-"))
-    if (process.platform === "win32") {
+    if (distro) {
+      await fs.promises.writeFile(path.join(dir, "nc"),
+        wslMcpShim(process.execPath, MCP_SERVER_PATH, distro), { mode: 0o700 })
+      await fs.promises.chmod(path.join(dir, "nc"), 0o700)
+    } else if (process.platform === "win32") {
       await fs.promises.writeFile(path.join(dir, "nc.cmd"),
         windowsMcpShim(process.execPath, MCP_SERVER_PATH))
     } else {
@@ -1121,16 +1138,21 @@ class Proc {
     await fs.promises.mkdir(agentDir, { recursive: true })
     await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition(), { mode: 0o600 })
     this.logPath = path.join(this.workspace, "agy-acp.log")
+    const distro = wslDistro()
+    if (this.geminiDir && distro) {
+      throw new Error("named agy profiles are unavailable in WSL mode; Windows-hosted profiles must not select WSL credentials. Use the distro's own default account.")
+    }
+    const agentPath = value => wslPath(value, distro)
 
     const args = [
       "acp",
       "--agent", AGENT_NAME,
-      "--log-file", this.logPath,
+      "--log-file", agentPath(this.logPath),
       "--ide-mcp-port", String(controlServer.address().port),
     ]
     // A named account pins this process to its own Gemini dir (own OAuth token).
     if (this.geminiDir) args.push(`--gemini_dir=${this.geminiDir}`)
-    if (this.workDir) args.push("--add-dir", this.workDir)
+    if (this.workDir) args.push("--add-dir", agentPath(this.workDir))
     try {
       const childEnv = accountEnv({ ...process.env }, this.geminiDir)
       const inheritedPath = process.env.PATH || childEnv.Path || ""
@@ -1144,7 +1166,8 @@ class Proc {
         windowsHide: true,
         env: {
           ...childEnv,
-          PATH: bin + path.delimiter + inheritedPath,
+          ...(!distro ? { PATH: bin + path.delimiter + inheritedPath } : {}),
+          ...(distro ? { AGY_BRIDGE_WSL_BIN: wslPath(bin, distro) } : {}),
           AGY_BRIDGE_CONTROL_PORT: String(controlServer.address().port),
           AGY_BRIDGE_TOKEN: this.token,
           AGY_CLI_DISABLE_AUTO_UPDATE: "true",
@@ -1214,7 +1237,7 @@ class Proc {
       try {
         session = await this.conn.request("session/resume", {
           sessionId: this.resumeFrom.sessionId,
-          cwd: this.workspace,
+          cwd: wslPath(this.workspace, wslDistro()),
           mcpServers: [],
         })
         if (!session || typeof session !== "object") throw new Error("empty session/resume result")
@@ -1231,7 +1254,7 @@ class Proc {
     if (this.resumeFrom && !resumable) this.replayReason = "resume_unsupported"
     if (!this.resumed) {
       this.validateReplay?.()
-      session = await this.conn.request("session/new", { cwd: this.workspace, mcpServers: [], ...meta })
+      session = await this.conn.request("session/new", { cwd: wslPath(this.workspace, wslDistro()), mcpServers: [], ...meta })
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
     }
@@ -1488,7 +1511,7 @@ class Proc {
       const stepsEnv = this.geminiDir
         ? { AGY_BRIDGE_CONVERSATIONS_DIR: path.join(this.geminiDir, "antigravity-cli", "conversations") }
         : process.env
-      turn.stepsFile = stepUsageEnabled ? sessionDbPath(this.sessionId, stepsEnv) : null
+      turn.stepsFile = stepUsageEnabled && !wslDistro() ? sessionDbPath(this.sessionId, stepsEnv) : null
       turn.stepCursor = modelUsageCursor(turn.stepsFile)
       // Content a cancelled turn never delivered still belongs to the session.
       let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
@@ -3795,6 +3818,7 @@ function namedWorkDirectory(body, init) {
 
 function workDirectory(directory) {
   if (!directory) return null
+  if (wslDistro()) return wslPath(directory, wslDistro())
   let candidate = directory
   if (process.platform === "win32" && candidate.startsWith("/")) {
     const wsl = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/.exec(candidate)
@@ -4525,6 +4549,7 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
 // the host keeps the single "agy" sentinel and routing stays profile-prefixed.
 function importResult(entries) {
   try {
+    if (wslDistro()) return { type: "failed", error: "Account import is unavailable in WSL mode; use the distro default account" }
     importAccounts(entries)
     accountsCache = null
     invalidateAccounts()
@@ -4600,7 +4625,7 @@ export const AntigravityBridgePlugin = async () => {
             if (!agy) {
               return {
                 type: "failed",
-                error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
+                error: cachedAgyError || "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
               }
             }
             const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
@@ -4610,14 +4635,13 @@ export const AntigravityBridgePlugin = async () => {
                 : (probe.stderr || probe.stdout || "").trim() || probe.err?.message || "unknown error"
               return {
                 type: "failed",
-                error: `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
+                error: wslDistro() ? `WSL agy failed (${why}). Check wsl.exe, distro ${wslDistro()} and AGY_PATH, then run agy in that same distro to sign in.` : `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
               }
             }
             return { type: "success", key: "agy" }
           },
         },
-        ...ACCOUNT_IMPORT_METHODS,
-        accountLogin,
+        ...(wslDistro() ? [] : [...ACCOUNT_IMPORT_METHODS, accountLogin]),
       ],
       loader: async () => {
         return {
@@ -4648,7 +4672,7 @@ export const AntigravityBridgePlugin = async () => {
             }
 
             const agy = findAgy()
-            if (!agy) return jsonError(503, "agy CLI not found on this machine")
+            if (!agy) return jsonError(503, cachedAgyError || "agy CLI not found on this machine")
             let body
             try {
               const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
@@ -4662,6 +4686,7 @@ export const AntigravityBridgePlugin = async () => {
             body = guarded.body
             const promptGuardMatched = guarded.diagnostics.length > 0
             const rawModel = body.model || ""
+            if (wslDistro() && rawModel.replace(/^antigravity-bridge\//, "").includes("/")) return jsonError(400, "Named account profiles are unavailable in WSL mode; use the distro default account")
             const accounts = await getAccounts(agy)
             const { account: accountName, model: modelId } = splitModelAccount(rawModel, accounts)
             const account = accounts.find(item => item.name === accountName) || DEFAULT_ACCOUNT
@@ -4681,7 +4706,8 @@ export const AntigravityBridgePlugin = async () => {
             const isFresh = trailing.history.length === 0
             const resultBlocks = extractToolResults(body)
             const callerWorkDir = namedWorkDirectory(body, init)
-            const workDir = workDirectory(callerWorkDir)
+            let workDir
+            try { workDir = workDirectory(callerWorkDir) } catch (error) { return jsonError(400, error.message) }
             const instructions = sessionInstructions(body, callerWorkDir)
             let promptAttempt = null
 
@@ -4882,8 +4908,9 @@ export const AntigravityBridgePlugin = async () => {
       npm: NPM_ANTHROPIC,
       models: async () => {
         const agy = findAgy()
+        if (cachedAgyError) throw new Error(cachedAgyError)
         // Refreshing the model catalog also re-discovers named accounts.
-        const accounts = await getAccounts(agy, { refresh: true })
+        const accounts = agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
         const out = {}
         await Promise.all(accounts.map(async account => {
           const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)

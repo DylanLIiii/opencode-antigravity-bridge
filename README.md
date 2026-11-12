@@ -286,6 +286,10 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
 [ACP 接入方案](https://linux.do/t/topic/3133812) ·
 [参考实现](https://github.com/lili-luo/dsh-plugin-bundle/blob/457b9395e9bd8a1aefae2b83cda7e5e9e08af783/dsh-llm-antigravity-acp/src/usage-db.ts)
 
+## Windows 宿主 + 仅安装在 WSL2 的 agy
+
+在 Windows 上启动 Magpie 前设置 `AGY_BRIDGE_WSL_DISTRO=<发行版>`。此时 `AGY_PATH` 是该发行版内的单个 Linux 可执行文件（绝对路径如 `/home/me/.local/bin/agy`，或裸 `agy`）；可选 `AGY_BRIDGE_WSL_EXE` 覆盖 `wsl.exe`。桥不会扫描发行版，也不会回退到原生 agy；配置在重启 Magpie 前固定。要求：WSL interop、标准 `/mnt/<盘符>` 自动挂载、同一发行版的默认账号已登录 agy。原生 Windows/macOS/Linux 不受影响。WSL 模式明确不支持：命名 profile、profile 导入、浏览器 OAuth 账号登录、额度查询、上下文解锁与逐步会话数据库用量（改用估算）；UNC 路径会被拒绝，自定义挂载根不受支持。仅用模拟启动/ACP/MCP 夹具测试，未在真实 Windows/WSL 主机验证。
+
 ## FAQ / 注意事项
 
 - **图片**：只支持内联 base64（PNG/JPEG/GIF/WebP），不支持远程 URL 和二进制/PDF 文档；纯文本 document 和 search_result 可用。

@@ -514,6 +514,10 @@ and Magpie's [usage hook](https://github.com/yetone/magpie/blob/5b4dec58e47d1eb9
 and [official Antigravity quota pools](https://github.com/yetone/magpie/blob/5b4dec58e47d1eb961f5a3f4417c441f77662c7d/internal/provider/google.go).
 The bridge uses the CLI path, not Magpie's remote OAuth implementation.
 
+## Windows host with agy installed only in WSL2
+
+Set `AGY_BRIDGE_WSL_DISTRO=<distro>` before starting Magpie on Windows. `AGY_PATH` is then one Linux executable inside that distro (absolute path such as `/home/me/.local/bin/agy`, or bare `agy`); optional `AGY_BRIDGE_WSL_EXE` overrides `wsl.exe`. The bridge never scans distros or falls back to a native agy, and the setting is fixed until Magpie restarts. Requirements: WSL interop, the standard `/mnt/<drive>` automount, and agy signed in as the default account of the same distro. Native Windows/macOS/Linux installs are unaffected. Unavailable in WSL mode: named profiles, profile import, browser OAuth account sign-in, quota queries, context unlock and per-step conversation DB usage (estimates are used); UNC paths are rejected, and custom automount roots are unsupported. Tested only with simulated launch/ACP/MCP fixtures, not on a real Windows/WSL host.
+
 ## Limitations
 
 - **User images and binary documents**: user prompt images require an `agy`
@@ -699,7 +703,9 @@ community observations and depend on the current account and CLI.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `AGY_PATH` | PATH lookup | agy executable |
+| `AGY_PATH` | PATH lookup | agy executable; in WSL mode, one Linux executable inside the distro |
+| `AGY_BRIDGE_WSL_DISTRO` | unset | Windows opt-in WSL distro name; no scan or native fallback |
+| `AGY_BRIDGE_WSL_EXE` | `wsl.exe` | optional WSL launcher executable |
 | `AGY_BRIDGE_THINKING` | on | `0` stops forwarding thought summaries |
 | `AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS` | off | `1` forwards agy's internal title-summarizer thought chunks, which are otherwise suppressed by their prompt echo; diagnostic only, they can dominate the transcript |
 | `AGY_BRIDGE_EFFORT` | unset | force `minimal` / `low` / `medium` / `high` / `xhigh` / `max` (`ultra` aliases `max`); explicit legacy model suffixes retain their level |

@@ -1,8 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.6.3
 
 - Recover from agy's mid-session OAuth expiry. A long-lived `agy acp` process does not refresh its access token inside a session, so after about an hour its first model call fails with `UNAUTHENTICATED (code 401)` and the turn ends. When that happens before anything is streamed or any tool is called, the bridge now drops the process, parks the session with its pre-turn history, and replays the same request once on a fresh process, which loads the refreshed token file and resumes the same agy session. A second 401 is returned as `upstream_unauthenticated` (502). 401 is classified separately from 403 and is never retried on the same process.
+
+## 0.6.2
+
+- Declare native named-account support so Magpie offers an add-account entry and stops warning that another Google login replaces existing accounts. Keep the single-account declaration in WSL mode.
+- Keep one Bridge connection through the shared `agy` sentinel; verify CLI validation, account/manifest imports and OAuth completion against Magpie's real host with synthetic credentials.
+- Keep English and Chinese plugin summaries within Magpie's 300 UTF-8 byte limit and document the account-name step before the browser opens.
 
 ## 0.6.1
 

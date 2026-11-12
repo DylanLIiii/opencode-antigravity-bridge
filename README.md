@@ -73,7 +73,7 @@ Prompt caching 由 Google 后端决定，本插件让请求前缀尽量稳定：
 magpie plugin add ./opencode-antigravity-bridge
 
 # 2. 在 Magpie 中：Providers → Antigravity Bridge → 登录
-#    已接入时点击「重新登录」，再选择「新增 Google 账号」
+#    已接入时点击「添加另一个 Antigravity Bridge 账号」，再选择「新增 Google 账号」
 # 3. 填写名称（例如 work），在浏览器完成 Google 登录，
 #    把最终回调页面的完整 URL 或授权码粘贴回 Magpie
 # 4. 选择 work/<模型>（可选思考等级），开始对话
@@ -82,7 +82,7 @@ magpie plugin add ./opencode-antigravity-bridge
 ### 账号管理入口
 
 原生模式下，在 **Providers → Antigravity Bridge** 中，首次接入点「登录」，已有连接点
-「重新登录」。这两个入口都会先显示操作选项，打开它们不会立即开始 Google
+「添加另一个 Antigravity Bridge 账号」。这两个入口都会先显示操作选项，打开它们不会立即开始 Google
 登录，也不会替换已有账号。选项名称随 Magpie 的界面语言显示：
 
 | 操作 | 用途 |
@@ -93,8 +93,9 @@ magpie plugin add ./opencode-antigravity-bridge
 | 新增 Google 账号 | 在浏览器登录 Google，保存为一个新名称的账号 |
 
 新增和导入都会保留已有账号；名称已被使用时会拒绝操作，请换一个名称。
-Magpie 的单账号提示指 Bridge 连接，插件中的 Google 账号按名称独立保存。
-外层「重新登录」按钮及宿主的提示由 Magpie 生成，插件不修改它们。
+插件中的 Google 账号按名称独立保存，使用 `<账号>/<模型>` 选择对应账号。
+Magpie 中保留一条 Bridge 连接记录；新增和导入完成后，宿主会按同一个 `agy`
+标记合并连接记录，不会因为新增 Google 账号而增加重复连接。
 WSL 模式仅支持使用发行版内已有的 CLI 登录，不提供命名账号的新增或导入选项。
 
 客户端侧零配置：不需要改全局 MCP 配置，插件为每个 agy 进程创建隔离的临时
@@ -124,7 +125,7 @@ Google Code Assist 后端
 历史保留。
 
 **在 Magpie 中登录新账号**：通过上面的账号管理入口选择「新增 Google 账号」，
-输入一个未占用的名称。Magpie 打开 Google 授权链接；
+输入一个未占用的名称并提交后，Magpie 打开 Google 授权链接；
 完成后把浏览器最终停留的 `https://antigravity.google/oauth-callback?...` 完整地址
 粘贴回 Magpie（推荐，也可只粘贴页面显示的授权码）。当前官方 CLI 使用这个网页回调，
 需要手动粘贴，没有本机自动回调。远程 Magpie 也使用相同流程。

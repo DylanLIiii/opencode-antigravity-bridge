@@ -53,8 +53,8 @@ magpie plugin add ./opencode-antigravity-bridge
 
 ## Use
 
-1. In Magpie, choose Providers → Antigravity Bridge → Sign in (or **Sign in
-   again** for an existing connection) → **Add a Google account**, and name the
+1. In Magpie, choose Providers → Antigravity Bridge → Sign in (or **Add
+   another Antigravity Bridge account** for an existing connection) → **Add a Google account**, and name the
    account, e.g. `work`.
 2. Follow the browser link, sign in with Google, then paste the full address of
    the final callback page (recommended), or its authorization code, into Magpie.
@@ -64,7 +64,7 @@ magpie plugin add ./opencode-antigravity-bridge
 
 ### Account management entry
 
-In native mode, both **Sign in** and **Sign in again** first open the account-action chooser.
+In native mode, both **Sign in** and **Add another Antigravity Bridge account** first open the account-action chooser.
 Opening it does not start Google sign-in or replace an account. Magpie shows
 the action labels in its selected language:
 
@@ -76,13 +76,13 @@ the action labels in its selected language:
 | Add a Google account | Sign in through Google and save the account under a new name |
 
 Adding and importing keep existing accounts. An occupied name is refused;
-choose another name. Magpie's single-account hint refers to the Bridge
-connection; the plugin keeps named Google accounts separately. Magpie supplies
-the outer **Sign in again** button and its hint; the plugin does not change them.
+choose another name. The plugin keeps named Google accounts separately; select
+one with `<account>/<model>`. Magpie keeps one Bridge connection: successful
+account actions return the same `agy` sentinel, which the host deduplicates.
 WSL mode supports only the distro's existing CLI login; named-account sign-in
 and imports are not offered there.
 
-**Browser sign-in.** The new method starts the official `agy acp --login` in a
+**Browser sign-in.** Submit the new account name to start the official `agy acp --login` in a
 hidden staging profile. The CLI sends the browser to
 `https://antigravity.google/oauth-callback`, so the current flow needs a paste;
 it does not finish automatically through localhost. Remote Magpie uses the same

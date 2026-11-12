@@ -4530,8 +4530,8 @@ for (const compacted of [true, false]) {
   const { default: importDefault } = await import("./index.mjs?import-forms")
   const importPlugin = await importDefault.server({ client: null, directory: os.tmpdir() }, {})
   const methods = importPlugin.auth.methods
-  check("default agy login stays first and single:true sentinel identity is kept",
-    importPlugin.auth.single === true && methods[0].keyless === true && /agy CLI/.test(methods[0].label) && methods[0].prompts === undefined)
+  check("native account actions allow adding accounts and default agy login stays first",
+    importPlugin.auth.single === false && methods[0].keyless === true && /agy CLI/.test(methods[0].label) && methods[0].prompts === undefined)
   const forms = methods.filter(m => m.type === "api" && m.prompts)
   check("import forms are native keyless api methods with localized labels and text prompts",
     forms.length === 2 && forms.every(m => m.type === "api" && m.keyless === true && typeof m.authorize === "function" &&

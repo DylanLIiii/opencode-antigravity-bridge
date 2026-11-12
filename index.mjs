@@ -5184,7 +5184,10 @@ export const AntigravityBridgePlugin = async () => {
   return {
     auth: {
       provider: PROVIDER_ID,
-      single: true,
+      // Native profiles add accounts without replacing one another. Magpie
+      // deduplicates successful methods by their shared "agy" sentinel key.
+      // WSL exposes only the distro's existing CLI account.
+      single: !!wslDistro(),
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
       usage: async () => readUsage(),
       methods: [

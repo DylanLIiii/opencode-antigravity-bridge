@@ -53,16 +53,34 @@ magpie plugin add ./opencode-antigravity-bridge
 
 ## Use
 
-1. In Magpie, choose Providers → Antigravity Bridge → Sign in →
-   **Sign in a new agy account with Google**, and name the account, e.g. `work`.
+1. In Magpie, choose Providers → Antigravity Bridge → Sign in (or **Sign in
+   again** for an existing connection) → **Add a Google account**, and name the
+   account, e.g. `work`.
 2. Follow the browser link, sign in with Google, then paste the full address of
    the final callback page (recommended), or its authorization code, into Magpie.
 3. Pick `work/<model>` and, when offered, a thinking level. Effort-specific IDs from
    `agy models` are grouped into one model with variants, then mapped back to
    the corresponding agy ID for each request.
 
-To reuse agy's existing default sign-in, choose **Sign in with the agy CLI**.
-That method verifies `agy models`; it does not start a new Google login.
+### Account management entry
+
+In native mode, both **Sign in** and **Sign in again** first open the account-action chooser.
+Opening it does not start Google sign-in or replace an account. Magpie shows
+the action labels in its selected language:
+
+| Action | Purpose |
+| --- | --- |
+| Use existing agy CLI login | Verify the current CLI login without starting Google sign-in |
+| Import an account | Import a profile folder or token file under a new account name |
+| Import accounts from a manifest | Add several named accounts from a JSON manifest |
+| Add a Google account | Sign in through Google and save the account under a new name |
+
+Adding and importing keep existing accounts. An occupied name is refused;
+choose another name. Magpie's single-account hint refers to the Bridge
+connection; the plugin keeps named Google accounts separately. Magpie supplies
+the outer **Sign in again** button and its hint; the plugin does not change them.
+WSL mode supports only the distro's existing CLI login; named-account sign-in
+and imports are not offered there.
 
 **Browser sign-in.** The new method starts the official `agy acp --login` in a
 hidden staging profile. The CLI sends the browser to
@@ -105,8 +123,8 @@ keyring/ADC sign-in is machine-global and cannot be isolated per directory.
 Refreshing the model catalog re-scans the accounts directory.
 
 **Importing accounts.** Instead of signing in inside a profile directory, you can
-import an agy login you already have, from Magpie's sign-in list ("Import an agy
-account" / "Import several agy accounts from a manifest") or the packaged CLI.
+import an agy login you already have, from the account-action chooser (**Import
+an account** / **Import accounts from a manifest**) or the packaged CLI.
 Paths are on the machine running Magpie; both call the same backend:
 
 ```sh

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1
+
+- Clarify the Bridge's native account actions with short localized labels for existing CLI access, single-account import, manifest import and adding a Google account.
+- Explain in the account forms that existing accounts are kept and a new name is required. Document the existing-account entry through Magpie's Sign in again chooser.
+
 ## 0.6.0
 
 - Align ACP and SQLite usage accounting, cache estimates and read-only WAL handling with agy-cli 0.1.22; thinking is included once in output.

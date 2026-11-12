@@ -11,6 +11,7 @@ import { createUsageReader } from "./usage.mjs"
 import { DEFAULT_ACCOUNT, invalidateAccounts, listAccounts, splitModelAccount } from "./accounts.mjs"
 import { importAccounts, ImportError, readManifest, validateAccountName } from "./accounts-import.mjs"
 import { createAccountLoginMethod } from "./accounts-login.mjs"
+import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
 import { selectAgy } from "./context-unlock.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
@@ -5094,16 +5095,21 @@ const ACCOUNT_IMPORT_METHODS = [
   {
     type: "api",
     keyless: true,
-    label: "Import an agy account / 导入 agy 账号",
+    ...ACCOUNT_ACTIONS.single,
     prompts: [
       {
-        type: "text", key: "name", message: "Account name (shown as <name>/<model>) / 账号名称",
-        placeholder: "work",
+        ...ACCOUNT_NAME_PROMPT,
         validate: value => { try { validateAccountName(String(value ?? "").trim()); return undefined } catch (error) { return error.message } },
       },
       {
         type: "text", key: "source",
-        message: "Path on this machine to an agy profile folder or antigravity-oauth-token file / 本机 agy 配置目录或 token 文件路径",
+        message: "Path to an agy profile folder or token file on the Magpie machine",
+        messages: {
+          zh: "运行 Magpie 的电脑上的 agy 配置目录或 token 文件路径",
+          "zh-TW": "執行 Magpie 的電腦上的 agy 設定目錄或 token 檔案路徑",
+          ja: "Magpie を実行しているコンピュータ上の agy 設定フォルダまたはトークンファイルのパス",
+          de: "Pfad zum agy-Profilordner oder zur Token-Datei auf dem Magpie-Rechner",
+        },
         placeholder: "~/.config/agy-work",
         validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
       },
@@ -5113,10 +5119,16 @@ const ACCOUNT_IMPORT_METHODS = [
   {
     type: "api",
     keyless: true,
-    label: "Import several agy accounts from a manifest / 批量导入 agy 账号",
+    ...ACCOUNT_ACTIONS.manifest,
     prompts: [{
       type: "text", key: "manifest",
-      message: "Path to a JSON manifest: [{\"name\":\"work\",\"source\":\"/path\"}] / 清单 JSON 路径",
+      message: "Path to a JSON manifest: [{\"name\":\"work\",\"source\":\"/path\"}] (existing accounts are kept)",
+      messages: {
+        zh: "清单 JSON 路径：[{\"name\":\"work\",\"source\":\"/path\"}]（已有账号会保留）",
+        "zh-TW": "清單 JSON 路徑：[{\"name\":\"work\",\"source\":\"/path\"}]（既有帳號會保留）",
+        ja: "JSON 一覧のパス：[{\"name\":\"work\",\"source\":\"/path\"}]（既存のアカウントは保持されます）",
+        de: "Pfad zur JSON-Liste: [{\"name\":\"work\",\"source\":\"/path\"}] (vorhandene Konten bleiben erhalten)",
+      },
       placeholder: "~/agy-accounts.json",
       validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
     }],
@@ -5149,7 +5161,7 @@ export const AntigravityBridgePlugin = async () => {
         {
           type: "api",
           keyless: true,
-          label: "Sign in with the agy CLI",
+          ...ACCOUNT_ACTIONS.cli,
           authorize: async () => {
             const agy = findAgy()
             if (!agy) {

@@ -37,7 +37,7 @@ test("a missing or unreadable store gives no measurement", () => {
   assert.equal(lastModelStep("/nonexistent/agy.db"), -1)
   assert.equal(modelStepsAfter("/nonexistent/agy.db", -1), null)
   assert.equal(sessionDbPath("../escape"), null)
-  assert.match(sessionDbPath("f6faf504-502b-4184-90da-aa6ff6105eb0", { AGY_BRIDGE_CONVERSATIONS_DIR: "/x" }), /^\/x\/f6faf504/)
+  assert.equal(sessionDbPath("f6faf504-502b-4184-90da-aa6ff6105eb0", { AGY_BRIDGE_CONVERSATIONS_DIR: "/x" }), path.join("/x", "f6faf504-502b-4184-90da-aa6ff6105eb0.db"))
 })
 
 test("generation records separate billing from the local context estimate", () => {

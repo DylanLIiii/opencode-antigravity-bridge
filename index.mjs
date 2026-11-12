@@ -51,8 +51,11 @@ function detachedEvictMs() {
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
-// Bound silence before agy's own five-minute stream timeout/retry loop.
-const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 2 * 60 * 1000)
+// Bound silence without meaningful agy output. agy emits nothing while it
+// generates tool-call arguments, so a large Write can be silent for minutes;
+// the default allows that at the cost of slower stall detection. This is not
+// progress detection, and clients or gateways may still enforce their own deadline.
+const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 10 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
 const RESUME_TTL_MS = positiveTimeout(process.env.AGY_BRIDGE_RESUME_TTL_MS, 6 * 60 * 60 * 1000)
 // agy fails an ide-tools MCP call after a fixed three minutes. Answer before

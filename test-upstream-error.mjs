@@ -130,14 +130,14 @@ test("promptGuardMatched reclassifies only generic 429/resource exhaustion", () 
     assert.match(actual.message, /prompt guard matched/)
   }
   assert.equal(classifyUpstreamError("RESOURCE_EXHAUSTED", { promptGuardMatched: false }).category, "rate_limit")
-  assert.equal(classifyUpstreamError("FAILED_PRECONDITION", { promptGuardMatched: true }).category, "unknown")
+  assert.equal(classifyUpstreamError("FAILED_PRECONDITION", { promptGuardMatched: true }).category, "request_rejected")
   const explicitRate = classifyUpstreamError("429 Too Many Requests", { promptGuardMatched: true })
   assert.equal(explicitRate.category, "rate_limit")
   assert.equal(explicitRate.retryable, true)
 })
 
 test("unknown and missing details preserve the existing generic diagnostic", () => {
-  for (const detail of [undefined, null, "", "FAILED_PRECONDITION (code 400): fake upstream failure"]) {
+  for (const detail of [undefined, null, "", "unexpected synthetic failure"]) {
     const actual = classifyUpstreamError(detail)
     assertShape(actual)
     assert.equal(actual.category, "unknown")
@@ -217,7 +217,7 @@ test("invalid, past, distant or unrelated reset timestamps are ignored", () => {
     assert.equal(actual.retryable, false, detail)
   }
   const unrelated = classifyUpstreamError(`FAILED_PRECONDITION: reset at ${isoAfter(60_000)}`, { nowMs: NOW })
-  assert.equal(unrelated.category, "unknown")
+  assert.equal(unrelated.category, "request_rejected")
   assert.equal(unrelated.retryAfterMs, null)
   assert.equal(classifyUpstreamError(`RESOURCE_EXHAUSTED: quota reset at ${isoAfter(86_400_000)}`, { nowMs: NOW }).retryAfterMs, 86_400_000)
 })
@@ -227,7 +227,7 @@ test("retry hints never make ambiguous, forbidden or unknown errors retryable", 
     ["RESOURCE_EXHAUSTED (code 429); Retry-After: 1", "rate_limit"],
     ["code 429; Retry-After: 1", "rate_limit"],
     ["PERMISSION_DENIED (code 403); Retry-After: 1", "forbidden"],
-    ["FAILED_PRECONDITION; Retry-After: 1", "unknown"],
+    ["FAILED_PRECONDITION; Retry-After: 1", "request_rejected"],
   ]) {
     const actual = classifyUpstreamError(detail, { nowMs: NOW })
     assert.equal(actual.category, category, detail)
@@ -250,6 +250,13 @@ test("messages omit prompt-bearing diagnostics and bound echoed detail", () => {
   const long = classifyUpstreamError("FAILED_PRECONDITION: " + "x".repeat(3000))
   assert.ok(long.message.length < 2200)
   assert.ok(!long.message.includes("x".repeat(2100)))
+})
+
+test("FAILED_PRECONDITION is a non-retryable rejected request", () => {
+  const result = classifyUpstreamError("FAILED_PRECONDITION (code 400): User location is not supported for the API use.")
+  assert.equal(result.category, "request_rejected")
+  assert.equal(result.retryable, false)
+  assert.equal(result.reasonCode, "AGY_ERROR_FAILED_PRECONDITION")
 })
 
 test("UNAUTHENTICATED / HTTP 401 is classified separately from 403 and never retried in place", () => {

@@ -36,6 +36,11 @@ export function classifyUpstreamError(detail, context = {}) {
       retryAfterMs,
     )
   }
+  if (/\bFAILED_PRECONDITION\b/i.test(text)) {
+    return result("request_rejected", false,
+      "Antigravity rejected the request because an upstream precondition was not met; automatic retry is disabled",
+      "AGY_ERROR_FAILED_PRECONDITION", text, retryAfterMs)
+  }
   if (INVALID_ARGUMENT_RE.test(text)) {
     return result(
       "request_rejected",

@@ -148,6 +148,18 @@ if (argv[0] === "acp" && argv.includes("--login")) {
           send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } })
           return
         }
+        if (text.includes('NOTICE49_')) {
+          const fenced = text.includes('FENCE')
+          const prefix = fenced ? 'Here:\n' + String.fromCharCode(96).repeat(3) + 'js\nconst a = 1;\n' : ''
+          const banner = '\n⚠ Agent execution terminated due to error.\n'
+          if (prefix) chunk(prefix)
+          if (!text.includes('NO_LOG')) fs.appendFileSync(agentLog, 'E1111 errorreport.go:224] agent executor error: INTERNAL (code 500): backend exploded.\n')
+          chunk(banner)
+          if (text.includes('WHITESPACE')) { chunk(' '); chunk('\t'); chunk('\n') }
+          if (text.includes('RECOVER')) { chunk(' '); chunk('Recovered answer.') }
+          send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } })
+          return
+        }
         if (fs.existsSync(stateFile("fail-401-once"))) {
           fs.unlinkSync(stateFile("fail-401-once"))
           fs.appendFileSync(agentLog, "E1111 22:00:00.000000 100 errorreport.go:224] agent executor error: generating and executing: UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n")
@@ -218,6 +230,26 @@ const postJson = async (body) => {
     body: JSON.stringify({ model: "gemini-4-carbon", max_tokens: 1024, stream: false, ...body }),
   })
   return { status: res.status, json: await res.json() }
+}
+
+for (const scenario of ['FENCE_FAIL', 'WHITESPACE_FAIL', 'FENCE_NO_LOG', 'WHITESPACE_NO_LOG', 'FENCE_RECOVER']) {
+  test('notice boundary ' + scenario, async () => {
+    const result = await postJson({ messages: [{ role: 'user', content: 'NOTICE49_' + scenario }] })
+    if (scenario.endsWith('FAIL')) {
+      assert.equal(result.status, 502, JSON.stringify(result))
+      assert.match(result.json.error?.message || '', /backend exploded/)
+    } else {
+      assert.equal(result.status, 200, JSON.stringify(result))
+      const text = result.json.content.map(block => block.text || '').join('')
+      if (scenario.includes('NO_LOG')) {
+        const prefix = scenario.includes('FENCE') ? 'Here:\n' + String.fromCharCode(96).repeat(3) + 'js\nconst a = 1;\n' : ''
+        assert.equal(text, prefix + '\n⚠ Agent execution terminated due to error.\n' + (scenario.includes('WHITESPACE') ? ' \t\n' : ''))
+      } else {
+        assert.ok(text.endsWith('Recovered answer.'))
+        assert.ok(!text.includes('Agent execution terminated'))
+      }
+    }
+  })
 }
 
 test("stale-proc OAuth 401 retires stale proc, re-parks pre-turn history, session/resumes on fresh proc, and returns 502 on double 401", async () => {

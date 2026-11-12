@@ -627,7 +627,13 @@ downstream pings cannot extend this window. Waiting for a client tool result
 uses the separate tool deadline; agy's status traffic and repeated polls cannot
 extend a detached client's wait. Slow generation with substantive output can
 continue beyond 120 seconds. A model that emits no output may need a larger explicit
-timeout; raising it also allows agy's internal retries to run longer.
+timeout; raising it also allows agy's internal retries to run longer. In
+particular, agy does not expose reliable progress while generating tool-call
+arguments, so a large `Write` can look idle for over 120 seconds. For such
+workloads, set `AGY_BRIDGE_TURN_TIMEOUT_MS=600000` (10 minutes) in the bridge
+host environment and restart the host; choose a shorter or longer **finite**
+value for your workload. This is a workaround, not detection of tool generation,
+and client or gateway deadlines may still cancel the request sooner.
 
 An upstream inactivity timeout produces an SSE `error` with code
 `upstream_idle_timeout`, or HTTP **504** with the same error for non-streaming

@@ -6,6 +6,10 @@
 - Run blocking context verification and patching outside the shared plugin host, with a loopback-only service, capability-protected actions and bounded work. Official agy and existing sessions keep their original behavior until the user applies a new selection.
 - Redesign the Chinese and English READMEs and add a self-contained bilingual product page with synthetic account routing and cache illustrations. Document historical token/cache measurements with their conditions and distinguish declared context windows from verified capacity.
 
+## 0.7.1
+
+- Fix model discovery by running the CLI catalog and a bounded 10-second ACP wait concurrently. Serve successful cached models during refresh, throttle failed probes, keep the full CLI catalog when ACP is unknown, and prefer live session handshakes over older probes.
+
 ## 0.7.0
 
 - Expose named Google profiles as separate native Magpie account rows sharing ordinary model IDs. Bind requests, model discovery, sessions and quota to the account selected by Magpie, enabling its existing account preferences and routing.

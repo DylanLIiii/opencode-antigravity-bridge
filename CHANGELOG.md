@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+- Fix model discovery races by running CLI catalog and bounded ACP confirmation concurrently. Preserve the last successful offered-model result across empty, failed, timed-out and stale probes, keep non-Gemini CLI models when ACP is unknown, and seed the account-scoped cache from live session handshakes.
+
 ## 0.7.0
 
 - Expose named Google profiles as separate native Magpie account rows sharing ordinary model IDs. Bind requests, model discovery, sessions and quota to the account selected by Magpie, enabling its existing account preferences and routing.

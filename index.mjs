@@ -112,6 +112,9 @@ const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
 // AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS=1 to forward them for diagnosis.
 const FILTER_SUMMARY_THOUGHTS = process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS !== "1"
 
+const ACP_CLIENT_INFO = Object.freeze({ name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version })
+const MODEL_CACHE_TTL_MS = 60_000
+
 const FALLBACK_MODELS = [
   { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
   { id: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)", effort: "medium" },
@@ -262,11 +265,37 @@ const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const catalogCache = new Map()
 const offeredProbes = new Map()
 
+function offeredKey(agyPath, account) {
+  return `${wslDistro() || "native"}|${agyPath}|${account.key}`
+}
+
+function offeredModelsFromSession(session) {
+  const options = configSelect(Array.isArray(session?.configOptions) ? session.configOptions : [], "model")
+  return [...selectValues(options?.options).map(x => ({ id: x.value, name: x.name || x.value })),
+    ...(session?.models?.availableModels || []).map(x => ({ id: x.modelId || x.id, name: x.name }))]
+    .filter(x => typeof x.id === "string" && x.id)
+}
+
+function seedOfferedModels(agyPath, account, models) {
+  const normalized = (models || []).map(x => ({ id: x?.modelId || x?.id, name: x?.name || x?.modelId || x?.id }))
+    .filter(x => typeof x.id === "string" && x.id)
+  if (!normalized.length) return null
+  const key = offeredKey(agyPath, account)
+  const entry = offeredProbes.get(key) || { at: 0, models: null, promise: null, revision: 0 }
+  entry.models = normalized
+  entry.at = Date.now()
+  entry.revision++
+  offeredProbes.set(key, entry)
+  return normalized
+}
+
 async function probeOfferedModels(agyPath, account) {
-  const key = `${wslDistro() || "native"}|${agyPath}|${account.key}`
+  const key = offeredKey(agyPath, account)
   const cached = offeredProbes.get(key)
-  if (cached && (cached.promise || Date.now() - cached.at < 60_000)) return cached.promise || cached.models
-  const entry = { at: Date.now(), models: null, promise: null }
+  if (cached?.promise) return cached.promise
+  if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.models
+  const entry = cached || { at: 0, models: null, promise: null, revision: 0 }
+  const revision = entry.revision
   entry.promise = (async () => {
     let workspace, child, conn
     try {
@@ -279,16 +308,26 @@ async function probeOfferedModels(agyPath, account) {
       child.on("error", error => conn?.close(error))
       child.on("close", () => conn?.close(new Error("agy model probe exited")))
       conn = new AcpConnection(child, { onNotification: () => {}, onRequest: async () => { throw Object.assign(new Error("not supported"), { code: -32601 }) }, onProtocolError: error => conn.close(error) })
-      const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: { name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version }, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, 5000)
+      const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: ACP_CLIENT_INFO, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, 5000)
       if (agyTooOld(init?.agentInfo?.version)) return null
       const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, 5000)
       const canClose = init?.agentCapabilities?.sessionCapabilities?.close ?? init?.agentCapabilities?.session_capabilities?.close
       if (session?.sessionId && canClose) await conn.request("session/close", { sessionId: session.sessionId }, 1000).catch(() => {})
-      const options = configSelect(Array.isArray(session?.configOptions) ? session.configOptions : [], "model")
-      const models = [...selectValues(options?.options).map(x => ({ id: x.value, name: x.name || x.value })),
-        ...(session?.models?.availableModels || []).map(x => ({ id: x.modelId || x.id, name: x.name }))].filter(x => typeof x.id === "string" && x.id)
-      return models.length ? models : null
-    } catch { return null } finally {
+      const models = offeredModelsFromSession(session)
+      if (!models.length) {
+        if (!entry.models) entry.at = Date.now()
+        return entry.models || null
+      }
+      if (entry.revision === revision) {
+        entry.models = models
+        entry.at = Date.now()
+        entry.revision++
+      }
+      return models
+    } catch {
+      if (!entry.models) entry.at = Date.now()
+      return entry.models || null
+    } finally {
       conn?.close(new Error("model probe complete"))
       try { child?.stdin?.end() } catch {}
       if (child?.pid) {
@@ -297,7 +336,7 @@ async function probeOfferedModels(agyPath, account) {
       }
       if (workspace) await fs.promises.rm(workspace, { recursive: true, force: true }).catch(() => {})
     }
-  })().then(models => { entry.models = models; return models }).finally(() => { entry.promise = null })
+  })().finally(() => { entry.promise = null })
   offeredProbes.set(key, entry)
   return entry.promise
 }
@@ -1270,7 +1309,7 @@ class Proc {
   async #handshake() {
     const init = await this.conn.request("initialize", {
       protocolVersion: 1,
-      clientInfo: { name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version },
+      clientInfo: ACP_CLIENT_INFO,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
     })
     this.agentVersion = init?.agentInfo?.version ?? null
@@ -1313,6 +1352,9 @@ class Proc {
       this.sessionId = session.sessionId
     }
     logBridgeEvent(this, null, this.resumed ? "resumed" : "created", this.replayReason)
+    // Live handshakes are authoritative for this account scope and seed the
+    // same cache used by provider discovery. A late probe cannot overwrite it.
+    seedOfferedModels(this.agyPath, { key: this.geminiDir ? `dir:${this.geminiDir}` : "default" }, offeredModelsFromSession(session))
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
@@ -5634,13 +5676,16 @@ export const AntigravityBridgePlugin = async (input = {}) => {
           : agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
         const out = {}
         await Promise.all(accounts.map(async account => {
-          const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)
-          const offered = agy ? await Promise.race([
+          const catalogPromise = agy ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS))
+          const offeredPromise = agy ? Promise.race([
             probeOfferedModels(agy, account),
             new Promise(resolve => setTimeout(() => resolve(null), 500)),
-          ]) : null
+          ]) : Promise.resolve(null)
+          const [catalog, offered] = await Promise.all([catalogPromise, offeredPromise])
           const offeredIds = new Set((offered || []).map(item => item.id))
-          const available = offered ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : catalog.models.filter(item => /^gemini-/i.test(item.id))
+          // ACP is an optional confirmation. Unknown/empty/failed probes must
+          // never narrow the CLI catalog (notably Claude, Sonnet and GPT-OSS).
+          const available = offered?.length ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : catalog.models
           const covered = new Set(available.flatMap(item => [item.id, ...[...(catalog.routes.get(item.id)?.byEffort?.values() || [])]]))
           for (const item of offered || []) if (!covered.has(item.id)) available.push({ id: item.id, name: item.name || item.id })
           for (const model of available) {

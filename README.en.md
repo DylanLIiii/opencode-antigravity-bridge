@@ -6,7 +6,7 @@
 
 Multiple Google accounts · shared ordinary model IDs · lean prompts · session reuse · observable token and cache usage
 
-[中文](README.md) · [Product page `docs/index.html`](docs/index.html) · [Install](#install) · [Technical guide](#what-works)
+[中文](README.md) · [Live product page](https://dylanliiii.github.io/opencode-antigravity-bridge/) · [Install](#install) · [Technical guide](#what-works)
 
 </div>
 
@@ -14,9 +14,9 @@ Multiple Google accounts · shared ordinary model IDs · lean prompts · session
 magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 ```
 
-> Install directly from GitHub; no npm release is required. Local checkouts also work for development. The product page
-> [`docs/index.html`](docs/index.html) is a single self-contained HTML file and is not hosted
-> anywhere yet: clone the repository and open it in a browser to preview it locally.
+> Install directly from GitHub; no npm release is required. Local checkouts also work for development.
+> The [live product page](https://dylanliiii.github.io/opencode-antigravity-bridge/) is hosted on GitHub Pages.
+> Its source, [`docs/index.html`](docs/index.html), is one self-contained HTML file that also opens locally.
 
 ## Why this bridge
 

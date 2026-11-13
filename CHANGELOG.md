@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.3
+
+- Host the self-contained bilingual product page on GitHub Pages through a dedicated Actions workflow that uploads only `docs/index.html`. Link the live site from both READMEs and keep README links working when the page is hosted or its language changes.
+
 ## 0.8.2
 
 - Make OAuth-retry fixtures run on native Windows using a `.cmd` launcher and Node's executable for the production MCP adapter, with process shutdown before temporary-file cleanup. Decode compat fixture file URLs with `fileURLToPath`. Run both suites in three-platform CI and add Windows Node 22 coverage alongside Node 24.

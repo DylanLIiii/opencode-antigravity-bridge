@@ -6,7 +6,7 @@
 
 多个 Google 账号 · 共用普通模型 ID · 精简 prompt · 会话复用 · 可观测的 token 与缓存用量
 
-[English](README.en.md) · [产品页 `docs/index.html`](docs/index.html) · [30 秒上手](#30-秒上手) · [技术指南](#它是怎么工作的)
+[English](README.en.md) · [在线产品页](https://dylanliiii.github.io/opencode-antigravity-bridge/) · [30 秒上手](#30-秒上手) · [技术指南](#它是怎么工作的)
 
 </div>
 
@@ -14,8 +14,8 @@
 magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 ```
 
-> 直接从 GitHub 安装，无需 npm 发布。开发时也可安装本地 checkout。产品页 [`docs/index.html`](docs/index.html) 是单个自包含的
-> HTML 文件，目前没有在线托管：克隆仓库后直接用浏览器打开即可本地预览。
+> 直接从 GitHub 安装，无需 npm 发布。开发时也可安装本地 checkout。[在线产品页](https://dylanliiii.github.io/opencode-antigravity-bridge/)
+> 托管于 GitHub Pages；源码 [`docs/index.html`](docs/index.html) 是单个自包含的 HTML 文件，也可直接在本地浏览器中打开。
 
 ## 为什么选它
 

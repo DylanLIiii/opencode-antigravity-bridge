@@ -98,6 +98,17 @@ test("override is reported separately, stale saved state is not actual unlock", 
   assert.equal(s.declaredContext, 700000); assert.equal(s.contextOverride, 700000); assert.equal(s.limits.gptOss, 131072)
 })
 
+test("WSL page cannot read or modify the host's context state", async t => {
+  let calls = 0
+  const { status, action } = await fixture(t, { unavailableReason: "wsl", runTask: async () => { calls++; return on } })
+  const value = await status()
+  assert.equal(value.unavailableReason, "wsl")
+  assert.equal(value.effective, "default")
+  assert.equal((await action("unlock")).status, 409)
+  assert.equal((await action("disable")).status, 409)
+  assert.equal(calls, 0, "the native patcher and native state reader are never invoked")
+})
+
 test("blocking worker leaves shared host responsive and is bounded", async t => {
   const taskUrl = new URL("./test/context-ui-worker-fixture.mjs", import.meta.url)
   const { service, request } = await fixture(t, { runTask: undefined, taskUrl, env: { TEST_WORK_MS: "400" } })

@@ -79,7 +79,7 @@ const safeEqual = (a, b) => {
 }
 
 // options.runTask(action) -> Promise<status>; options.runtimeMode() -> "not-selected" | "default" | "unlocked"
-export function createContextService({ env = process.env, runtimeMode = () => "not-selected", runTask, taskUrl, opTimeout, log = () => {} } = {}) {
+export function createContextService({ env = process.env, runtimeMode = () => "not-selected", unavailableReason = null, runTask, taskUrl, opTimeout, log = () => {} } = {}) {
   const capability = randomBytes(32).toString("base64url")
   const template = fs.readFileSync(APP_URL, "utf8")
   const html = template.replace("__CAPABILITY__", capability)
@@ -99,6 +99,12 @@ export function createContextService({ env = process.env, runtimeMode = () => "n
 
   const runCheck = () => {
     if (closed || checking || operation) return checking
+    // The native patcher must never operate on a host install when requests
+    // actually use agy inside WSL. Report the limitation without reading state.
+    if (unavailableReason) {
+      check = { state: "unsupported", enabled: false, active: false, reason: "Managed context unlock is unavailable in WSL mode.", checkedAt: new Date().toISOString() }
+      return null
+    }
     checking = Promise.resolve().then(() => execute("status"))
       .then(status => { check = { ...publicCheck(status), checkedAt: new Date().toISOString() } },
         error => { check = { state: "unknown", enabled: false, active: false, reason: publicError(error), checkedAt: new Date().toISOString() } })
@@ -114,6 +120,7 @@ export function createContextService({ env = process.env, runtimeMode = () => "n
     const contextOverride = Number.isSafeInteger(override) && override > 0 && override <= 1_048_576 ? override : null
     return {
       desired, effective, current,
+      unavailableReason,
       contextOverride,
       declaredContext: contextOverride || (current === "not-selected" ? null : current === "unlocked" ? CONTEXT_LIMITS.managed : CONTEXT_LIMITS.default),
       restartRequired: current !== "not-selected" && effective !== "unknown" && current !== effective,
@@ -195,6 +202,7 @@ export function createContextService({ env = process.env, runtimeMode = () => "n
       return send(res, 200, snapshot(), cors)
     }
     if (url.pathname === "/api/action" && req.method === "POST") {
+      if (unavailableReason) return send(res, 409, { error: "Managed context unlock is unavailable in WSL mode; the distro's official agy remains in use." }, cors)
       if (!/^application\/json(?:\s*;|$)/i.test(req.headers["content-type"] || "")) return send(res, 415, { error: "JSON required" }, cors)
       let raw = ""
       let tooLarge = false

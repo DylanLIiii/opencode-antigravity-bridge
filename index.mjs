@@ -5215,6 +5215,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
   const magpie = !!input.magpie
   if (magpie) void startContextService({
     port: options?.contextPort,
+    unavailableReason: wslDistro() ? "wsl" : null,
     runtimeMode: () => cachedAgyPath ? (cachedAgyUnlocked ? "unlocked" : "default") : "not-selected",
     log: message => console.error(`[antigravity-bridge] ${message}`),
   })

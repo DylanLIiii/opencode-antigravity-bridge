@@ -36,6 +36,7 @@ const strings = {
     success: "Saved successfully. Restart the Bridge host, then refresh models to update context declarations. Running sessions keep their current mode.",
     failure: "Operation failed. Review status and retry. ", unavailable: "Context service unavailable. Retry Refresh status or reopen this page. ", cancelled: "Selection cancelled. No changes were requested.",
     override: "Environment override", tokens: "tokens", notDeclared: "Not declared yet", checking: "Verifying…",
+    wsl: "Context unlock is unavailable in WSL mode. Bridge keeps using the distro's official agy; this page cannot modify the host installation or its unlock setting.",
   },
   zh: {
     title: "Antigravity Bridge 上下文", intro: "选择所有 Bridge 账号使用的上下文模式。Bridge 宿主下次选择 agy 时应用设置。",
@@ -52,6 +53,7 @@ const strings = {
     loading: "正在检查保存设置与二进制完整性…", working: "执行中：检查构建校验，创建并验证托管副本…", disabling: "执行中：恢复默认选择…",
     success: "保存成功。请重启 Bridge 宿主，再刷新模型以更新上下文声明。已有会话保留当前模式。", failure: "操作失败，请检查状态后重试。", unavailable: "上下文服务不可用，请刷新状态或重新打开页面。", cancelled: "已取消选择，未请求任何更改。",
     override: "环境覆盖值", tokens: "tokens", notDeclared: "尚未声明", checking: "正在验证…",
+    wsl: "WSL 模式暂不支持上下文解锁。Bridge 继续使用发行版内的官方 agy；此页面不会修改宿主机安装或其解锁设置。",
   },
 }
 let lang = "en", snapshot = null, selected = "default", pending = null, busy = true, pollTimer = null, localError = false
@@ -83,12 +85,12 @@ function render() {
   $("declared").textContent = snapshot.declaredContext == null ? t("notDeclared") : `${number(snapshot.declaredContext)} ${t("tokens")}${snapshot.contextOverride ? ` (${t("override")})` : ""}`
   $("restart").textContent = t(snapshot.restartRequired ? "restart" : "pinned")
   $("default").checked = selected === "default"; $("unlocked").checked = selected === "unlocked"
-  $("modes").disabled = busy; $("apply").disabled = busy || !snapshot.check; $("cancel").disabled = busy
+  $("modes").disabled = busy || !!snapshot.unavailableReason; $("apply").disabled = busy || !snapshot.check || !!snapshot.unavailableReason; $("cancel").disabled = busy
   $("refresh").disabled = busy; $("confirm").disabled = busy
   $("review").hidden = !pending
   $("review-text").textContent = t(pending === "unlocked" ? "reviewUnlock" : "reviewDefault")
   const check = snapshot.check
-  $("detail").textContent = check && !["default", "disabled", "unlocked"].includes(check.state) ? `${check.state}: ${check.reason}` : ""
+  $("detail").textContent = snapshot.unavailableReason ? t(snapshot.unavailableReason) : check && !["default", "disabled", "unlocked"].includes(check.state) ? `${check.state}: ${check.reason}` : ""
 }
 function feedback(key, error = "") {
   $("feedback").className = key === "success" ? "ok" : ["failure", "unavailable"].includes(key) ? "error" : ""

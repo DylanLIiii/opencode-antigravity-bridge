@@ -2,7 +2,7 @@
 
 ## 0.7.1
 
-- Fix model discovery races by running CLI catalog and bounded ACP confirmation concurrently. Preserve the last successful offered-model result across empty, failed, timed-out and stale probes, keep non-Gemini CLI models when ACP is unknown, and seed the account-scoped cache from live session handshakes.
+- Fix model discovery by running the CLI catalog and a bounded 10-second ACP wait concurrently. Serve successful cached models during refresh, throttle failed probes, keep the full CLI catalog when ACP is unknown, and prefer live session handshakes over older probes.
 
 ## 0.7.0
 

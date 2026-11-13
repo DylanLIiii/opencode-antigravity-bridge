@@ -114,6 +114,11 @@ const FILTER_SUMMARY_THOUGHTS = process.env.AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS !==
 
 const ACP_CLIENT_INFO = Object.freeze({ name: PACKAGE_METADATA.name, version: PACKAGE_METADATA.version })
 const MODEL_CACHE_TTL_MS = 60_000
+// A cold `agy acp` handshake takes several seconds. Discovery waits this long
+// for the first confirmation, concurrently with `agy models` (15s cap).
+const MODEL_PROBE_WAIT_MS = 10_000
+const MODEL_PROBE_STEP_MS = 5_000
+const MODEL_PROBE_RETRY_MS = 15_000
 
 const FALLBACK_MODELS = [
   { id: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", effort: "high" },
@@ -276,69 +281,85 @@ function offeredModelsFromSession(session) {
     .filter(x => typeof x.id === "string" && x.id)
 }
 
-function seedOfferedModels(agyPath, account, models) {
-  const normalized = (models || []).map(x => ({ id: x?.modelId || x?.id, name: x?.name || x?.modelId || x?.id }))
-    .filter(x => typeof x.id === "string" && x.id)
-  if (!normalized.length) return null
+function offeredEntry(agyPath, account) {
   const key = offeredKey(agyPath, account)
-  const entry = offeredProbes.get(key) || { at: 0, models: null, promise: null, revision: 0 }
-  entry.models = normalized
-  entry.at = Date.now()
-  entry.revision++
-  offeredProbes.set(key, entry)
-  return normalized
+  if (!offeredProbes.has(key)) offeredProbes.set(key, { at: 0, models: null, promise: null, revision: 0, retryAt: 0 })
+  return offeredProbes.get(key)
 }
 
-async function probeOfferedModels(agyPath, account) {
-  const key = offeredKey(agyPath, account)
-  const cached = offeredProbes.get(key)
-  if (cached?.promise) return cached.promise
-  if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.models
-  const entry = cached || { at: 0, models: null, promise: null, revision: 0 }
-  const revision = entry.revision
-  entry.promise = (async () => {
-    let workspace, child, conn
-    try {
-      workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agy-model-probe-"))
-      const args = ["acp", ...(account.dir ? [`--gemini_dir=${account.dir}`] : [])]
-      child = spawnAgy(agyPath, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
-        env: { ...accountEnv({ ...process.env }, account.dir), AGY_CLI_DISABLE_AUTO_UPDATE: "true" } })
-      child.stderr?.resume()
-      child.stdin?.on("error", () => {})
-      child.on("error", error => conn?.close(error))
-      child.on("close", () => conn?.close(new Error("agy model probe exited")))
-      conn = new AcpConnection(child, { onNotification: () => {}, onRequest: async () => { throw Object.assign(new Error("not supported"), { code: -32601 }) }, onProtocolError: error => conn.close(error) })
-      const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: ACP_CLIENT_INFO, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, 5000)
-      if (agyTooOld(init?.agentInfo?.version)) return null
-      const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, 5000)
-      const canClose = init?.agentCapabilities?.sessionCapabilities?.close ?? init?.agentCapabilities?.session_capabilities?.close
-      if (session?.sessionId && canClose) await conn.request("session/close", { sessionId: session.sessionId }, 1000).catch(() => {})
-      const models = offeredModelsFromSession(session)
-      if (!models.length) {
-        if (!entry.models) entry.at = Date.now()
-        return entry.models || null
-      }
+// A live session handshake is the freshest evidence for its account scope. The
+// revision bump stops an older in-flight probe from replacing or returning it.
+function seedOfferedModels(agyPath, account, models) {
+  if (!models?.length) return
+  const entry = offeredEntry(agyPath, account)
+  entry.models = models
+  entry.at = Date.now()
+  entry.retryAt = 0
+  entry.revision++
+}
+
+// Offered ACP models for one account scope, or null while unknown. A known
+// result (even stale) is returned at once while one shared refresh runs; only a
+// cold scope waits, bounded by waitMs. Failed, empty or old-CLI probes never
+// erase a success and are retried no sooner than the retry interval.
+async function probeOfferedModels(agyPath, account, waitMs = MODEL_PROBE_WAIT_MS) {
+  const entry = offeredEntry(agyPath, account)
+  const now = Date.now()
+  const fresh = entry.models && now - entry.at < configuredTimeout("AGY_BRIDGE_MODEL_CACHE_TTL_MS", MODEL_CACHE_TTL_MS)
+  if (!fresh && !entry.promise && now >= entry.retryAt) {
+    const revision = entry.revision
+    entry.promise = runOfferedProbe(agyPath, account).then(models => {
       if (entry.revision === revision) {
-        entry.models = models
-        entry.at = Date.now()
-        entry.revision++
+        if (!models?.length) entry.retryAt = Date.now() + configuredTimeout("AGY_BRIDGE_MODEL_PROBE_RETRY_MS", MODEL_PROBE_RETRY_MS)
+        else {
+          entry.models = models
+          entry.at = Date.now()
+          entry.retryAt = 0
+          entry.revision++
+        }
       }
-      return models
-    } catch {
-      if (!entry.models) entry.at = Date.now()
-      return entry.models || null
-    } finally {
-      conn?.close(new Error("model probe complete"))
-      try { child?.stdin?.end() } catch {}
-      if (child?.pid) {
-        if (process.platform === "win32") await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3000 }).catch(() => {})
-        else try { process.kill(-child.pid, "SIGTERM") } catch { try { child.kill("SIGTERM") } catch {} }
-      }
-      if (workspace) await fs.promises.rm(workspace, { recursive: true, force: true }).catch(() => {})
+      return entry.models
+    }).finally(() => { entry.promise = null })
+  }
+  if (entry.models || !entry.promise || waitMs <= 0) return entry.models
+  let timer
+  try {
+    return await Promise.race([entry.promise, new Promise(resolve => { timer = setTimeout(() => resolve(entry.models), waitMs) })])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function runOfferedProbe(agyPath, account) {
+  let workspace, child, conn
+  try {
+    workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agy-model-probe-"))
+    const args = ["acp", ...(account.dir ? [`--gemini_dir=${account.dir}`] : [])]
+    child = spawnAgy(agyPath, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32",
+      env: { ...accountEnv({ ...process.env }, account.dir), AGY_CLI_DISABLE_AUTO_UPDATE: "true" } })
+    child.stderr?.resume()
+    child.stdin?.on("error", () => {})
+    child.on("error", error => conn?.close(error))
+    child.on("close", () => conn?.close(new Error("agy model probe exited")))
+    conn = new AcpConnection(child, { onNotification: () => {}, onRequest: async () => { throw Object.assign(new Error("not supported"), { code: -32601 }) }, onProtocolError: error => conn.close(error) })
+    const init = await conn.request("initialize", { protocolVersion: 1, clientInfo: ACP_CLIENT_INFO, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } }, MODEL_PROBE_STEP_MS)
+    if (agyTooOld(init?.agentInfo?.version)) return null
+    const session = await conn.request("session/new", { cwd: wslPath(workspace, wslDistro()), mcpServers: [] }, MODEL_PROBE_STEP_MS)
+    const canClose = init?.agentCapabilities?.sessionCapabilities?.close ?? init?.agentCapabilities?.session_capabilities?.close
+    if (session?.sessionId && canClose) await conn.request("session/close", { sessionId: session.sessionId }, 1000).catch(() => {})
+    const models = offeredModelsFromSession(session)
+    return models.length ? models : null
+  } catch {
+    return null
+  } finally {
+    conn?.close(new Error("model probe complete"))
+    try { child?.stdin?.end() } catch {}
+    if (child?.pid) {
+      if (process.platform === "win32") await execOnce("taskkill", ["/T", "/F", "/PID", String(child.pid)], { timeoutMs: 3000 }).catch(() => {})
+      else try { process.kill(-child.pid, "SIGTERM") } catch { try { child.kill("SIGTERM") } catch {} }
     }
-  })().finally(() => { entry.promise = null })
-  offeredProbes.set(key, entry)
-  return entry.promise
+    if (workspace) await fs.promises.rm(workspace, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 // Named accounts live in AGY_BRIDGE_ACCOUNTS_DIR (default
@@ -1171,6 +1192,8 @@ class Proc {
     this.openingImages = openingImagesOf(opts.messages?.[0])
     this.account = opts.account || null
     this.geminiDir = opts.geminiDir || null
+    // Same scope key as discovery (accounts.mjs), so a live handshake seeds it.
+    this.accountKey = opts.accountKey || (this.geminiDir ? `dir:${this.geminiDir}` : DEFAULT_ACCOUNT.key)
     this.model = opts.model
     this.selection = opts.selection
     this.tools = opts.tools
@@ -1354,7 +1377,7 @@ class Proc {
     logBridgeEvent(this, null, this.resumed ? "resumed" : "created", this.replayReason)
     // Live handshakes are authoritative for this account scope and seed the
     // same cache used by provider discovery. A late probe cannot overwrite it.
-    seedOfferedModels(this.agyPath, { key: this.geminiDir ? `dir:${this.geminiDir}` : "default" }, offeredModelsFromSession(session))
+    seedOfferedModels(this.agyPath, { key: this.accountKey }, offeredModelsFromSession(session))
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
@@ -5455,7 +5478,7 @@ export const AntigravityBridgePlugin = async (input = {}) => {
               }
               const acquireOpts = { model, selection, tools, workDir, instructions, history: trailing.history,
                 messages: body.messages, layout, nonstream: body.stream === false,
-                account: account.name, geminiDir: account.dir, userId: body.metadata?.user_id || "",
+                account: account.name, accountKey: account.key, geminiDir: account.dir, userId: body.metadata?.user_id || "",
                 validateReplay: () => validateAcpPromptBudget(
                   renderReplayPromptParts(body, callerWorkDir, true, instructions), instructions, body) }
               const claim = () => {
@@ -5677,15 +5700,15 @@ export const AntigravityBridgePlugin = async (input = {}) => {
         const out = {}
         await Promise.all(accounts.map(async account => {
           const catalogPromise = agy ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS))
-          const offeredPromise = agy ? Promise.race([
-            probeOfferedModels(agy, account),
-            new Promise(resolve => setTimeout(() => resolve(null), 500)),
-          ]) : Promise.resolve(null)
+          const offeredPromise = agy
+            ? probeOfferedModels(agy, account, configuredTimeout("AGY_BRIDGE_MODEL_PROBE_WAIT_MS", MODEL_PROBE_WAIT_MS))
+            : Promise.resolve(null)
           const [catalog, offered] = await Promise.all([catalogPromise, offeredPromise])
           const offeredIds = new Set((offered || []).map(item => item.id))
           // ACP is an optional confirmation. Unknown/empty/failed probes must
           // never narrow the CLI catalog (notably Claude, Sonnet and GPT-OSS).
-          const available = offered?.length ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : catalog.models
+          // Always copy: ACP-only additions must not leak into the cached catalog.
+          const available = offered?.length ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : [...catalog.models]
           const covered = new Set(available.flatMap(item => [item.id, ...[...(catalog.routes.get(item.id)?.byEffort?.values() || [])]]))
           for (const item of offered || []) if (!covered.has(item.id)) available.push({ id: item.id, name: item.name || item.id })
           for (const model of available) {

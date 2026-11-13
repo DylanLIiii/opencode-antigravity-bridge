@@ -1184,6 +1184,14 @@ function isUnsupportedSteering(error) {
     /(?:not\s+supported|unsupported|busy|already|in\s+progress)/i.test(message)
 }
 
+// Native CLI 1.5 introduced replacement-style resume append and configuration
+// notifications paired with set_config_option. Older ACP servers retain their
+// response-only contract. Evidence: OAR's 2026-11-05 native 1.5.0 experiment.
+function nativeSessionSettings(version) {
+  const parsed = /^v?(\d+)\.(\d+)\.(\d+)(?:$|[-+])/.exec(version || "")
+  return !!parsed && (Number(parsed[1]) > 1 || (Number(parsed[1]) === 1 && Number(parsed[2]) >= 5))
+}
+
 class Proc {
   constructor(agyPath, convKey, opts) {
     this.agyPath = agyPath
@@ -1216,6 +1224,7 @@ class Proc {
     this.stepUsageTrusted = true
     this.configOptions = []
     this.configMethodUnsupported = false
+    this.configExpectation = null
     this.currentSelectionKey = null
     this.instructionsInSession = false
     this.resumed = false
@@ -1324,6 +1333,8 @@ class Proc {
       if (this.dead && this.deadError && error !== this.deadError && !/timed out starting/.test(error.message)) {
         throw new Error(`agy failed before the ACP session started: ${this.deadError.message}`)
       }
+      // Cancel outstanding RPC/config waits even when the startup deadline wins.
+      this.#markDead(error)
       throw error
     } finally {
       clearTimeout(timer)
@@ -1356,6 +1367,8 @@ class Proc {
           sessionId: this.resumeFrom.sessionId,
           cwd: wslPath(this.workspace, wslDistro()),
           mcpServers: [],
+          // Native resume replaces this setting; it does not accumulate append.
+          ...(nativeSessionSettings(this.agentVersion) ? meta : {}),
         })
         if (!session || typeof session !== "object") throw new Error("empty session/resume result")
         this.sessionId = this.resumeFrom.sessionId
@@ -1387,13 +1400,36 @@ class Proc {
   }
 
   async #setConfig(config, value) {
-    const result = await this.conn.request("session/set_config_option", {
-      sessionId: this.sessionId, configId: config.id, value,
-    })
-    if (!Array.isArray(result?.configOptions)) throw new Error("agy returned no configOptions after setting a session option")
-    this.configOptions = result.configOptions
-    const updated = this.configOptions.find(option => option.id === config.id)
-    if (updated?.currentValue !== value) throw new Error(`agy did not apply session option ${config.id}`)
+    if (this.dead) throw this.deadError
+    const timeoutMs = configuredTimeout("AGY_BRIDGE_CONFIG_TIMEOUT_MS", 30_000)
+    let expectation = null
+    let confirmed = Promise.resolve()
+    if (nativeSessionSettings(this.agentVersion)) {
+      // Install before sending: ACP permits notification before RPC response.
+      confirmed = new Promise((resolve, reject) => {
+        expectation = { id: config.id, value, resolve, reject, timer: null }
+        expectation.timer = setTimeout(() => reject(new Error(
+          `agy did not confirm session option ${config.id} via config_option_update after ${timeoutMs}ms`,
+        )), timeoutMs)
+        this.configExpectation = expectation
+      })
+    }
+    try {
+      const response = this.conn.request("session/set_config_option", {
+        sessionId: this.sessionId, configId: config.id, value,
+      }, timeoutMs).then(result => {
+        if (!Array.isArray(result?.configOptions)) throw new Error("agy returned no configOptions after setting a session option")
+        const updated = result.configOptions.find(option => option.id === config.id)
+        if (updated?.currentValue !== value) throw new Error(`agy did not apply session option ${config.id}`)
+        // On native agents the notification is authoritative, in either order.
+        if (!expectation) this.configOptions = result.configOptions
+      })
+      await Promise.all([response, confirmed])
+      if (expectation?.error) throw expectation.error
+    } finally {
+      if (expectation) clearTimeout(expectation.timer)
+      if (this.configExpectation === expectation) this.configExpectation = null
+    }
   }
 
   async #setModel(model, selection, force = false) {
@@ -1530,6 +1566,16 @@ class Proc {
     if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
       this.configOptions = params.update.configOptions
       this.currentSelectionKey = null
+      const expected = this.configExpectation
+      const option = expected && this.configOptions.find(option => option.id === expected.id)
+      if (option) {
+        if (option.currentValue !== expected.value) {
+          expected.error = new Error(`agy config_option_update contradicted session option ${expected.id}: expected ${expected.value}, got ${option.currentValue}`)
+          expected.reject(expected.error)
+        } else {
+          expected.resolve()
+        }
+      }
       return
     }
     const turn = this.turn
@@ -2173,6 +2219,11 @@ class Proc {
     this.dead = true
     this.deadError = error
     this.conn?.close(error)
+    if (this.configExpectation) {
+      clearTimeout(this.configExpectation.timer)
+      this.configExpectation.reject(error)
+      this.configExpectation = null
+    }
     for (const waiter of this.listWaiters.splice(0)) {
       clearTimeout(waiter.timer)
       waiter.reject(error)

@@ -27,7 +27,7 @@ magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 | **OpenCode compatibility** | Direct OpenCode use keeps `<account>/<model-id>` selection | [Multiple accounts](#multiple-accounts) |
 | **Lean agent, on by default** | Drops agy's ~8K built-in coding prompt; historically measured "Reply OK" input 8,357 → 509 (−94%) | [Token cost](#token-cost) |
 | **Session reuse** | Each turn sends only the new message; idle, evicted or restarted sessions `session/resume` from a hashed snapshot | [What works](#what-works) |
-| **Stable prefix for caching** | Instructions are installed once per session and requests only append, giving Google's backend a stable prefix; whether it caches is Google's decision | [Prompt caching](#prompt-caching) |
+| **Stable prefix for caching** | Session instructions stay stable and are restored on resume; each turn only appends new messages, giving Google's backend a stable prefix; whether it caches is Google's decision | [Prompt caching](#prompt-caching) |
 | **Real client tools** | Client tools appear as native MCP tools: parallel, multi-round and long-running, each executed once | [What works](#what-works) |
 | **Streaming · thinking · images** | Streamed text and thought summaries; inline image input when agy advertises image support | [Limitations](#limitations) |
 | **Observable usage** | Separates actual input, cache reads/writes, output and thinking; subscription quota in Magpie's Usage page | [Subscription limits](#subscription-limits) |
@@ -283,8 +283,10 @@ user profile or VM.
   text. The next request whose history and instructions hash the same, also
   after a Magpie or plugin restart, starts agy with `session/resume` and sends
   only the new message (within `AGY_BRIDGE_RESUME_TTL_MS`, default 6 hours).
-  Instructions are appended only on `session/new`, never appended again on
-  resume. A failed resume or startup restores the durable snapshot instead of
+  Where append is advertised, instructions are installed on `session/new`.
+  Native agy 1.5+ resume restores the same append setting, replacing rather than
+  accumulating it, without repeating instructions in user messages. Older ACP
+  behavior is preserved. A failed resume or startup restores the durable snapshot instead of
   discarding it; only a missing/unsupported conversation falls back to
   `session/new`. Concurrent bridge processes merge the file instead of
   overwriting it.
@@ -459,8 +461,9 @@ used as an exact quota or context-limit measurement.
 
 ## Token cost
 
-The client's system prompt is installed once per session with ACP
-`_meta.antigravity.systemPrompt.append`, and each turn sends only the new user
+The client's system prompt is kept in the ACP session through
+`_meta.antigravity.systemPrompt.append` when supported; native agy 1.5+ resume
+restores that setting without accumulating copies. Each turn sends only the new user
 message. agy's own coding-agent prompt and built-in tool catalog are excluded,
 because the client supplies both. Measured with agy 1.4.12 (`gemini-3.8-flash`):
 
@@ -486,8 +489,8 @@ per 150 s of waiting only when a tool runs longer than that.
 ### Prompt caching
 
 **Prompt caching** is decided by Google's backend, not the bridge. The bridge
-keeps the request prefix as stable as it can: the instructions are installed
-once per session and agy keeps the conversation, so each turn appends only the
+keeps the request prefix as stable as it can: session instructions are kept
+consistent across resumes and agy keeps the conversation, so each turn appends only the
 new message. Measured on agy 1.4.12 with a 5.5k-token stable system prompt
 over four turns of one session:
 
@@ -826,6 +829,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_MODEL_PROBE_RETRY_MS` | 15000 | minimum retry delay after an empty, failed or unsupported ACP probe; failures keep the last successful result |
 | `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session, tool and model usage diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
+| `AGY_BRIDGE_CONFIG_TIMEOUT_MS` | 30000 | configuration RPC deadline; native agy 1.5+ also requires the matching session notification before applying the next option or sending a prompt |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | idle time before a process is parked for resume |
 | `AGY_BRIDGE_MAX_PROCS` | 16 | maximum pooled agy processes across conversations and accounts; positive safe integer; Magpie also applies the plugin's concurrency limit of 16 |

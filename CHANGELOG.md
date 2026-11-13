@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.4
+
+- Restore capability-advertised system append on every native agy 1.5+ resume, without repeating instructions in user turns or accumulating append text. Preserve older ACP behavior.
+- Bound configuration RPCs on all supported versions with `AGY_BRIDGE_CONFIG_TIMEOUT_MS` (default 30 seconds). Native agy 1.5+ also waits for the matching session notification before applying effort or sending a prompt. Missing confirmations return retryable HTTP 503, contradictory notifications return HTTP 502, and waits are cleaned up on failure or shutdown. Retain legacy model fallback only for an unsupported method.
+- Add production-provider/fake-ACP protocol regressions and run them in the existing cross-platform CI matrix, including Windows Node 22 and checkout paths with spaces.
+
 ## 0.8.3
 
 - Host the self-contained bilingual product page on GitHub Pages through a dedicated Actions workflow that uploads only `docs/index.html`. Link the live site from both READMEs and keep README links working when the page is hosted or its language changes.

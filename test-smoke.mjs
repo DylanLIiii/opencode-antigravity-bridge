@@ -2393,9 +2393,9 @@ for (const location of ["inline", "system", "developer", "user"]) {
       !lastOf("user").text.includes("CONSECUTIVE-RESUME-SYSTEM"))
   }
   const related = inits().filter(event => event.convId === target.convId)
-  check("system append appears only on new across consecutive resumes",
+  check("system append is restored once on every native open across consecutive resumes",
     related.length === 3 && related.filter(event => event.resumed).length === 2 &&
-    related.filter(event => event.resumed).every(event => event.systemAppend === null),
+    related.every(event => event.systemAppend === target.systemAppend),
     JSON.stringify(related.map(event => ({ resumed: event.resumed, append: event.systemAppend }))))
 }
 

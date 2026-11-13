@@ -1,63 +1,100 @@
-# opencode-antigravity-bridge
+<div align="center">
 
-把你的 **Antigravity 订阅**变成 OpenCode、Amp、Claude Code 等客户端的模型后端——
-Gemini、Claude、GPT-OSS 全系可用。
+# Antigravity Bridge
 
-**[English version → README.en.md](README.en.md)**
+**用官方 `agy` CLI，把 Antigravity 订阅接进 Magpie、OpenCode、Claude Code 和 Amp。**
 
+多个 Google 账号 · 共用普通模型 ID · 精简 prompt · 会话复用 · 可观测的 token 与缓存用量
 
-精简 agent 默认开启；设置 `AGY_BRIDGE_MINIMAL_AGENT=0` 可关闭，这与 agy-cli 的默认关闭有意不同。缺少逐调用记录时，工具轮次的缓存用量是有界估算，不能证明 Google 实际缓存命中；ACP 输出量包含一次思考量。
+[English](README.en.md) · [产品页 `docs/index.html`](docs/index.html) · [30 秒上手](#30-秒上手) · [技术指南](#它是怎么工作的)
 
-## 它解决什么问题
+</div>
 
-- 已经订阅了 Antigravity（Google AI Pro/Ultra 附带），却还要为 Gemini / Claude API
-  另开一份付费？这个插件让订阅直接服务你的编码客户端。
-- 不用逆向私有接口、不用伪装 IDE：它驱动**真实的 `agy` CLI**，走官方
-  Agent Client Protocol（ACP），Google 看到的是正版 CLI 发出的请求。
-- 客户端的工具（读写文件、跑命令等）原生透传给模型，不是文本约定 hack。
+```sh
+magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
+```
 
-## 核心特性
+> 直接从 GitHub 安装，无需 npm 发布。开发时也可安装本地 checkout。产品页 [`docs/index.html`](docs/index.html) 是单个自包含的
+> HTML 文件，目前没有在线托管：克隆仓库后直接用浏览器打开即可本地预览。
 
-- **全订阅模型可用**：Gemini、Claude、GPT-OSS 一应俱全，会话中可随时切换模型
-  和思考等级；ACP 保持 Zed 兼容身份以支持 agy 的非 Gemini 模型 allowlist。
+## 为什么选它
+
+| | 你得到什么 | 依据 |
+| --- | --- | --- |
+| **官方 CLI 通道** | 驱动真实的 `agy acp`（Agent Client Protocol），不逆向私有接口、不伪装 IDE | 见[工作原理](#它是怎么工作的) |
+| **多账号，原生体验** | 每个 Google 账号在 Magpie 中独立成行，**共用不带前缀的普通模型 ID**，由 Magpie 的账号首选、开关与路由规则选择；会话、进程和额度按账号隔离 | 见[账号管理](#账号管理入口) |
+| **OpenCode 兼容** | 直接用 OpenCode 时，仍可用 `<账号>/<模型id>` 前缀选择账号 | 见[多账号](#多账号) |
+| **精简 agent（默认开启）** | 去掉 agy 自带约 8K 的编码 prompt；历史实测 "Reply OK" 输入 8,357 → 509（−94%） | 见[省 token 实测](#省-token-实测) |
+| **会话复用** | 每轮只发新增消息；空闲、淘汰或重启后按哈希快照 `session/resume` | 见[使用说明](#使用说明) |
+| **稳定前缀，利于缓存** | 指令每个会话只安装一次、请求只追加，便于 Google 后端命中缓存；是否命中由 Google 决定 | 见[缓存命中](#缓存命中由-google-决定) |
+| **真正的客户端工具** | 客户端工具以 MCP 原生工具出现，支持并行、多轮、长耗时工具，每个调用只执行一次 | 见[客户端工具行为](#使用说明) |
+| **流式 · 思考 · 图片** | 文本与思考摘要流式输出，支持内联图片输入（需 agy 声明图片能力） | 见 [FAQ](#faq--注意事项) |
+| **用量看得见** | 日志区分实际输入、缓存读写、输出与思考量；Magpie Usage 页可看订阅额度 | 见[上下文与用量](#上下文窗口与压缩) |
+| **可选上下文解锁** | 默认 256K 声明；显式 `unlock` 后托管副本声明 512K（客户端策略，未端到端验证） | 见[上下文解锁](#可选上下文解锁默认关闭) |
+
+可用模型取决于你安装的 agy 版本和账号实际开放的型号：插件会按账号探测后再列出，
+不保证所有 Gemini / Claude / GPT-OSS 型号都可用。
+
+## 省 token 实测
+
+agy 默认 agent 自带约 8,000 tokens 的编码 prompt。本插件默认使用最小化 agent
+配置，把这部分去掉，以客户端自己的 system prompt 和工具目录为准
+（`AGY_BRIDGE_MINIMAL_AGENT=0` 可关闭，这与 agy-cli 的默认关闭有意不同）。
+
+以下为**历史实测**，条件：agy 1.4.12，`gemini-3.8-flash`（三轮会话用 `gemini-3.8-flash-low`）。
+不同 agy 版本、模型和客户端 prompt 下数字会变化：
+
+| 场景 | input tokens |
+|---|---|
+| agy 默认 agent（"Reply OK"） | 8,357 |
+| 本插件（同一指令） | **509（−94%）** |
+| 三轮编码会话含一次工具调用（两个客户端工具） | **4,109 vs 15,351（−73%）** |
+
+### 缓存命中由 Google 决定
+
+Prompt caching 由 Google 后端决定，插件不能保证命中率；它只让请求前缀尽量稳定：
+指令每个会话只安装一次，每轮只追加新消息，不重放历史。历史实测（agy 1.4.12，同一会话多轮）：
+
+| 模型 · 稳定 prompt 大小 | 观察结果 |
+| --- | --- |
+| `gemini-4-argon-low` · 约 26k | 第 3 轮缓存读 23,944 / 26,097 = **91.7%** |
+| `gemini-4-argon-low` · 约 5.5k | 第 2–4 轮约 **62–64%** |
+| `gemini-3.8-flash-low` · 约 5.5k | 每轮缓存读 **0** |
+
+在这些 Argon 样本中，每轮约最后 2k tokens 不从缓存读取，因此命中率随 prompt 变大而上升；
+这个常数是从样本推断的，Google 未公开说明。**不承诺 90% 命中**：具体取决于模型、账号和 Google 后端。
+
+缓存数字的来源也要区分：能读到 agy 本地会话库的逐调用记录（`gen_metadata` / `steps`）时，
+`cache_read_input_tokens` 来自实际记录；读不到时，工具轮次的缓存用量是**有界估算**，
+不能证明 Google 实际缓存命中。ACP 输出量包含一次思考量。
+
+完整数据和测量方法见 [README.en.md](README.en.md#token-cost)。
+
+## 更多能力与边界
+
+- **模型与思考等级**：会话中可在 Magpie 模型选择器切换模型和思考等级；ACP 使用本插件的名称与版本。
+  型号以账号实际探测结果为准。
 - **Prompt 风险收敛**：精确移除独立计费伪 header、规范化已知 Agent SDK 身份句，
   不全局改写用户正文；通用 429 不再被直接当作确定配额耗尽。
 - **异常防重发**：同一逻辑 Prompt 在提交后失败、取消或进程退出时，不会因客户端
   自动重试再次交给 agy。
-- **流式输出 + 思考摘要 + 图片输入**：文本、思考过程、图片按顺序完整呈现。
+- **流式输出 + 思考摘要 + 图片输入**：文本、思考过程、图片按顺序呈现。
   agy 内部的会话标题摘要也在同一思考流里，其提示词回显不再转发到客户端
   （诊断时可设 `AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS=1` 恢复）。
   过滤依据已知提示词签名：未验证原生来源标记；任意分片可能漏过，合法思考若回显相同签名
   也可能被过滤。
 - **Claude Code 兼容**：支持尾随 system/developer 上下文、hooks、Skill /
   ToolSearch 工具附加内容和用户排队消息，兼容非流式 Messages 响应。
-- **工具调用零损耗**：客户端工具以 MCP 原生工具的形式出现在模型面前，
-  支持长任务、并行调用；工具跑得再久也不会丢结果。
-- **会话不丢**：每轮结束自动记录会话状态（只存哈希，不落明文），
-  重启 magpie 或插件后上下文原样续上。
-- **额度可见**：在 Magpie 的 Usage 页面直接查看 Antigravity 订阅额度。
+- **客户端工具原生透传**：客户端工具以 MCP 原生工具的形式出现在模型面前，支持并行调用和长任务；
+  超过 150 秒的工具先回复 "still running"，结果最终送达，每个调用只执行一次
+  （仍受 `AGY_BRIDGE_TOOL_TIMEOUT_MS` 等待上限约束）。
+- **会话续接**：每轮结束记录会话状态（只存哈希，不落明文），重启 Magpie 或插件后，
+  历史与指令哈希一致时通过 `session/resume` 续上；恢复失败或历史改写时按预算重放。
+- **额度可见**：在 Magpie 的 Usage 页面查看 Antigravity 订阅额度（仅展示，不自动停请求）。
 - **上下文与用量可追踪**：向客户端声明上下文窗口，并在工具等待前读取生成级账单，
   日志分别记录实际输入、缓存与 AGY 本地上下文估算。
 - **安全隔离**：不读取你的全局 MCP 配置和凭据；agy 的权限请求一律拒绝，
-  真正的操作都发生在客户端侧。
-- **省 token 实测**：见下。
-
-## 省 token 实测
-
-agy 默认 agent 自带约 8,000 tokens 的编码 prompt。本插件通过最小化 agent
-配置把这部分干掉——客户端自己的 system prompt 和工具目录本来就是权威来源：
-
-| 场景 | input tokens |
-|---|---|
-| agy 默认 agent（"Reply OK"） | 8,357 |
-| 本插件（同一指令） | **509（-94%）** |
-| 三轮编码会话含一次工具调用 | **4,109 vs 15,351（-73%）** |
-
-Prompt caching 由 Google 后端决定，本插件让请求前缀尽量稳定：实测 26k token
-的稳定 prompt 下缓存命中率 **91.7%**，OpenCode 这类带工具定义的长 prompt
-通常在 90% 以上。每轮只发新增消息，不重放历史。
-
-完整数据、缓存分析和测量方法见 [README.en.md](README.en.md#token-cost)。
+  真正的操作都发生在客户端侧。这不保证账号不受限制，也不排除 Google 政策变化。
 
 ## 30 秒上手
 
@@ -69,8 +106,8 @@ Prompt caching 由 Google 后端决定，本插件让请求前缀尽量稳定：
   （已核对 1.5.4 的授权链接与输入流程）
 
 ```sh
-# 1. 安装插件（本地 checkout，尚未发布 npm）
-magpie plugin add ./opencode-antigravity-bridge
+# 1. 从 GitHub 安装插件
+magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 
 # 2. 在 Magpie 中：Providers → Antigravity Bridge → 登录
 #    已接入时点击「添加另一个 Antigravity Bridge 账号」，再选择「新增 Google 账号」
@@ -97,7 +134,7 @@ magpie plugin add ./opencode-antigravity-bridge
 Magpie 中每个账号独立显示一行，共用不带账号前缀的模型 ID。可在账号列表设为首选、启用或关闭，
 并使用 Magpie 的账号路由规则。会话、进程和额度按所选账号隔离。
 从 0.6.x 升级时，原默认 CLI 账号保留；对已有的每个命名账号，选择「使用已保存的 Bridge 账号」并填写
-原名称（例如 `Yazi`），不需要再次 Google 授权。刷新模型目录后移除旧的账号前缀型号，保留普通型号。
+原名称（例如 `work`），不需要再次 Google 授权。刷新模型目录后移除旧的账号前缀型号，保留普通型号。
 删除 Magpie 中的账号登记不会删除其配置目录；重新登记即可恢复，不会在重启时自动恢复被移除的登记。
 WSL 模式仅支持使用发行版内已有的 CLI 登录，不提供命名账号的新增或导入选项。
 
@@ -145,7 +182,9 @@ Google Code Assist 后端
 新的登录会清理上次未完成的流程。取消开始或完成步骤会立即清理；关闭等待粘贴的
 界面后，插件会在到期或下次登录时清理隐藏目录和进程。失败后请重新开始，使用新回调。
 
-**多账号**：新 UI 登录会自动创建
+### 多账号
+
+新 UI 登录会自动创建
 `~/.config/magpie-agy-bridge/accounts/<名称>/`（可用 `AGY_BRIDGE_ACCOUNTS_DIR`
 覆盖根目录）。也可手动准备一个完整的 Gemini 配置目录，并在该目录里登录一次：
 
@@ -281,6 +320,15 @@ agy-bridge context status
 agy-bridge context unlock     # 需要 Python 3.8+；复制 agy，只补丁副本
 agy-bridge context disable [--purge]
 ```
+
+**Magpie 界面入口**：在 Providers 中右键 Antigravity Bridge 行，选择
+「Antigravity Bridge 上下文设置」，或从侧边栏打开同名页面。选择默认或托管解锁，审阅后确认，
+页面会异步执行并显示结果；失败后可重试，也可恢复默认。保存后重启 Magpie 或重新加载 Bridge 插件，
+再刷新模型目录。页面分别显示已保存模式、下次启动校验结果和当前进程实际模式；已有会话保持原模式。
+入口调用下面同一套补丁流程，上述 CLI 命令继续可用。WSL 模式仅显示状态说明，不能修改宿主机的解锁设置。
+
+补丁只针对已知构建生成受校验的副本。补丁移除的是 agy 的 256K checkpoint gate，补丁后的阈值约为
+983K（983,040），这是 gate 数值，**不代表已验证 1M 可用容量**；新版本 agy 的长上下文效果同样未经验证。
 
 `unlock` 把官方 `agy` 复制到 `~/.config/magpie-agy-bridge/context-unlock/`
 （`AGY_BRIDGE_CONTEXT_DIR`），用固定且校验 SHA-256 的

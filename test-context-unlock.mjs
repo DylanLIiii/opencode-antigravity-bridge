@@ -95,6 +95,21 @@ test("unsupported builds fail closed and keep the default", () => {
   assert.throws(() => unlockContext({ env, agyPath: path.join(os.tmpdir(), "no-such-agy"), run }), ContextError)
 })
 
+test("a UI deadline bounds every command and an expired deadline starts no command", () => {
+  const { agy, env } = setup()
+  const fake = fakeRun()
+  const run = (file, args, options) => {
+    assert(options.timeout > 0 && options.timeout <= 1000)
+    return fake.run(file, args)
+  }
+  assert.equal(unlockContext({ env, agyPath: agy, run, deadline: Date.now() + 1000,
+    taskId: "a8586e3e-3729-4164-9f5f-7ee45d572e8d" }).active, true)
+  const expired = fakeRun()
+  assert.throws(() => unlockContext({ env, agyPath: agy, run: expired.run, deadline: Date.now() - 1 }), error => error.code === "timeout")
+  assert.equal(expired.calls.length, 0)
+  assert.equal(fs.readFileSync(agy, "utf8"), "OFFICIAL-AGY-v1")
+})
+
 test("a tampered patcher is refused before anything runs", () => {
   const { agy, env } = setup()
   const fake = path.join(tmp("ctx-patcher-"), "agy-patch.py")

@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Antigravity Bridge context</title>
+<style>
+:root{color-scheme:light dark;font:14px/1.6 var(--magpie-font,system-ui,sans-serif);background:var(--magpie-bg,Canvas);color:var(--magpie-fg,CanvasText)}body{margin:0;padding:clamp(16px,4vw,36px)}main{max-width:780px;margin:auto}h1{font-size:22px;line-height:1.3}h2{font-size:16px}p{margin:10px 0}.muted,small{color:var(--magpie-muted,GrayText)}fieldset{border:0;padding:0;margin:24px 0}legend{font-weight:600;margin-bottom:8px}.choice{display:block;border:1px solid var(--magpie-line,GrayText);border-radius:10px;padding:14px;margin:10px 0;cursor:pointer}.choice:has(input:checked){border-color:var(--magpie-accent,Highlight);background:var(--magpie-accent-soft,transparent)}.choice input{margin:0 8px 0 0}.choice small{display:block;margin-left:25px}button{font:inherit;color:inherit;background:var(--magpie-card,ButtonFace);border:1px solid var(--magpie-line,ButtonBorder);border-radius:7px;padding:7px 12px;cursor:pointer}button:disabled{opacity:.5;cursor:default}button:focus-visible,input:focus-visible{outline:2px solid var(--magpie-accent,Highlight);outline-offset:3px}.actions{display:flex;gap:8px;flex-wrap:wrap}dl{display:grid;grid-template-columns:minmax(130px,1fr) 2fr;gap:8px 16px;padding:16px;border:1px solid var(--magpie-line,GrayText);border-radius:10px}dt{color:var(--magpie-muted,GrayText)}dd{margin:0;overflow-wrap:anywhere}#review{border:2px solid var(--magpie-accent,Highlight);border-radius:10px;padding:16px;margin:20px 0}#feedback{white-space:pre-wrap;overflow-wrap:anywhere}.error{color:var(--magpie-danger,#c43d3d)}.ok{color:var(--magpie-success,#267c4b)}[hidden]{display:none!important}@media(max-width:480px){dl{grid-template-columns:1fr;gap:2px}dd{margin-bottom:10px}}
+</style></head><body><main>
+<h1 data-i18n="title">Antigravity Bridge context</h1>
+<p data-i18n="intro">Choose a context mode for all Bridge accounts. Changes apply when the Bridge host next selects agy.</p>
+<dl aria-live="polite"><dt data-i18n="saved">Saved desired mode</dt><dd id="desired">…</dd><dt data-i18n="verified">Verified selection for next start</dt><dd id="effective">…</dd><dt data-i18n="current">Current host process</dt><dd id="current">…</dd><dt data-i18n="declaration">Current client context declaration</dt><dd id="declared">…</dd></dl>
+<p id="restart" class="muted"></p>
+<fieldset id="modes"><legend data-i18n="choose">Choose mode</legend>
+<label class="choice"><input type="radio" name="mode" id="default" value="default" checked><strong data-i18n="defaultChoice">Default — 256,000 tokens</strong><small data-i18n="defaultHelp">Use official agy. Restoring default disables the saved unlock and keeps managed copies.</small></label>
+<label class="choice"><input type="radio" name="mode" id="unlocked" value="unlocked"><strong data-i18n="unlockChoice">Managed unlock — 512,000 declared tokens</strong><small data-i18n="unlockHelp">Copy the official agy and patch only the Bridge-managed copy. Requires Python 3.8+ and a build/architecture supported by every gate of the pinned patcher.</small></label>
+</fieldset>
+<p class="muted" data-i18n="limits">512K is a client declaration, not an end-to-end verified capacity. GPT-OSS stays capped at 131,072 tokens. An AGY_BRIDGE_CONTEXT_WINDOW override takes precedence. Existing sessions keep their selected binary and mode.</p>
+<div class="actions"><button id="apply" disabled data-i18n="apply">Review selected change</button><button id="cancel" data-i18n="cancel">Cancel selection</button><button id="refresh" data-i18n="refresh">Refresh status</button></div>
+<section id="review" hidden aria-labelledby="review-title"><h2 id="review-title" data-i18n="reviewTitle">Confirm context change</h2><p id="review-text"></p><p data-i18n="reviewNote">The official installation is never written. Restart the Bridge host after saving, then refresh models. Running sessions stay unchanged.</p><div class="actions"><button id="confirm" data-i18n="confirm">Confirm and execute</button><button id="back" data-i18n="back">Back without changes</button></div></section>
+<p id="feedback" role="status" aria-live="polite"></p><p id="detail" class="muted"></p>
+</main><script>
+const capability = "__CAPABILITY__"
+const $ = id => document.getElementById(id)
+const strings = {
+  en: {
+    title: "Antigravity Bridge context", intro: "Choose a context mode for all Bridge accounts. Changes apply when the Bridge host next selects agy.",
+    saved: "Saved desired mode", verified: "Verified selection for next start", current: "Current host process", declaration: "Current client context declaration", choose: "Choose mode",
+    defaultChoice: "Default — 256,000 tokens", defaultHelp: "Use official agy. Restoring default disables the saved unlock and keeps managed copies.",
+    unlockChoice: "Managed unlock — 512,000 declared tokens", unlockHelp: "Copy the official agy and patch only the Bridge-managed copy. Requires Python 3.8+ and a build/architecture supported by every gate of the pinned patcher.",
+    limits: "512K is a client declaration, not an end-to-end verified capacity. GPT-OSS stays capped at 131,072 tokens. An AGY_BRIDGE_CONTEXT_WINDOW override takes precedence. Existing sessions keep their selected binary and mode.",
+    apply: "Review selected change", cancel: "Cancel selection", refresh: "Refresh status", reviewTitle: "Confirm context change", confirm: "Confirm and execute", back: "Back without changes",
+    reviewNote: "The official installation is never written. Restart Magpie or reload the Bridge plugin after saving, then refresh models. Running sessions stay unchanged.",
+    reviewUnlock: "Enable managed unlock? Python 3.8+ and all pinned patcher build gates must pass before the saved selection changes. Only the managed copy is patched.",
+    reviewDefault: "Restore default? This disables managed selection without deleting copies. The default client declaration is 256,000 unless overridden.",
+    default: "Default (official agy)", unlocked: "Managed unlock", unknown: "Unknown", notSelected: "Not selected yet — next initialization uses the saved setting",
+    restart: "Restart required: the running process keeps its selected binary. Restart Magpie or reload the Bridge plugin, then refresh the model list.",
+    pinned: "Binary selection is pinned per host process; existing sessions keep their mode.",
+    loading: "Checking saved selection and binary integrity…", working: "Working: checking build gates, creating/verifying the managed copy…", disabling: "Working: restoring default selection…",
+    success: "Saved successfully. Restart Magpie or reload the Bridge plugin, then refresh models to update context declarations. Running sessions keep their current mode.",
+    failure: "Operation failed. Review status and retry. ", unavailable: "Context service unavailable. Retry Refresh status or reopen this page. ", cancelled: "Selection cancelled. No changes were requested.",
+    override: "Environment override", tokens: "tokens", notDeclared: "Not declared yet", checking: "Verifying…",
+    wsl: "Context unlock is unavailable in WSL mode. Bridge keeps using the distro's official agy; this page cannot modify the host installation or its unlock setting.",
+  },
+  zh: {
+    title: "Antigravity Bridge 上下文设置", intro: "选择所有 Bridge 账号使用的上下文模式。Bridge 宿主下次选择 agy 时应用设置。",
+    saved: "已保存的目标模式", verified: "下次启动的校验结果", current: "当前宿主进程", declaration: "当前客户端上下文声明", choose: "选择模式",
+    defaultChoice: "默认 — 256,000 tokens", defaultHelp: "使用官方 agy。恢复默认会关闭已保存的解锁设置，并保留托管副本。",
+    unlockChoice: "托管解锁 — 声明 512,000 tokens", unlockHelp: "复制官方 agy，仅修改 Bridge 托管副本。需要 Python 3.8+，且版本和架构必须通过固定补丁器的全部构建校验。",
+    limits: "512K 是客户端声明，尚未经端到端验证。GPT-OSS 上限仍为 131,072 tokens。AGY_BRIDGE_CONTEXT_WINDOW 环境覆盖值优先。已有会话保留原二进制与模式。",
+    apply: "审阅所选更改", cancel: "取消选择", refresh: "刷新状态", reviewTitle: "确认上下文更改", confirm: "确认并执行", back: "返回，不作更改",
+    reviewNote: "始终不写入官方安装。保存后重启 Magpie 或重新加载 Bridge 插件，再刷新模型。已有会话不变。",
+    reviewUnlock: "启用托管解锁？需要 Python 3.8+，且固定补丁器的全部构建校验通过后才保存设置。仅修改托管副本。",
+    reviewDefault: "恢复默认？关闭托管选择并保留副本。未设置环境覆盖时，默认客户端声明为 256,000。",
+    default: "默认（官方 agy）", unlocked: "托管解锁", unknown: "未知", notSelected: "尚未选择 — 下次初始化按保存设置选择",
+    restart: "需要重启：当前进程继续使用已选二进制。请重启 Magpie 或重新加载 Bridge 插件，再刷新模型列表。", pinned: "每个宿主进程固定选择一次二进制；已有会话保留原模式。",
+    loading: "正在检查保存设置与二进制完整性…", working: "执行中：检查构建校验，创建并验证托管副本…", disabling: "执行中：恢复默认选择…",
+    success: "保存成功。请重启 Magpie 或重新加载 Bridge 插件，再刷新模型以更新上下文声明。已有会话保留当前模式。", failure: "操作失败，请检查状态后重试。", unavailable: "上下文服务不可用，请刷新状态或重新打开页面。", cancelled: "已取消选择，未请求任何更改。",
+    override: "环境覆盖值", tokens: "tokens", notDeclared: "尚未声明", checking: "正在验证…",
+    wsl: "WSL 模式暂不支持上下文解锁。Bridge 继续使用发行版内的官方 agy；此页面不会修改宿主机安装或其解锁设置。",
+  },
+}
+let lang = "en", snapshot = null, selected = "default", pending = null, busy = true, pollTimer = null, localError = false
+const t = key => strings[lang][key] || strings.en[key] || key
+function theme(value) {
+  if (!value || typeof value !== "object") return
+  lang = /^zh/i.test(value.lang || "") ? "zh" : "en"
+  document.documentElement.lang = lang
+  document.documentElement.style.colorScheme = value.dark ? "dark" : "light"
+  for (const [key, val] of Object.entries(value.tokens || {})) {
+    if (/^[a-zA-Z0-9-]+$/.test(key) && typeof val === "string") document.documentElement.style.setProperty("--magpie-" + key, val)
+  }
+  document.querySelectorAll("[data-i18n]").forEach(node => { node.textContent = t(node.dataset.i18n) })
+  render()
+}
+try { theme(JSON.parse(new URLSearchParams(location.hash.slice(1)).get("theme") || "{}")) } catch {}
+addEventListener("message", event => {
+  if (event.source !== parent || event.data?.magpie !== 1) return
+  if (event.data.event === "theme") theme(event.data.data)
+  else if (event.data.id === "bridge-context-theme" && event.data.result) theme(event.data.result)
+})
+if (parent !== window) parent.postMessage({ magpie: 1, id: "bridge-context-theme", method: "hello" }, "*")
+const number = n => Number(n).toLocaleString(lang === "zh" ? "zh-CN" : "en-US")
+function render() {
+  if (!snapshot) return
+  $("desired").textContent = t(snapshot.desired)
+  $("effective").textContent = snapshot.checking ? t("checking") : t(snapshot.effective)
+  $("current").textContent = snapshot.current === "not-selected" ? t("notSelected") : t(snapshot.current)
+  $("declared").textContent = snapshot.declaredContext == null ? t("notDeclared") : `${number(snapshot.declaredContext)} ${t("tokens")}${snapshot.contextOverride ? ` (${t("override")})` : ""}`
+  $("restart").textContent = t(snapshot.restartRequired ? "restart" : "pinned")
+  $("default").checked = selected === "default"; $("unlocked").checked = selected === "unlocked"
+  $("modes").disabled = busy || !!snapshot.unavailableReason; $("apply").disabled = busy || !snapshot.check || !!snapshot.unavailableReason; $("cancel").disabled = busy
+  $("refresh").disabled = busy; $("confirm").disabled = busy
+  $("review").hidden = !pending
+  $("review-text").textContent = t(pending === "unlocked" ? "reviewUnlock" : "reviewDefault")
+  const check = snapshot.check
+  $("detail").textContent = snapshot.unavailableReason ? t(snapshot.unavailableReason) : check && !["default", "disabled", "unlocked"].includes(check.state) ? `${check.state}: ${check.reason}` : ""
+}
+function feedback(key, error = "") {
+  $("feedback").className = key === "success" ? "ok" : ["failure", "unavailable"].includes(key) ? "error" : ""
+  $("feedback").textContent = t(key) + error
+}
+// Relative URLs preserve the full Magpie web token proxy path. A sandboxed
+// document has location.origin "null" on some engines; never use it for APIs.
+async function api(path, body) {
+  const response = await fetch(new URL(path, location.href).href, {
+    method: body ? "POST" : "GET", credentials: "omit",
+    headers: { "x-bridge-context-capability": capability, Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  })
+  const result = await response.json()
+  if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`)
+  return result
+}
+async function refresh(force = false) {
+  clearTimeout(pollTimer)
+  try {
+    const previous = snapshot
+    snapshot = await api(force ? "api/status?refresh=1" : "api/status")
+    busy = !!snapshot.operation || snapshot.checking
+    if (!previous?.check && snapshot.check) selected = snapshot.desired === "unlocked" ? "unlocked" : "default"
+    render()
+    if (snapshot.operation) feedback(snapshot.operation.action === "disable" ? "disabling" : "working")
+    else if (snapshot.checking) feedback("loading")
+    else if (snapshot.last?.ok === false) feedback("failure", snapshot.last.error || "")
+    else if (snapshot.last?.ok) feedback("success")
+    else { localError = false; $("feedback").textContent = "" }
+    if (busy) pollTimer = setTimeout(() => refresh(), 500)
+  } catch (error) {
+    busy = false; localError = true; render(); $("refresh").disabled = false
+    feedback("unavailable", error.message)
+  }
+}
+$("default").addEventListener("change", () => { selected = "default"; pending = null; render() })
+$("unlocked").addEventListener("change", () => { selected = "unlocked"; pending = null; render() })
+$("apply").addEventListener("click", () => {
+  if (busy || !snapshot?.check) return
+  pending = selected; render(); $("confirm").focus()
+})
+function cancel() {
+  if (busy) return
+  pending = null; selected = snapshot?.desired === "unlocked" ? "unlocked" : "default"; render(); feedback("cancelled")
+}
+$("cancel").addEventListener("click", cancel)
+$("back").addEventListener("click", cancel)
+$("refresh").addEventListener("click", () => { if (!busy) refresh(true) })
+$("confirm").addEventListener("click", async () => {
+  if (!pending || busy) return
+  const action = pending === "unlocked" ? "unlock" : "disable"
+  pending = null; busy = true; render(); feedback(action === "unlock" ? "working" : "disabling")
+  try {
+    snapshot = await api("api/action", { action, confirm: action })
+    render(); await refresh()
+  } catch (error) {
+    busy = false; localError = true; render(); feedback("failure", error.message)
+  }
+})
+feedback("loading")
+refresh()
+</script></body></html>

@@ -26,7 +26,7 @@ magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 | **OpenCode 兼容** | 直接用 OpenCode 时，仍可用 `<账号>/<模型id>` 前缀选择账号 | 见[多账号](#多账号) |
 | **精简 agent（默认开启）** | 去掉 agy 自带约 8K 的编码 prompt；历史实测 "Reply OK" 输入 8,357 → 509（−94%） | 见[省 token 实测](#省-token-实测) |
 | **会话复用** | 每轮只发新增消息；空闲、淘汰或重启后按哈希快照 `session/resume` | 见[使用说明](#使用说明) |
-| **稳定前缀，利于缓存** | 指令每个会话只安装一次、请求只追加，便于 Google 后端命中缓存；是否命中由 Google 决定 | 见[缓存命中](#缓存命中由-google-决定) |
+| **稳定前缀，利于缓存** | 会话指令保持稳定、恢复时补回，每轮只追加新消息，便于 Google 后端命中缓存；是否命中由 Google 决定 | 见[缓存命中](#缓存命中由-google-决定) |
 | **真正的客户端工具** | 客户端工具以 MCP 原生工具出现，支持并行、多轮、长耗时工具，每个调用只执行一次 | 见[客户端工具行为](#使用说明) |
 | **流式 · 思考 · 图片** | 文本与思考摘要流式输出，支持内联图片输入（需 agy 声明图片能力） | 见 [FAQ](#faq--注意事项) |
 | **用量看得见** | 日志区分实际输入、缓存读写、输出与思考量；Magpie Usage 页可看订阅额度 | 见[上下文与用量](#上下文窗口与压缩) |
@@ -53,7 +53,7 @@ agy 默认 agent 自带约 8,000 tokens 的编码 prompt。本插件默认使用
 ### 缓存命中由 Google 决定
 
 Prompt caching 由 Google 后端决定，插件不能保证命中率；它只让请求前缀尽量稳定：
-指令每个会话只安装一次，每轮只追加新消息，不重放历史。历史实测（agy 1.4.12，同一会话多轮）：
+指令保存在会话设置中，原生 agy 1.5+ 恢复时重新设置同一份指令；每轮只追加新消息，不重放历史。历史实测（agy 1.4.12，同一会话多轮）：
 
 | 模型 · 稳定 prompt 大小 | 观察结果 |
 | --- | --- |
@@ -380,8 +380,9 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
 - **错误与重试**：通用 `RESOURCE_EXHAUSTED` 不再被当作确定配额耗尽；已提交 Prompt
   的相同请求重试会返回 `prompt_outcome_unknown`，不会再次调用 `session/prompt`。
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
-  （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。system instructions 只在
-  `session/new` 安装，resume 不重复 append；恢复失败保留旧快照。
+  （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。支持 append 时通过 `session/new` 安装指令；
+  原生 agy 1.5+ 的 resume 会重新设置同一份 append，避免恢复后丢失，也不会累加或重复放进用户消息。
+  旧版 ACP 保留原行为；恢复失败保留旧快照。
 - **超时**：启动 60s、agy 无实质输出 10min（0.6.5 起，原为 120s）、等客户端工具结果
   30min，可用 `AGY_BRIDGE_START_TIMEOUT_MS` / `AGY_BRIDGE_TURN_TIMEOUT_MS` /
   `AGY_BRIDGE_TOOL_TIMEOUT_MS` 调整（正毫秒数）。只有非空正文/思考和真实工具调用/结果

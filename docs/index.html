@@ -307,8 +307,8 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
   <div>
     <h2 id="h-tokens"><span lang="zh-CN">去掉 agy 自带的 8K 编码 prompt。</span><span lang="en">Drop agy's built-in 8K coding prompt.</span></h2>
     <p class="intro">
-      <span lang="zh-CN">精简 agent 默认开启（<code>AGY_BRIDGE_MINIMAL_AGENT=0</code> 可关闭）。客户端自己的 system prompt 和工具目录才是权威来源；指令每个会话只安装一次，每轮只发新增消息。</span>
-      <span lang="en">The minimal agent is on by default (<code>AGY_BRIDGE_MINIMAL_AGENT=0</code> turns it off). The client's own system prompt and tool catalog are authoritative; instructions are installed once per session and each turn sends only the new message.</span>
+      <span lang="zh-CN">精简 agent 默认开启（<code>AGY_BRIDGE_MINIMAL_AGENT=0</code> 可关闭）。客户端自己的 system prompt 和工具目录才是权威来源；会话指令保持稳定、恢复时补回，每轮只发新增消息。</span>
+      <span lang="en">The minimal agent is on by default (<code>AGY_BRIDGE_MINIMAL_AGENT=0</code> turns it off). The client's own system prompt and tool catalog are authoritative; session instructions stay stable and are restored on resume, while each turn sends only the new message.</span>
     </p>
     <div class="bars">
       <div class="bar-row">

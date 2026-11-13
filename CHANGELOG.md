@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.2
+
+- Make OAuth-retry fixtures run on native Windows using a `.cmd` launcher and Node's executable for the production MCP adapter, with process shutdown before temporary-file cleanup. Decode compat fixture file URLs with `fileURLToPath`. Run both suites in three-platform CI and add Windows Node 22 coverage alongside Node 24.
+
 ## 0.8.1
 
 - Recover the context settings service after a Magpie hot update overlaps old and new plugin hosts. Wait in the background when the port belongs to a previous Bridge service, including 0.8.0, then take over after it closes. Keep model requests responsive and stop retrying unidentified applications after a bounded startup check.

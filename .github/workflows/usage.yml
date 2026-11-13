@@ -21,15 +21,14 @@ jobs:
             node: 22
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
-    defaults:
-      run:
-        working-directory: bridge fixture checkout
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: bridge fixture checkout
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
       - run: node --test test-auth-retry.mjs test-compat.mjs test-context-ui.mjs test-native-accounts.mjs test-platform.mjs test-usage.mjs test-wsl.mjs test-step-usage.mjs test-step-usage-extra.mjs test-tool-schema.mjs test-schema-parity.mjs test-mcp-server.mjs test-upstream-error.mjs test-model-discovery.mjs
       - run: node test/array-items-unit.mjs
+      - name: Create a checkout whose path contains spaces
+        run: git worktree add --detach "bridge fixture checkout" HEAD
+      - run: node --test test-auth-retry.mjs test-compat.mjs
+        working-directory: bridge fixture checkout

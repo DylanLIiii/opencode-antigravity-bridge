@@ -14,6 +14,7 @@ import { createAccountLoginMethod } from "./accounts-login.mjs"
 import { NativeAccountError, nativeAccount, nativeAccountResult, nativeAccountSlot, nativeModelId } from "./native-accounts.mjs"
 import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
 import { selectAgy } from "./context-unlock.mjs"
+import { startContextService } from "./context-ui-service.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
@@ -5210,8 +5211,13 @@ function expandHome(value) {
   return text === "~" || text.startsWith("~/") ? path.join(os.homedir(), text.slice(1)) : text
 }
 
-export const AntigravityBridgePlugin = async (input = {}) => {
+export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
   const magpie = !!input.magpie
+  if (magpie) void startContextService({
+    port: options?.contextPort,
+    runtimeMode: () => cachedAgyPath ? (cachedAgyUnlocked ? "unlocked" : "default") : "not-selected",
+    log: message => console.error(`[antigravity-bridge] ${message}`),
+  })
   const native = magpie && !wslDistro()
   const boundAccount = (auth, options) => {
     if (wslDistro()) {

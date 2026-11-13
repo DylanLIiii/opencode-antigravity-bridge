@@ -36,10 +36,13 @@
     "NOTICE.md",
     "CHANGELOG.md",
     "README.md",
-    "README.en.md"
+    "README.en.md",
+    "context-ui-service.mjs",
+    "context-ui-task.mjs",
+    "ui/"
   ],
   "scripts": {
-    "test": "node --test test-native-accounts.mjs test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
+    "test": "node --test test-context-ui.mjs test-native-accounts.mjs test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [
@@ -59,7 +62,28 @@
       "zh": "通过官方 agy CLI 接入，精简提示词并复用会话。Magpie 独立显示每个账号，共用模型 ID，支持原生账号切换与路由。可新增 Google 账号、导入配置或登记已保存的 Bridge 账号，保留已有登录。"
     },
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
-    "maxConcurrency": 16
+    "maxConcurrency": 16,
+    "page": {
+      "file": "ui/context-bootstrap.html",
+      "title": "Antigravity Bridge context",
+      "titles": {
+        "zh": "Antigravity Bridge 上下文"
+      },
+      "service": {
+        "port": 47821,
+        "option": "contextPort"
+      }
+    },
+    "actions": [
+      {
+        "id": "context-settings",
+        "menu": "provider",
+        "title": "Antigravity Bridge context",
+        "titles": {
+          "zh": "Antigravity Bridge 上下文"
+        }
+      }
+    ]
   },
   "engines": {
     "bun": ">=1.0.0"

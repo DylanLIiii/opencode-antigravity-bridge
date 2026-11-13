@@ -22,5 +22,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: node --test test-native-accounts.mjs test-platform.mjs test-usage.mjs test-wsl.mjs test-step-usage.mjs test-step-usage-extra.mjs test-tool-schema.mjs test-schema-parity.mjs test-mcp-server.mjs test-upstream-error.mjs
+      - run: node --test test-context-ui.mjs test-native-accounts.mjs test-platform.mjs test-usage.mjs test-wsl.mjs test-step-usage.mjs test-step-usage-extra.mjs test-tool-schema.mjs test-schema-parity.mjs test-mcp-server.mjs test-upstream-error.mjs
       - run: node test/array-items-unit.mjs

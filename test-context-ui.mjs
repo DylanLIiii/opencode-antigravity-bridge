@@ -39,6 +39,7 @@ test("page navigation cannot be read through CORS; APIs require capability and J
   const script = /<script>([\s\S]*?)<\/script>/.exec(page.raw)[1]
   const hash = createHash("sha256").update(script).digest("base64")
   assert.ok(page.headers["content-security-policy"].includes(`'sha256-${hash}'`))
+  assert.ok(page.headers["content-security-policy"].includes("frame-ancestors 'self' wails://localhost http://wails.localhost"))
   assert.ok(!page.headers["access-control-allow-origin"])
   assert.equal((await request("/api/status", { capability: false })).status, 403)
   assert.equal((await request(`/api/status?capability=${service.capability}`, { capability: false })).status, 403)
@@ -132,6 +133,31 @@ test("one bind attempt fails promptly and port options are validated", async t =
   await other.close()
   assert.equal(contextPort("39431"), 39431)
   for (const value of [0, -1, 65536, NaN, undefined, "oops"]) assert.equal(contextPort(value), DEFAULT_CONTEXT_PORT)
+})
+
+test("timeout and close clean only their own terminated worker's staging copy", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "context-ui-staging-"))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const stranger = path.join(dir, ".unlock-another-active-task")
+  fs.mkdirSync(stranger)
+  fs.writeFileSync(path.join(stranger, "keep"), "not this task")
+  const ready = path.join(dir, "ready")
+  const taskUrl = new URL("./test/context-ui-worker-fixture.mjs", import.meta.url)
+  const env = { AGY_BRIDGE_CONTEXT_DIR: dir, TEST_STAGING_READY: ready, TEST_WORK_MS: "5000" }
+  await assert.rejects(runContextTask("unlock", { taskUrl, env, timeout: 1000 }), /timed out/)
+  assert(fs.existsSync(ready), "the worker created staging before its timeout")
+  assert.deepEqual(fs.readdirSync(dir).sort(), [".unlock-another-active-task", "ready"])
+  fs.rmSync(ready)
+  const controller = new AbortController()
+  const closing = runContextTask("unlock", { taskUrl, env, timeout: 10000, signal: controller.signal })
+  // Attach the rejection handler before abort to avoid unhandled rejection.
+  const rejected = assert.rejects(closing, /service closed/)
+  for (let i = 0; i < 100 && !fs.existsSync(ready); i++) await new Promise(resolve => setTimeout(resolve, 20))
+  assert(fs.existsSync(ready), "the worker created staging before close")
+  controller.abort()
+  await rejected
+  assert.deepEqual(fs.readdirSync(dir).sort(), [".unlock-another-active-task", "ready"])
+  assert.equal(fs.readFileSync(path.join(stranger, "keep"), "utf8"), "not this task")
 })
 
 // Exercise the real inline UI script with a tiny DOM/network harness. No user

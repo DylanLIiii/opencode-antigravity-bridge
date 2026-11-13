@@ -9,8 +9,10 @@
 // host keeps serving model calls. Nothing here selects or freezes the agy binary.
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import fs from "node:fs"
+import path from "node:path"
 import { createServer } from "node:http"
 import { Worker } from "node:worker_threads"
+import { contextStateDir } from "./context-unlock.mjs"
 
 export const DEFAULT_CONTEXT_PORT = 47821
 export const CAPABILITY_HEADER = "x-bridge-context-capability"
@@ -48,7 +50,16 @@ function publicCheck(status) {
 export function runContextTask(action, { env = process.env, timeout = OP_TIMEOUT_MS, taskUrl = TASK_URL, signal } = {}) {
   return new Promise((resolve, reject) => {
     let worker
-    try { worker = new Worker(taskUrl, { workerData: { action, env: { ...env } } }) } catch (error) { reject(error); return }
+    const taskId = randomUUID()
+    const stateDir = contextStateDir(env)
+    const stagingPrefix = `.unlock-${taskId}-`
+    const cleanup = async () => {
+      if (action !== "unlock") return
+      const entries = await fs.promises.readdir(stateDir).catch(error => { if (error.code === "ENOENT") return []; throw error })
+      await Promise.all(entries.filter(name => name.startsWith(stagingPrefix)).map(name =>
+        fs.promises.rm(path.join(stateDir, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })))
+    }
+    try { worker = new Worker(taskUrl, { workerData: { action, env: { ...env }, taskId, deadline: Date.now() + timeout } }) } catch (error) { reject(error); return }
     let settled = false
     const finish = (fn, value) => {
       if (settled) return
@@ -56,7 +67,10 @@ export function runContextTask(action, { env = process.env, timeout = OP_TIMEOUT
       clearTimeout(timer)
       signal?.removeEventListener("abort", abort)
       // Keep the operation locked until blocking work has actually stopped.
-      Promise.resolve(worker.terminate()).catch(() => {}).then(() => fn(value))
+      // A terminated worker cannot run unlockContext's finally block. Remove
+      // only this job's staging directory after termination has completed.
+      Promise.resolve(worker.terminate()).then(cleanup).then(() => fn(value), () => reject(Object.assign(
+        new Error("context task cleanup failed; check the saved mode before retrying"), { code: "cleanup_failed" })))
     }
     const timer = setTimeout(() => finish(reject, Object.assign(
       new Error("the context operation timed out; the official agy was left unchanged"), { code: "timeout" })), timeout)
@@ -176,7 +190,7 @@ export function createContextService({ env = process.env, runtimeMode = () => "n
         // Always an opaque origin, as in Magpie's frame. 'self' is not matched
         // from an opaque origin by WebKit, so the loopback source is named too
         // (magpie web adds its proxied root after 'self').
-        "Content-Security-Policy": `sandbox allow-scripts; default-src 'none'; script-src ${scriptHash}; style-src 'unsafe-inline'; connect-src 'self' http://127.0.0.1:${port}; img-src data:; base-uri 'none'; form-action 'none'`,
+        "Content-Security-Policy": `sandbox allow-scripts; default-src 'none'; script-src ${scriptHash}; style-src 'unsafe-inline'; connect-src 'self' http://127.0.0.1:${port}; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self' wails://localhost http://wails.localhost http://127.0.0.1:* http://localhost:*`,
       })
       return res.end(html)
     }

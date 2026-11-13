@@ -138,8 +138,14 @@ function describeFailure(result) {
 
 // Create (or reuse) the managed unlocked copy. The official install is only
 // read. Every failure leaves any previous manifest and the official agy as is.
-export function unlockContext({ env = process.env, agyPath, run = runCommand, patcher = PATCHER, platform = process.platform } = {}) {
+export function unlockContext({ env = process.env, agyPath, run = runCommand, patcher = PATCHER, platform = process.platform, deadline = Infinity, taskId } = {}) {
   if (wslDistro(env, platform)) throw new ContextError("Context unlock is unavailable in Windows-to-WSL mode")
+  if (taskId != null && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(taskId)) throw new ContextError("invalid context task identifier", "invalid_task")
+  const invoke = (file, args, options = {}) => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) throw new ContextError("the context operation timed out; the official agy was left unchanged", "timeout")
+    return run(file, args, { ...options, timeout: Math.max(1, Math.min(options.timeout ?? 120_000, remaining)) })
+  }
   const source = agyPath || findOfficialAgy(env, os.homedir(), platform)
   if (!source) throw new ContextError("official agy CLI not found; install it first (nothing was changed)", "not_found")
   const sourceStat = (() => { try { return fs.statSync(source) } catch { return null } })()
@@ -147,35 +153,35 @@ export function unlockContext({ env = process.env, agyPath, run = runCommand, pa
   if (!fs.existsSync(patcher.path) || sha256File(patcher.path) !== patcher.sha256) {
     throw new ContextError("the bundled patcher failed its SHA-256 check; reinstall the package (nothing was changed)", "integrity")
   }
-  const python = findPython(env, run)
+  const python = findPython(env, invoke)
   const dir = contextStateDir(env)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-  const staging = fs.mkdtempSync(path.join(dir, ".unlock-"))
+  const staging = fs.mkdtempSync(path.join(dir, taskId ? `.unlock-${taskId}-` : ".unlock-"))
   try {
     const copy = path.join(staging, exeName(platform))
     fs.copyFileSync(source, copy)
     fs.chmodSync(copy, 0o755)
     const sourceSha = sha256File(copy)
-    const version = run(copy, ["--version"], { env, agy: true, timeout: 15_000 })
+    const version = invoke(copy, ["--version"], { env, agy: true, timeout: 15_000 })
     if (version.code !== 0 || !version.stdout.trim()) throw new ContextError(`the agy copy does not report a version (${describeFailure(version)}); nothing was changed`)
     const patchArgs = flag => [patcher.path, "--binary", copy, flag, "--no-env-fix"]
 
-    const before = run(python, patchArgs("--dry-run"), { env })
+    const before = invoke(python, patchArgs("--dry-run"), { env })
     if (before.code !== 0) throw new ContextError(`agy ${version.stdout.trim()} is not supported by the pinned patcher: ${describeFailure(before)}`)
     const pending = gateReport(before.stdout, "pending")
     if (!pending.ok) {
       throw new ContextError(`agy ${version.stdout.trim()} ${pending.missing.length ? `lacks gates ${pending.missing.join(", ")}` : `has gates already modified (${pending.wrong.join(", ")}); it is not an official build`}; unlock refused and nothing was changed`)
     }
-    const apply = run(python, [patcher.path, "--binary", copy, "--in-place", "--no-backup", "--no-env-fix"], { env })
+    const apply = invoke(python, [patcher.path, "--binary", copy, "--in-place", "--no-backup", "--no-env-fix"], { env })
     if (apply.code !== 0) throw new ContextError(`patching the copy failed: ${describeFailure(apply)}`, "patch_failed")
-    const after = run(python, patchArgs("--dry-run"), { env })
+    const after = invoke(python, patchArgs("--dry-run"), { env })
     const applied = gateReport(after.stdout, "applied")
     if (after.code !== 0 || !applied.ok) {
       throw new ContextError(`post-patch check failed for gates ${[...applied.missing, ...applied.wrong].join(", ") || "(unknown)"}; the copy was discarded`, "verify_failed")
     }
     const patchedSha = sha256File(copy)
     if (patchedSha === sourceSha) throw new ContextError("the patch changed nothing; the copy was discarded", "verify_failed")
-    const check = run(copy, ["--version"], { env, agy: true, timeout: 15_000 })
+    const check = invoke(copy, ["--version"], { env, agy: true, timeout: 15_000 })
     if (check.code !== 0 || check.stdout.trim() !== version.stdout.trim()) {
       throw new ContextError("the patched copy does not start or reports a different version; it was discarded", "verify_failed")
     }

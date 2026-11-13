@@ -6,10 +6,10 @@ import { contextStatus, disableContext, unlockContext } from "./context-unlock.m
 const report = (value, error = false) => parentPort?.postMessage({ value, error })
 
 try {
-  const { action, env } = workerData || {}
+  const { action, env, taskId, deadline } = workerData || {}
   let value
   if (action === "status") value = contextStatus({ env, full: true })
-  else if (action === "unlock") value = unlockContext({ env })
+  else if (action === "unlock") value = unlockContext({ env, taskId, deadline })
   // Restore default: switch the manifest off; managed copies are kept (no purge).
   else if (action === "disable") value = disableContext({ env, purge: false })
   else throw Object.assign(new Error("unknown context action"), { code: "invalid_action" })

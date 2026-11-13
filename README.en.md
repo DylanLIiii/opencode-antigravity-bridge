@@ -1,6 +1,43 @@
-# opencode-antigravity-bridge
+<div align="center">
 
-> 中文介绍见 [README.md](README.md)。
+# Antigravity Bridge
+
+**Use your Antigravity subscription in Magpie, OpenCode, Claude Code and Amp, through the official `agy` CLI.**
+
+Multiple Google accounts · shared ordinary model IDs · lean prompts · session reuse · observable token and cache usage
+
+[中文](README.md) · [Product page `docs/index.html`](docs/index.html) · [Install](#install) · [Technical guide](#what-works)
+
+</div>
+
+```sh
+magpie plugin add ./opencode-antigravity-bridge
+```
+
+> Not yet published to npm; install from a local checkout. The product page
+> [`docs/index.html`](docs/index.html) is a single self-contained HTML file and is not hosted
+> anywhere yet: clone the repository and open it in a browser to preview it locally.
+
+## Why this bridge
+
+| | What you get | Details |
+| --- | --- | --- |
+| **Official CLI path** | Drives the real `agy acp` (Agent Client Protocol); no reverse-engineered private API, no IDE impersonation | [How it works](#how-it-works) |
+| **Multiple accounts, native to Magpie** | Each Google account is its own Magpie row, all sharing **ordinary model IDs without prefixes**; Magpie's preferences, switches and routing choose the account. Sessions, processes and quota stay per account | [Account management](#account-management-entry) |
+| **OpenCode compatibility** | Direct OpenCode use keeps `<account>/<model-id>` selection | [Multiple accounts](#multiple-accounts) |
+| **Lean agent, on by default** | Drops agy's ~8K built-in coding prompt; historically measured "Reply OK" input 8,357 → 509 (−94%) | [Token cost](#token-cost) |
+| **Session reuse** | Each turn sends only the new message; idle, evicted or restarted sessions `session/resume` from a hashed snapshot | [What works](#what-works) |
+| **Stable prefix for caching** | Instructions are installed once per session and requests only append, giving Google's backend a stable prefix; whether it caches is Google's decision | [Prompt caching](#prompt-caching) |
+| **Real client tools** | Client tools appear as native MCP tools: parallel, multi-round and long-running, each executed once | [What works](#what-works) |
+| **Streaming · thinking · images** | Streamed text and thought summaries; inline image input when agy advertises image support | [Limitations](#limitations) |
+| **Observable usage** | Separates actual input, cache reads/writes, output and thinking; subscription quota in Magpie's Usage page | [Subscription limits](#subscription-limits) |
+| **Optional context unlock** | 256K declared by default; an explicit `unlock` declares 512K for the managed copy (client policy, not end-to-end verified) | [Context unlock](#optional-context-unlock-off-by-default) |
+
+Available models depend on your installed agy and on what each account actually
+offers. The bridge probes each account before listing models; no particular
+Gemini, Claude or GPT-OSS model is guaranteed.
+
+## How it works
 
 A [magpie](https://github.com/yetone/magpie) provider plugin that serves an
 **Antigravity subscription through a real `agy` CLI process**, rather than
@@ -84,7 +121,7 @@ account selected by Magpie.
 
 When upgrading from 0.6.x, keep the existing default CLI account. For each saved
 named profile, choose **Use a saved Bridge account** and enter its existing name
-(for example `Yazi`). No Google authorization is needed. Refresh the model catalog
+(for example `work`). No Google authorization is needed. Refresh the model catalog
 to remove old prefixed model selections and use the ordinary model IDs. Signing
 out removes only the host registration, preserving the profile for later reuse;
 restarts do not automatically restore removed registrations.
@@ -113,7 +150,9 @@ the UI while it waits for a paste leaves no RPC signal for the plugin to observe
 the hidden profile and child process are removed on expiry or the next sign-in.
 After a failed attempt, start again and use a fresh callback or code.
 
-**Multiple accounts**: UI sign-in prepares each account in
+### Multiple accounts
+
+UI sign-in prepares each account in
 `~/.config/magpie-agy-bridge/accounts/<name>/` (override the root with
 `AGY_BRIDGE_ACCOUNTS_DIR`). Alternatively, prepare a full Gemini directory and
 sign in once inside it:
@@ -210,7 +249,7 @@ user profile or VM.
   This is a content heuristic: no native source marker has been verified. Some
   chunk splits can leak through, and legitimate reasoning echoing the same
   signature can also be suppressed.
-- **All account models.** The ACP client identifies with this package’s name and version. The bridge probes each account’s offered models before listing them; offerings depend on the installed agy and account. Changing the model, or the effort
+- **Models each account offers.** The ACP client identifies with this package’s name and version. The bridge probes each account’s offered models before listing them; offerings depend on the installed agy and account. Changing the model, or the effort
   level, uses the server's ACP
   `model` and `thought_level` configuration options inside the live session.
   Model changes refresh the available thinking levels; configuration update
@@ -230,8 +269,9 @@ user profile or VM.
   a result that arrives after agy ended its turn is delivered in a follow-up
   prompt within the same response. The client runs each call exactly once.
 - **Live tool catalog changes** (for example OpenCode Code Mode) reach agy
-  through MCP `notifications/tools/list_changed`, including in the middle of a
-  tool continuation; the session is kept. A catalog that cannot be confirmed
+  through MCP `notifications/tools/list_changed`. A catalog that gains tools while
+  a tool result is being continued is replayed once into a fresh session
+  (`tools_grew`); other catalog updates keep the session. A catalog that cannot be confirmed
   fails before `session/prompt` with `tool_list_unconfirmed`, and a disconnected
   MCP watch reconnects with bounded backoff and requests a fresh tool list.
 - **Session resume, including across restarts.** After every completed turn,
@@ -262,7 +302,7 @@ user profile or VM.
   This setting applies only when history is replayed; it does not erase records
   already held by an active or resumed agy session. The delimiters guide the
   model; they cannot guarantee that a model never quotes historical content.
-- **Cancellation without loss.** A client that stops reading gets
+- **Cancellation that keeps the session.** A client that stops reading gets
   `session/cancel`; the session stays alive and the partial answer the client
   saw becomes part of the expected history.
 - **User steering during tools.** With compatible history, instructions and
@@ -434,10 +474,16 @@ because the client supplies both. Measured with agy 1.4.12 (`gemini-3.8-flash`):
 A scripted three-turn coding conversation with one tool round (two client tools,
 `gemini-3.8-flash-low`) consumed **4,109** input tokens in total with this
 bridge and **15,351** with agy's default components kept
-(`AGY_BRIDGE_MINIMAL_AGENT=0`), 73% less. Tool rounds cost no extra prompt,
-model switches, tool catalog changes, cancellations, upstream errors and idle
-resumes no longer replay the conversation, and long tools cost one short model
-call per 150 s of waiting only when a tool runs longer than that.
+(`AGY_BRIDGE_MINIMAL_AGENT=0`), 73% less. These are historical measurements
+under the conditions above; other agy versions, models and client prompts give
+different numbers. Tool rounds continue the same agy turn instead of resending
+the prompt. Model switches, cancellations, upstream errors and idle resumes
+normally continue the existing session; replay is reserved for changed history,
+incompatible instructions or working directory, unavailable sessions, and a
+tool catalog that grows (replayed once). Long tools cost one short model call
+per 150 s of waiting only when a tool runs longer than that.
+
+### Prompt caching
 
 **Prompt caching** is decided by Google's backend, not the bridge. The bridge
 keeps the request prefix as stable as it can: the instructions are installed
@@ -458,12 +504,17 @@ changes afterwards), so the shortfall is the backend's, not a moving part in
 the prefix. The hit rate therefore grows with prompt size: about 62–64% for
 the 5.5k prompt above, and 91.7% for a 26k prompt (turn 3 read 23,944 of
 26,097, exactly the previous 25,993 minus 2,049). OpenCode prompts with tool
-definitions are usually far longer, so expect 90%+ there. The 2,049 constant
+definitions are often longer, which would favour a higher rate under the same
+backend behaviour, but no hit rate is promised: it depends on the model,
+account and Google's backend. The 2,049 constant
 is inferred from these runs on `gemini-4-argon-low`; Google does not document
 it. Flash reported no cached tokens with `systemPrompt.append`, with
 the instructions in the first message, or with agy's default components kept,
 so that is the backend's behaviour for that model, not a prefix the bridge
-changes. Cached tokens appear as `cache_read_input_tokens`.
+changes. Cached tokens appear as `cache_read_input_tokens`. They come from
+agy's per-call records (`gen_metadata` or `steps`) when the conversation store
+is readable; otherwise tool-round cache figures are bounded estimates, not
+evidence of actual Google cache hits.
 
 ## Subscription limits
 
@@ -604,8 +655,9 @@ Set `AGY_BRIDGE_WSL_DISTRO=<distro>` before starting Magpie on Windows. `AGY_PAT
 - **One Google account by default.** agy owns the default sign-in; the bridge
   never calls ACP `authenticate` (it switches agy to a different sign-in path)
   and relies on the CLI's existing login. Multiple accounts are supported via
-  the `--gemini_dir` isolation described under Use (model IDs get an
-  `<account>/` prefix); ACP `authenticate` is still never used to switch.
+  the `--gemini_dir` isolation described under Use (Magpie shows native account
+  rows with shared model IDs; direct OpenCode use selects `<account>/<model-id>`);
+  ACP `authenticate` is still never used to switch.
   On Windows, named accounts also need the file-storage switch described
   there, because agy otherwise reads the machine-global Credential Manager.
 - **The IDE tool connection uses a private `nc`.** agy runs `nc host port` for
@@ -693,7 +745,19 @@ budget is configured separately with `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`.
 
 agy has no native flag for a larger context window or for its 64K per-message
 clamp. The only known mechanism is a version- and architecture-bound machine-code
-patch, so it is an explicit, reversible opt-in and never runs automatically:
+patch, so it is an explicit, reversible opt-in and never runs automatically.
+
+**Magpie entry (in development).** A later version plans an **Antigravity Bridge
+context** item in the Provider row menu, with a settings page also reachable from
+the sidebar: choose and review an option, confirm, see the asynchronous result,
+or restore the default. Existing sessions use the new setting only after Magpie
+restarts and the model catalog is refreshed. It drives the same patch flow below,
+and the CLI commands remain available; check the UI of the version you install.
+
+The patcher only builds verified copies of known agy builds. It removes agy's
+256K checkpoint gate; the patched threshold is about 983K (983,040). That is a
+gate value, **not a verified 1M usable capacity**, and long-context behaviour on
+newer agy builds is likewise unverified.
 
 ```sh
 agy-bridge context status

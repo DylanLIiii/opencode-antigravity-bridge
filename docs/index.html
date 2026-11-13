@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="zh-CN" data-lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Antigravity Bridge · 官方 agy CLI 接入 Magpie / OpenCode</title>
+<meta name="description" content="Antigravity Bridge: use an Antigravity subscription in Magpie, OpenCode, Claude Code and Amp through the official agy CLI. Multiple accounts, shared model IDs, lean prompts, session reuse and observable usage.">
+<meta name="color-scheme" content="light dark">
+<style>
+:root{
+  --paper:#f6f3ec; --paper-2:#ece7dc; --ink:#1b1a17; --ink-2:#4a463e; --ink-3:#7a7468;
+  --rule:#d6cfbf; --accent:#c2410c; --accent-ink:#fff; --ok:#166534; --warn:#92400e;
+  --code:#1f1d1a; --code-ink:#f3efe6; --focus:#2563eb;
+  --serif: "Iowan Old Style","Palatino Linotype",Palatino,"Songti SC","Noto Serif CJK SC","Source Han Serif SC",Georgia,serif;
+  --sans: -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Roboto,Helvetica,Arial,sans-serif;
+  --mono: ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --paper:#161513; --paper-2:#201e1b; --ink:#efe9dc; --ink-2:#c9c1b1; --ink-3:#958d7e;
+    --rule:#3a362f; --accent:#fb923c; --accent-ink:#1b1a17; --ok:#4ade80; --warn:#fbbf24;
+    --code:#0e0d0c; --code-ink:#efe9dc; --focus:#93c5fd; }
+}
+*{box-sizing:border-box}
+html{background:var(--paper);color:var(--ink)}
+body{margin:0;font:16px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+html[data-lang="zh"] [lang="en"]:not(html), html[data-lang="en"] [lang="zh-CN"]:not(html){display:none !important}
+a{color:inherit;text-decoration-color:var(--accent);text-underline-offset:3px}
+a:hover{color:var(--accent)}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px;border-radius:2px}
+code,kbd,pre{font-family:var(--mono);font-size:.92em}
+code{background:var(--paper-2);padding:.08em .35em;border-radius:3px}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+.skip{position:absolute;left:-9999px}.skip:focus{left:12px;top:12px;background:var(--ink);color:var(--paper);padding:8px 12px;z-index:9}
+
+/* masthead */
+.mast{border-bottom:1px solid var(--ink)}
+.mast .wrap{display:flex;align-items:center;gap:16px;justify-content:space-between;padding-top:14px;padding-bottom:14px}
+.brand{font:600 15px/1 var(--sans);letter-spacing:.14em;text-transform:uppercase}
+.brand b{color:var(--accent)}
+.mast nav{display:flex;gap:18px;align-items:center;font-size:14px}
+.mast nav a{text-decoration:none;color:var(--ink-2)}
+.seg{display:inline-flex;border:1px solid var(--ink);border-radius:999px;overflow:hidden}
+.seg button{font:600 13px/1 var(--sans);border:0;background:transparent;color:var(--ink);padding:7px 12px;cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--paper)}
+
+/* hero */
+.hero{padding:56px 0 40px;border-bottom:1px solid var(--rule)}
+.kicker{font:600 12px/1.4 var(--sans);letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin:0 0 18px}
+.hero h1{font:400 clamp(40px,7.4vw,92px)/.98 var(--serif);letter-spacing:-.02em;margin:0;max-width:15ch}
+html[data-lang="zh"] .hero h1{max-width:none}
+.hero h1 em{font-style:italic;color:var(--accent)}
+.hero-grid{display:grid;grid-template-columns:1.25fr 1fr;gap:48px;margin-top:36px;align-items:end}
+.lede{font:400 20px/1.55 var(--serif);color:var(--ink-2);margin:0;max-width:36em}
+.install{background:var(--code);color:var(--code-ink);border-radius:6px;padding:16px 16px 14px}
+.install .label{font:600 11px/1 var(--sans);letter-spacing:.14em;text-transform:uppercase;color:#a8a194;margin-bottom:10px;display:flex;justify-content:space-between;gap:8px}
+.install pre{margin:0;white-space:pre-wrap;word-break:break-all;font-size:14.5px}
+.install pre .p{color:#8d877b;user-select:none}
+.copy{font:600 12px/1 var(--sans);background:var(--accent);color:var(--accent-ink);border:0;border-radius:4px;padding:7px 10px;cursor:pointer}
+.install small{display:block;color:#a8a194;margin-top:10px;font-size:12.5px;line-height:1.5}
+.cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:22px}
+.btn{display:inline-block;font:600 14px/1 var(--sans);padding:12px 16px;border:1px solid var(--ink);border-radius:4px;text-decoration:none}
+.btn.primary{background:var(--ink);color:var(--paper)}
+.btn.primary:hover{color:var(--paper);background:var(--accent);border-color:var(--accent)}
+
+/* fact strip */
+.facts{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--rule)}
+.facts div{padding:22px 18px 20px;border-right:1px solid var(--rule)}
+.facts div:last-child{border-right:0}
+.facts strong{display:block;font:400 34px/1 var(--serif);margin-bottom:8px}
+.facts span{font-size:13.5px;color:var(--ink-2);line-height:1.45;display:block}
+
+/* section */
+section.s{display:grid;grid-template-columns:200px minmax(0,1fr);gap:40px;padding:56px 0;border-bottom:1px solid var(--rule)}
+.s .side{position:relative}
+section.s > div{min-width:0}
+.ctx > div,.pipe > div,.facts > div{min-width:0;overflow-wrap:anywhere}
+.s .num{font:400 64px/1 var(--serif);color:var(--accent)}
+.s .tag{font:600 12px/1.4 var(--sans);letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-top:8px}
+.s h2{font:400 clamp(28px,3.6vw,42px)/1.12 var(--serif);margin:0 0 14px;letter-spacing:-.01em;max-width:22ch}
+.s p.intro{font-size:17.5px;color:var(--ink-2);max-width:44em;margin:0 0 26px}
+.note{font-size:13.5px;color:var(--ink-3);border-left:3px solid var(--rule);padding:2px 0 2px 12px;margin:18px 0 0;max-width:52em}
+.badge{display:inline-block;font:700 10.5px/1 var(--sans);letter-spacing:.12em;text-transform:uppercase;border:1px solid currentColor;color:var(--warn);padding:4px 6px;border-radius:3px;vertical-align:middle}
+
+/* demo panel */
+.panel{border:1px solid var(--ink);border-radius:6px;background:var(--paper)}
+.panel-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--ink)}
+.panel-body{display:grid;grid-template-columns:1.1fr .9fr}
+.panel-body > div{padding:18px}
+.panel-body > div + div{border-left:1px solid var(--rule)}
+.accts{list-style:none;margin:0;padding:0}
+.accts li{display:grid;grid-template-columns:auto 1fr auto auto;gap:12px;align-items:center;padding:10px 0;border-bottom:1px dashed var(--rule)}
+.accts li:last-child{border-bottom:0}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--ink-3)}
+.on .dot{background:var(--ok)}
+.served .dot{box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 35%,transparent);background:var(--accent)}
+.aname{font-weight:600}
+.ameta{display:block;font-size:12.5px;color:var(--ink-3);font-weight:400}
+.switch{position:relative;width:42px;height:24px;border-radius:999px;border:1px solid var(--ink);background:transparent;cursor:pointer;padding:0}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:var(--ink-3);transition:transform .15s}
+.switch[aria-checked="true"]{background:var(--ink)}
+.switch[aria-checked="true"]::after{transform:translateX(18px);background:var(--paper)}
+.pref{font:600 12px/1 var(--sans);border:1px solid var(--rule);background:transparent;color:var(--ink-2);padding:6px 8px;border-radius:4px;cursor:pointer;white-space:nowrap}
+.pref[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
+label.f{display:block;font:600 12px/1.4 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin:0 0 6px}
+select{font:15px var(--sans);width:100%;padding:9px 10px;border:1px solid var(--ink);border-radius:4px;background:var(--paper);color:var(--ink)}
+.req{margin-top:16px;background:var(--code);color:var(--code-ink);border-radius:5px;padding:14px;font:13.5px/1.65 var(--mono);overflow-x:auto}
+.req .k{color:#a8a194}.req .v{color:#fdba74}.req .ok{color:#86efac}.req .bad{color:#fca5a5}
+.send{margin-top:14px;width:100%;font:600 14px/1 var(--sans);padding:12px;border:0;border-radius:4px;background:var(--accent);color:var(--accent-ink);cursor:pointer}
+.legend{font-size:13px;color:var(--ink-3);margin-top:10px}
+
+/* bars */
+.bars{display:grid;gap:22px}
+.bar-row h3{font:600 15px/1.35 var(--sans);margin:0 0 8px}
+.bar{display:grid;grid-template-columns:150px 1fr 90px;gap:12px;align-items:center;font-size:14px;margin:6px 0}
+.bar .track{height:18px;background:var(--paper-2);border-radius:2px;overflow:hidden}
+.bar .fill{height:100%;background:var(--ink-3)}
+.bar.us .fill{background:var(--accent)}
+.bar .n{font:600 14px var(--mono);text-align:right}
+
+/* cache */
+.cache-ctl{display:flex;flex-wrap:wrap;gap:18px;align-items:end;margin-bottom:18px}
+.cache-ctl .grow{flex:1;min-width:220px}
+input[type=range]{width:100%;accent-color:var(--accent)}
+.stack{display:flex;height:46px;border:1px solid var(--ink);border-radius:4px;overflow:hidden;font:600 12.5px/1 var(--sans)}
+.stack div{display:flex;align-items:center;justify-content:center;white-space:nowrap;overflow:hidden;transition:flex-basis .2s}
+.stack .hit{background:var(--accent);color:var(--accent-ink)}
+.stack .miss{background:repeating-linear-gradient(45deg,var(--paper-2) 0 6px,var(--paper) 6px 12px);color:var(--ink-2)}
+.readout{display:flex;flex-wrap:wrap;gap:28px;margin-top:14px}
+.readout strong{font:400 40px/1 var(--serif)}
+.readout span{display:block;font-size:13px;color:var(--ink-3)}
+table.obs{width:100%;border-collapse:collapse;margin-top:24px;font-size:14.5px}
+table.obs th,table.obs td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--rule);vertical-align:top}
+table.obs th{font:600 12px/1.3 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+table.obs td.n{font-family:var(--mono);white-space:nowrap}
+
+/* pipeline */
+.pipe{display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--ink);border-radius:6px;overflow:hidden}
+.pipe div{padding:16px;border-right:1px solid var(--rule);position:relative}
+.pipe div:last-child{border-right:0}
+.pipe b{display:block;font:400 21px/1.2 var(--serif);margin-bottom:6px}
+.pipe small{display:block;color:var(--ink-3);font-size:13px;line-height:1.45}
+.pipe .me{background:var(--ink);color:var(--paper)}
+.pipe .me small{color:color-mix(in srgb,var(--paper) 70%,transparent)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 40px;margin-top:30px}
+.grid2 h3{font:600 16px/1.35 var(--sans);margin:18px 0 4px}
+.grid2 p{margin:0;color:var(--ink-2);font-size:15px}
+
+/* context */
+.ctx{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.ctx div{border-top:3px solid var(--ink);padding-top:10px}
+.ctx div.warn{border-top-color:var(--warn)}
+.ctx strong{display:block;font:400 30px/1.1 var(--serif)}
+.ctx span{font-size:13.5px;color:var(--ink-2);display:block;margin-top:4px}
+ol.steps{counter-reset:s;list-style:none;padding:0;margin:26px 0 0;display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+ol.steps li{counter-increment:s;border:1px solid var(--rule);border-radius:4px;padding:12px;font-size:14px}
+ol.steps li::before{content:counter(s,decimal-leading-zero);display:block;font:400 22px/1 var(--serif);color:var(--accent);margin-bottom:6px}
+pre.cli{background:var(--code);color:var(--code-ink);padding:14px;border-radius:5px;overflow-x:auto;font-size:13.5px;margin:22px 0 0}
+
+/* bounds */
+ul.bounds{list-style:none;padding:0;margin:0;columns:2;column-gap:40px}
+ul.bounds li{break-inside:avoid;padding:10px 0 10px 22px;border-bottom:1px solid var(--rule);position:relative;font-size:15px;color:var(--ink-2)}
+ul.bounds li::before{content:"—";position:absolute;left:0;color:var(--accent)}
+
+footer{padding:40px 0 56px;font-size:14px;color:var(--ink-3)}
+footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+
+@media (max-width:900px){
+  .hero-grid,.panel-body,.grid2{grid-template-columns:1fr}
+  .panel-body > div + div{border-left:0;border-top:1px solid var(--rule)}
+  section.s{grid-template-columns:minmax(0,1fr);gap:12px;padding:40px 0}
+  .s .side{display:flex;align-items:baseline;gap:14px}
+  .s .num{font-size:44px}
+  .facts{grid-template-columns:1fr 1fr}
+  .facts div:nth-child(2){border-right:0}
+  .facts div:nth-child(-n+2){border-bottom:1px solid var(--rule)}
+  .pipe{grid-template-columns:1fr 1fr}
+  .pipe div:nth-child(2){border-right:0}
+  .pipe div:nth-child(-n+2){border-bottom:1px solid var(--rule)}
+  .ctx{grid-template-columns:1fr 1fr}
+  ol.steps{grid-template-columns:1fr 1fr}
+  ul.bounds{columns:1}
+}
+@media (max-width:560px){
+  .wrap{padding:0 16px}
+  .mast nav a{display:none}
+  .hero{padding-top:36px}
+  .lede{font-size:18px}
+  .bar{grid-template-columns:1fr 70px}
+  .bar .track{grid-column:1 / -1;grid-row:2}
+  .accts li{grid-template-columns:auto 1fr auto;row-gap:8px}
+  .accts li .switch{grid-column:3;grid-row:1}
+  .accts li .pref{grid-column:2;grid-row:2;justify-self:start}
+  .facts strong{font-size:28px}
+}
+@media (prefers-reduced-motion: reduce){*{transition:none !important}}
+</style>
+</head>
+<body>
+<a class="skip" href="#main"><span lang="zh-CN">跳到正文</span><span lang="en">Skip to content</span></a>
+
+<header class="mast">
+  <div class="wrap">
+    <div class="brand">Antigravity <b>Bridge</b></div>
+    <nav aria-label="Primary">
+      <a href="#accounts"><span lang="zh-CN">多账号</span><span lang="en">Accounts</span></a>
+      <a href="#tokens"><span lang="zh-CN">省 token</span><span lang="en">Tokens</span></a>
+      <a href="#cache"><span lang="zh-CN">缓存</span><span lang="en">Cache</span></a>
+      <a href="#context"><span lang="zh-CN">上下文</span><span lang="en">Context</span></a>
+      <a href="https://github.com/DylanLIiii/opencode-antigravity-bridge">GitHub</a>
+      <div class="seg" role="group" aria-label="Language / 语言">
+        <button type="button" data-set-lang="zh" aria-pressed="true">中文</button>
+        <button type="button" data-set-lang="en" aria-pressed="false">EN</button>
+      </div>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="wrap">
+
+<div class="hero">
+  <p class="kicker"><span lang="zh-CN">Magpie / OpenCode 提供方插件 · 官方 agy CLI</span><span lang="en">Magpie / OpenCode provider plugin · official agy CLI</span></p>
+  <h1>
+    <span lang="zh-CN">把 Antigravity 订阅，<br><em>接进你的编码客户端。</em></span>
+    <span lang="en">Your Antigravity subscription, <em>inside your coding client.</em></span>
+  </h1>
+  <div class="hero-grid">
+    <div>
+      <p class="lede">
+        <span lang="zh-CN">驱动真实的 <code>agy acp</code>，把 Anthropic Messages 转成 Agent Client Protocol。多个 Google 账号在 Magpie 中独立成行、共用普通模型 ID；精简 prompt、会话复用，用量与缓存一目了然。</span>
+        <span lang="en">It drives the real <code>agy acp</code> and translates Anthropic Messages to the Agent Client Protocol. Several Google accounts appear as separate Magpie rows sharing ordinary model IDs, with lean prompts, session reuse and visible token and cache usage.</span>
+      </p>
+      <div class="cta">
+        <a class="btn primary" href="#install"><span lang="zh-CN">开始安装</span><span lang="en">Install</span></a>
+        <a class="btn" href="../README.md" data-readme><span lang="zh-CN">阅读 README</span><span lang="en">Read the README</span></a>
+      </div>
+    </div>
+    <div class="install" id="install">
+      <div class="label">
+        <span><span lang="zh-CN">在 checkout 的上一级目录运行</span><span lang="en">Run beside your checkout</span></span>
+        <button type="button" class="copy" data-copy="magpie plugin add ./opencode-antigravity-bridge"><span lang="zh-CN">复制</span><span lang="en">Copy</span></button>
+      </div>
+<pre><span class="p">$ </span>git clone https://github.com/DylanLIiii/opencode-antigravity-bridge.git
+<span class="p">$ </span>magpie plugin add ./opencode-antigravity-bridge</pre>
+      <small>
+        <span lang="zh-CN">尚未发布到 npm。然后在 Magpie：Providers → Antigravity Bridge → 登录 → 新增 Google 账号。需要已安装 <code>agy</code>。</span>
+        <span lang="en">Not yet on npm. Then in Magpie: Providers → Antigravity Bridge → Sign in → Add a Google account. Requires an installed <code>agy</code>.</span>
+      </small>
+      <p class="sr" role="status" aria-live="polite" id="copy-status"></p>
+    </div>
+  </div>
+</div>
+
+<div class="facts" role="list">
+  <div role="listitem"><strong>N</strong><span lang="zh-CN">Google 账号，各自一行，共用普通模型 ID</span><span lang="en">Google accounts, one row each, sharing ordinary model IDs</span></div>
+  <div role="listitem"><strong>−94%</strong><span lang="zh-CN">"Reply OK" 输入 token（历史实测，agy 1.4.12）</span><span lang="en">"Reply OK" input tokens (historical, agy 1.4.12)</span></div>
+  <div role="listitem"><strong>91.7%</strong><span lang="zh-CN">一次 26k 稳定 prompt 样本的缓存读（不是承诺）</span><span lang="en">cache read in one 26k stable-prompt sample (not a promise)</span></div>
+  <div role="listitem"><strong>256K</strong><span lang="zh-CN">默认上下文声明；可选托管副本声明 512K</span><span lang="en">default context declaration; optional managed copy declares 512K</span></div>
+</div>
+
+<!-- 01 accounts -->
+<section class="s" id="accounts" aria-labelledby="h-accounts">
+  <div class="side"><div class="num">01</div><div class="tag"><span lang="zh-CN">多账号</span><span lang="en">Accounts</span></div></div>
+  <div>
+    <h2 id="h-accounts"><span lang="zh-CN">一个模型 ID，多个账号，由 Magpie 来选。</span><span lang="en">One model ID, several accounts, chosen by Magpie.</span></h2>
+    <p class="intro">
+      <span lang="zh-CN">每个 Google 账号在 Magpie 中独立成行，共用不带前缀的模型 ID。首选、启用/关闭和账号路由规则都用 Magpie 自带的；会话、进程和额度按账号隔离。直接用 OpenCode 时，仍可写 <code>&lt;账号&gt;/&lt;模型id&gt;</code>。</span>
+      <span lang="en">Each Google account is its own Magpie row, sharing ordinary model IDs without prefixes. Preference, on/off switches and routing rules are Magpie's own; sessions, processes and quota stay per account. Direct OpenCode use can still write <code>&lt;account&gt;/&lt;model-id&gt;</code>.</span>
+    </p>
+
+    <div class="panel" id="demo">
+      <div class="panel-head">
+        <span class="badge"><span lang="zh-CN">合成演示 · 非真实账号</span><span lang="en">Synthetic demo · not real accounts</span></span>
+        <div class="seg" role="group" aria-label="Client mode">
+          <button type="button" data-mode="native" aria-pressed="true"><span lang="zh-CN">Magpie 原生</span><span lang="en">Magpie native</span></button>
+          <button type="button" data-mode="prefixed" aria-pressed="false"><span lang="zh-CN">OpenCode 前缀</span><span lang="en">OpenCode prefix</span></button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div>
+          <label class="f" id="accts-label"><span lang="zh-CN">Providers → Antigravity Bridge</span><span lang="en">Providers → Antigravity Bridge</span></label>
+          <ul class="accts" id="accts" aria-labelledby="accts-label"></ul>
+        </div>
+        <div>
+          <label class="f" for="model"><span lang="zh-CN">模型 ID</span><span lang="en">Model ID</span></label>
+          <select id="model">
+            <option>gemini-4-argon</option>
+            <option>gemini-3.8-flash</option>
+            <option>claude-sonnet-5.5</option>
+          </select>
+          <div class="req" id="req" aria-live="polite"></div>
+          <button type="button" class="send" id="send"><span lang="zh-CN">模拟发送一次请求</span><span lang="en">Simulate a request</span></button>
+          <p class="legend" id="demo-legend"></p>
+        </div>
+      </div>
+    </div>
+    <p class="note">
+      <span lang="zh-CN">演示简化了路由：这里只按「首选且启用 → 其他已启用账号」选择。实际由 Magpie 的账号路由规则决定。账号名和型号都是示例；可用型号取决于各账号与 agy 版本的实际探测结果。</span>
+      <span lang="en">The demo simplifies routing to "preferred and enabled → another enabled account". Magpie's own routing rules decide in practice. Account names and models are examples; available models depend on what each account and agy version actually offer.</span>
+    </p>
+  </div>
+</section>
+
+<!-- 02 tokens -->
+<section class="s" id="tokens" aria-labelledby="h-tokens">
+  <div class="side"><div class="num">02</div><div class="tag"><span lang="zh-CN">精简 prompt</span><span lang="en">Lean prompt</span></div></div>
+  <div>
+    <h2 id="h-tokens"><span lang="zh-CN">去掉 agy 自带的 8K 编码 prompt。</span><span lang="en">Drop agy's built-in 8K coding prompt.</span></h2>
+    <p class="intro">
+      <span lang="zh-CN">精简 agent 默认开启（<code>AGY_BRIDGE_MINIMAL_AGENT=0</code> 可关闭）。客户端自己的 system prompt 和工具目录才是权威来源；指令每个会话只安装一次，每轮只发新增消息。</span>
+      <span lang="en">The minimal agent is on by default (<code>AGY_BRIDGE_MINIMAL_AGENT=0</code> turns it off). The client's own system prompt and tool catalog are authoritative; instructions are installed once per session and each turn sends only the new message.</span>
+    </p>
+    <div class="bars">
+      <div class="bar-row">
+        <h3><span lang="zh-CN">"Reply OK" 输入 token</span><span lang="en">"Reply OK" input tokens</span></h3>
+        <div class="bar"><span lang="zh-CN">agy 默认 agent</span><span lang="en">agy default agent</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="n">8,357</span></div>
+        <div class="bar us"><span lang="zh-CN">本插件</span><span lang="en">This bridge</span><div class="track"><div class="fill" style="width:6.1%"></div></div><span class="n">509</span></div>
+      </div>
+      <div class="bar-row">
+        <h3><span lang="zh-CN">三轮编码会话，含一次工具调用（合计输入）</span><span lang="en">Three-turn coding session with one tool round (total input)</span></h3>
+        <div class="bar"><span lang="zh-CN">保留默认组件</span><span lang="en">Default components</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="n">15,351</span></div>
+        <div class="bar us"><span lang="zh-CN">本插件</span><span lang="en">This bridge</span><div class="track"><div class="fill" style="width:26.8%"></div></div><span class="n">4,109</span></div>
+      </div>
+    </div>
+    <p class="note">
+      <span lang="zh-CN">历史实测：agy 1.4.12，<code>gemini-3.8-flash</code>；三轮会话使用 <code>gemini-3.8-flash-low</code> 和两个客户端工具。−94% 与 −73% 只代表这些条件，不同版本、模型和客户端 prompt 会不同。</span>
+      <span lang="en">Historical measurements: agy 1.4.12, <code>gemini-3.8-flash</code>; the three-turn session used <code>gemini-3.8-flash-low</code> and two client tools. −94% and −73% describe those conditions only; other versions, models and client prompts differ.</span>
+    </p>
+  </div>
+</section>
+
+<!-- 03 cache -->
+<section class="s" id="cache" aria-labelledby="h-cache">
+  <div class="side"><div class="num">03</div><div class="tag"><span lang="zh-CN">缓存命中</span><span lang="en">Caching</span></div></div>
+  <div>
+    <h2 id="h-cache"><span lang="zh-CN">前缀稳定，缓存才有机会。命中与否由 Google 决定。</span><span lang="en">A stable prefix gives caching a chance. Google decides whether it hits.</span></h2>
+    <p class="intro">
+      <span lang="zh-CN">请求只追加不改写，便于 Google 后端复用前缀。在历史 Argon 样本中，每轮约最后 2,049 个 token 不从缓存读取，因此 prompt 越大，比例越高。下方示意按这个推断计算。</span>
+      <span lang="en">Requests only append, so Google's backend can reuse the prefix. In historical Argon samples, about the last 2,049 tokens of each turn were never read from cache, so the share grows with prompt size. The illustration below applies that inference.</span>
+    </p>
+    <div class="panel">
+      <div class="panel-head">
+        <span class="badge"><span lang="zh-CN">示意 · 基于历史样本推断，不是预测</span><span lang="en">Illustration · inferred from past samples, not a forecast</span></span>
+        <div class="seg" role="group" aria-label="Model sample">
+          <button type="button" data-cm="argon" aria-pressed="true">Argon low</button>
+          <button type="button" data-cm="flash" aria-pressed="false">Flash low</button>
+        </div>
+      </div>
+      <div style="padding:18px">
+        <div class="cache-ctl">
+          <div class="grow">
+            <label class="f" for="psize"><span lang="zh-CN">上一轮 prompt 大小（tokens）</span><span lang="en">Previous turn prompt size (tokens)</span>: <output id="psize-out" for="psize">26,000</output></label>
+            <input type="range" id="psize" min="3000" max="60000" step="500" value="26000">
+          </div>
+        </div>
+        <div class="stack" aria-hidden="true"><div class="hit" id="hit"></div><div class="miss" id="miss"></div></div>
+        <div class="readout">
+          <div><strong id="rate">—</strong><span lang="zh-CN">示意缓存读比例</span><span lang="en">illustrative cache-read share</span></div>
+          <div><strong id="cached">—</strong><span lang="zh-CN">示意缓存读 tokens</span><span lang="en">illustrative cached tokens</span></div>
+        </div>
+        <p class="sr" aria-live="polite" id="cache-sr"></p>
+      </div>
+    </div>
+    <table class="obs">
+      <caption class="sr">Historical observations</caption>
+      <thead><tr><th><span lang="zh-CN">历史样本（agy 1.4.12）</span><span lang="en">Historical sample (agy 1.4.12)</span></th><th><span lang="zh-CN">观察结果</span><span lang="en">Observed</span></th></tr></thead>
+      <tbody>
+        <tr><td><code>gemini-4-argon-low</code> · <span lang="zh-CN">约 26k 稳定 prompt，第 3 轮</span><span lang="en">~26k stable prompt, turn 3</span></td><td class="n">23,944 / 26,097 = 91.7%</td></tr>
+        <tr><td><code>gemini-4-argon-low</code> · <span lang="zh-CN">约 5.5k 稳定 prompt，第 2–4 轮</span><span lang="en">~5.5k stable prompt, turns 2–4</span></td><td class="n">≈ 62–64%</td></tr>
+        <tr><td><code>gemini-3.8-flash-low</code> · <span lang="zh-CN">约 5.5k 稳定 prompt</span><span lang="en">~5.5k stable prompt</span></td><td class="n">0</td></tr>
+      </tbody>
+    </table>
+    <p class="note">
+      <span lang="zh-CN">不承诺 90% 命中。2,049 常数是从样本推断的，Google 未公开说明。能读到 agy 本地会话库的逐调用记录（<code>gen_metadata</code> / <code>steps</code>）时，<code>cache_read_input_tokens</code> 来自实际记录；读不到时，工具轮次缓存量是有界估算，不能证明 Google 实际命中。</span>
+      <span lang="en">No 90% hit rate is promised. The 2,049 constant is inferred from samples and is not documented by Google. With agy's per-call records (<code>gen_metadata</code> / <code>steps</code>) available, <code>cache_read_input_tokens</code> comes from actual records; otherwise tool-round cache figures are bounded estimates, not evidence of actual Google cache hits.</span>
+    </p>
+  </div>
+</section>
+
+<!-- 04 how -->
+<section class="s" id="how" aria-labelledby="h-how">
+  <div class="side"><div class="num">04</div><div class="tag"><span lang="zh-CN">工作原理</span><span lang="en">How it works</span></div></div>
+  <div>
+    <h2 id="h-how"><span lang="zh-CN">官方 CLI 进程，原生 MCP 工具。</span><span lang="en">The official CLI process, native MCP tools.</span></h2>
+    <div class="pipe" role="list">
+      <div role="listitem"><b><span lang="zh-CN">客户端</span><span lang="en">Client</span></b><small>OpenCode · Claude Code · Amp<br>Anthropic Messages, SSE</small></div>
+      <div role="listitem" class="me"><b>Magpie + Bridge</b><small><span lang="zh-CN">本插件：会话池、工具、用量</span><span lang="en">This plugin: sessions, tools, usage</span></small></div>
+      <div role="listitem"><b>agy acp</b><small><span lang="zh-CN">真实 Antigravity CLI，ACP over stdio</span><span lang="en">Real Antigravity CLI, ACP over stdio</span></small></div>
+      <div role="listitem"><b>Google</b><small>Code Assist backend</small></div>
+    </div>
+    <div class="grid2">
+      <div><h3><span lang="zh-CN">真正的客户端工具</span><span lang="en">Real client tools</span></h3><p><span lang="zh-CN">客户端工具以 MCP 原生工具出现：并行、多轮、长耗时，每个调用只执行一次。没有文本约定 hack。</span><span lang="en">Client tools appear as native MCP tools: parallel, multi-round, long-running, each run once. No text conventions.</span></p></div>
+      <div><h3><span lang="zh-CN">会话复用与续接</span><span lang="en">Session reuse and resume</span></h3><p><span lang="zh-CN">每轮只发新增消息；空闲、淘汰或重启后按哈希快照（不存明文）<code>session/resume</code>。历史改写时按预算重放。</span><span lang="en">Each turn sends only the new message; idle, evicted or restarted sessions resume from a hashed snapshot (no message text). Changed history replays within budget.</span></p></div>
+      <div><h3><span lang="zh-CN">流式 · 思考 · 图片</span><span lang="en">Streaming · thinking · images</span></h3><p><span lang="zh-CN">文本与思考摘要流式输出；内联 PNG/JPEG/GIF/WebP 输入需要 agy 声明图片能力（1.5.0 起）。</span><span lang="en">Streamed text and thought summaries; inline PNG/JPEG/GIF/WebP input requires agy to advertise image support (1.5.0+).</span></p></div>
+      <div><h3><span lang="zh-CN">用量看得见</span><span lang="en">Observable usage</span></h3><p><span lang="zh-CN">区分实际输入、缓存读写、输出与思考量；Magpie Usage 页显示订阅额度（仅展示）。</span><span lang="en">Separates actual input, cache reads/writes, output and thinking; Magpie's Usage page shows subscription quota (display only).</span></p></div>
+      <div><h3><span lang="zh-CN">隔离而不越权</span><span lang="en">Isolation without bypass</span></h3><p><span lang="zh-CN">不读取全局 MCP 配置；agy 的权限请求一律拒绝，操作发生在客户端侧。</span><span lang="en">No global MCP configuration is read; agy permission requests are rejected, and actions happen client-side.</span></p></div>
+      <div><h3><span lang="zh-CN">不放大重试</span><span lang="en">No retry amplification</span></h3><p><span lang="zh-CN">已提交的 Prompt 不会因客户端重试再次交给 agy，返回 <code>prompt_outcome_unknown</code>。</span><span lang="en">A submitted prompt is not resent on client retry; it returns <code>prompt_outcome_unknown</code>.</span></p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 05 context -->
+<section class="s" id="context" aria-labelledby="h-context">
+  <div class="side"><div class="num">05</div><div class="tag"><span lang="zh-CN">上下文</span><span lang="en">Context</span></div></div>
+  <div>
+    <h2 id="h-context"><span lang="zh-CN">保守默认，显式解锁。</span><span lang="en">Conservative default, explicit unlock.</span></h2>
+    <div class="ctx">
+      <div><strong>256,000</strong><span lang="zh-CN">默认 <code>limit.context</code> 声明</span><span lang="en">default <code>limit.context</code> declaration</span></div>
+      <div><strong>512,000</strong><span lang="zh-CN">选中已校验托管副本时的声明，未端到端验证</span><span lang="en">declared with a verified managed copy; not end-to-end verified</span></div>
+      <div><strong>131,072</strong><span lang="zh-CN">GPT-OSS 始终封顶</span><span lang="en">GPT-OSS cap, always</span></div>
+      <div class="warn"><strong>≈983K</strong><span lang="zh-CN">补丁后的 checkpoint gate 数值，不代表 1M 可用容量</span><span lang="en">patched checkpoint gate value, not 1M usable capacity</span></div>
+    </div>
+    <p class="intro" style="margin-top:28px">
+      <span lang="zh-CN"><span class="badge">开发中</span> 计划在 Provider 行菜单加入「Antigravity Bridge 上下文设置」，也可从侧边栏打开设置页：</span>
+      <span lang="en"><span class="badge">In development</span> A planned <strong>Antigravity Bridge context</strong> item in the Provider row menu, also reachable from the sidebar:</span>
+    </p>
+    <ol class="steps">
+      <li><span lang="zh-CN">选择方案</span><span lang="en">Choose an option</span></li>
+      <li><span lang="zh-CN">查看影响</span><span lang="en">Review it</span></li>
+      <li><span lang="zh-CN">确认执行</span><span lang="en">Confirm</span></li>
+      <li><span lang="zh-CN">异步显示结果</span><span lang="en">See the async result</span></li>
+      <li><span lang="zh-CN">可恢复默认</span><span lang="en">Restore the default</span></li>
+    </ol>
+    <p class="note">
+      <span lang="zh-CN">已有会话需重启 Magpie 并刷新模型目录才用新设置。现有补丁只为已知构建生成受校验的副本，官方安装从不修改；新版 agy 的长上下文效果未经验证。当前可用的 CLI：</span>
+      <span lang="en">Existing sessions need a Magpie restart and a model-catalog refresh. The patcher only builds verified copies of known builds and never modifies the official install; long context on newer agy builds is unverified. The CLI available today:</span>
+    </p>
+<pre class="cli">agy-bridge context status
+agy-bridge context unlock     # Python 3.8+, patches only a copy
+agy-bridge context disable [--purge]</pre>
+  </div>
+</section>
+
+<!-- 06 bounds -->
+<section class="s" id="bounds" aria-labelledby="h-bounds">
+  <div class="side"><div class="num">06</div><div class="tag"><span lang="zh-CN">边界</span><span lang="en">Boundaries</span></div></div>
+  <div>
+    <h2 id="h-bounds"><span lang="zh-CN">说清楚它不保证什么。</span><span lang="en">What it does not guarantee.</span></h2>
+    <ul class="bounds">
+      <li><span lang="zh-CN">型号按账号实际探测列出，不保证全部 Gemini / Claude / GPT-OSS 可用。</span><span lang="en">Models are listed from each account's probe; no model family is guaranteed.</span></li>
+      <li><span lang="zh-CN">走官方 CLI 不等于保证账号不受限制，也不排除 Google 政策变化。</span><span lang="en">Using the official CLI does not guarantee against account restrictions or Google policy changes.</span></li>
+      <li><span lang="zh-CN">缓存由 Google 后端决定；数字是历史样本，不是承诺。</span><span lang="en">Caching is Google's decision; the figures are historical samples, not promises.</span></li>
+      <li><span lang="zh-CN">额度窗口仅展示，不会在耗尽时自动停请求。</span><span lang="en">Quota windows are display-only and do not stop requests.</span></li>
+      <li><span lang="zh-CN">命名账号需要 agy 支持 <code>--gemini_dir</code> 和文件 token；WSL 模式只支持默认账号。</span><span lang="en">Named accounts need <code>--gemini_dir</code> and file tokens; WSL mode supports only the default account.</span></li>
+      <li><span lang="zh-CN">Windows 已有自动化测试，尚未完成实机验证。</span><span lang="en">Windows has automated tests; real-host verification is pending.</span></li>
+    </ul>
+  </div>
+</section>
+
+</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span lang="zh-CN">MIT 许可 · 本页是仓库中的单文件 <code>docs/index.html</code>，可直接用浏览器本地打开。</span>
+    <span lang="en">MIT licensed · This page is the single file <code>docs/index.html</code> in the repository; open it locally in a browser.</span>
+    <span><a href="../README.md" data-readme>README</a> · <a href="../README.en.md">README (English)</a> · <a href="https://github.com/DylanLIiii/opencode-antigravity-bridge">GitHub</a></span>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+  var root = document.documentElement;
+  var T = {
+    zh:{copied:"已复制安装命令", copyFail:"复制失败，请手动选择命令", copiedBtn:"已复制",
+      preferred:"首选", setPref:"设为首选", on:"已启用", off:"已关闭", served:"本次服务",
+      enable:"启用账号 ", none:"没有已启用账号：Magpie 会拒绝请求。", 
+      legendNative:"所有账号共用同一个模型 ID；账号由 Magpie 选择。",
+      legendPrefixed:"OpenCode 直接使用时，账号写进模型 ID 前缀，显示名带 [账号]。",
+      mins:"会话、进程池与额度：按账号隔离", srCache:function(r,c){return "示意缓存读比例 "+r+"，约 "+c+" tokens"}},
+    en:{copied:"Install command copied", copyFail:"Copy failed; select the command manually", copiedBtn:"Copied",
+      preferred:"Preferred", setPref:"Set preferred", on:"Enabled", off:"Disabled", served:"Served this",
+      enable:"Enable account ", none:"No enabled account: Magpie rejects the request.",
+      legendNative:"All accounts share one model ID; Magpie chooses the account.",
+      legendPrefixed:"In direct OpenCode use the account is a model-ID prefix, shown with a [name] label.",
+      mins:"sessions, process pool and quota: per account", srCache:function(r,c){return "Illustrative cache share "+r+", about "+c+" tokens"}}
+  };
+  var lang = "zh";
+  function t(k){ return T[lang][k]; }
+
+  function setLang(l){
+    lang = l === "en" ? "en" : "zh";
+    root.setAttribute("data-lang", lang);
+    root.setAttribute("lang", lang === "en" ? "en" : "zh-CN");
+    document.title = lang === "en" ? "Antigravity Bridge · the official agy CLI in Magpie / OpenCode" : "Antigravity Bridge · 官方 agy CLI 接入 Magpie / OpenCode";
+    document.querySelectorAll("[data-set-lang]").forEach(function(b){ b.setAttribute("aria-pressed", String(b.dataset.setLang === lang)); });
+    document.querySelectorAll("[data-readme]").forEach(function(a){ a.setAttribute("href", lang === "en" ? "../README.en.md" : "../README.md"); });
+    try { localStorage.setItem("agyb-lang", lang); } catch (e) {}
+    renderAccounts(); renderReq(); renderCache();
+  }
+  document.querySelectorAll("[data-set-lang]").forEach(function(b){ b.addEventListener("click", function(){ setLang(b.dataset.setLang); }); });
+
+  /* copy */
+  var status = document.getElementById("copy-status");
+  function fallbackCopy(text){
+    var ta = document.createElement("textarea"); ta.value = text; ta.setAttribute("readonly", "");
+    ta.style.position = "fixed"; ta.style.opacity = "0"; document.body.appendChild(ta); ta.select();
+    var ok = false; try { ok = document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta); return ok;
+  }
+  document.querySelectorAll("[data-copy]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var text = btn.dataset.copy;
+      function done(ok){
+        status.textContent = ok ? t("copied") : t("copyFail");
+        btn.setAttribute("data-state", ok ? "copied" : "failed");
+        var spans = btn.querySelectorAll("span"), old = [];
+        spans.forEach(function(s, i){ old[i] = s.textContent; s.textContent = ok ? T[s.getAttribute("lang") === "en" ? "en" : "zh"].copiedBtn : s.textContent; });
+        setTimeoutish(function(){ spans.forEach(function(s, i){ s.textContent = old[i]; }); btn.removeAttribute("data-state"); });
+      }
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function(){ done(true); }, function(){ done(fallbackCopy(text)); });
+      } else done(fallbackCopy(text));
+    });
+  });
+  function setTimeoutish(fn){ window.setTimeout(fn, 1600); }
+
+  /* synthetic accounts demo */
+  var accounts = [
+    {name:"default", meta:{zh:"agy 自己的 CLI 登录", en:"agy's own CLI sign-in"}, on:true},
+    {name:"work", meta:{zh:"示例命名账号", en:"example named account"}, on:true},
+    {name:"lab", meta:{zh:"示例命名账号", en:"example named account"}, on:false}
+  ];
+  var preferred = "work", mode = "native", served = null, count = 0;
+  var list = document.getElementById("accts"), req = document.getElementById("req"), model = document.getElementById("model");
+
+  function pick(){
+    var p = accounts.filter(function(a){ return a.name === preferred && a.on; })[0];
+    if (p) return p;
+    return accounts.filter(function(a){ return a.on; })[0] || null;
+  }
+  function renderAccounts(){
+    list.innerHTML = "";
+    accounts.forEach(function(a, i){
+      var li = document.createElement("li");
+      li.className = (a.on ? "on" : "") + (served === a.name ? " served" : "");
+      var dot = document.createElement("span"); dot.className = "dot"; dot.setAttribute("aria-hidden", "true");
+      var nm = document.createElement("span"); nm.className = "aname";
+      nm.textContent = a.name;
+      var meta = document.createElement("span"); meta.className = "ameta";
+      meta.textContent = (mode === "prefixed" ? a.name + "/" + model.value + " · [" + a.name + "]" : a.meta[lang]) + (served === a.name ? " · " + t("served") : "");
+      nm.appendChild(meta);
+      var pref = document.createElement("button"); pref.type = "button"; pref.className = "pref";
+      pref.setAttribute("aria-pressed", String(preferred === a.name));
+      pref.textContent = preferred === a.name ? t("preferred") : t("setPref");
+      pref.setAttribute("aria-label", (preferred === a.name ? t("preferred") : t("setPref")) + ": " + a.name);
+      pref.addEventListener("click", function(){ preferred = a.name; served = null; renderAccounts(); renderReq(); focusAt(i, ".pref"); });
+      var sw = document.createElement("button"); sw.type = "button"; sw.className = "switch";
+      sw.setAttribute("role", "switch"); sw.setAttribute("aria-checked", String(a.on));
+      sw.setAttribute("aria-label", t("enable") + a.name);
+      sw.addEventListener("click", function(){ a.on = !a.on; served = null; renderAccounts(); renderReq(); focusAt(i, ".switch"); });
+      li.appendChild(dot); li.appendChild(nm); li.appendChild(pref); li.appendChild(sw);
+      list.appendChild(li);
+    });
+  }
+  function focusAt(i, sel){ var el = list.children[i] && list.children[i].querySelector(sel); if (el) el.focus(); }
+  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); }
+  function renderReq(){
+    var a = pick(), id = model.value;
+    var shown = mode === "prefixed" ? (a ? a.name + "/" : "&lt;account&gt;/") + esc(id) : esc(id);
+    var lines = [
+      '<span class="k">POST</span> /v1/messages',
+      '<span class="k">model</span>   <span class="v">' + (mode === "prefixed" && a ? esc(a.name) + "/" + esc(id) : shown) + '</span>'
+    ];
+    if (!a) lines.push('<span class="bad">' + esc(t("none")) + '</span>');
+    else {
+      lines.push('<span class="k">account</span> <span class="ok">' + esc(a.name) + '</span>' + (served ? '  #' + count : ''));
+      lines.push('<span class="k">agy</span>     --gemini_dir=' + (a.name === "default" ? '(global)' : '…/accounts/' + esc(a.name)));
+      lines.push('<span class="k">' + esc(t("mins")) + '</span>');
+    }
+    req.innerHTML = lines.join("\n").replace(/\n/g, "<br>");
+    document.getElementById("demo-legend").textContent = mode === "native" ? t("legendNative") : t("legendPrefixed");
+  }
+  document.getElementById("send").addEventListener("click", function(){
+    var a = pick(); served = a ? a.name : null; if (a) count++; renderAccounts(); renderReq();
+  });
+  model.addEventListener("change", function(){ served = null; renderReq(); renderAccounts(); });
+  document.querySelectorAll("[data-mode]").forEach(function(b){
+    b.addEventListener("click", function(){
+      mode = b.dataset.mode; served = null;
+      document.querySelectorAll("[data-mode]").forEach(function(x){ x.setAttribute("aria-pressed", String(x === b)); });
+      renderAccounts(); renderReq();
+    });
+  });
+
+  /* cache illustration */
+  var cm = "argon", range = document.getElementById("psize");
+  var fmt = function(n){ return Math.round(n).toLocaleString("en-US"); };
+  function renderCache(){
+    var prev = Number(range.value), fresh = 104; /* the 26k sample: 26,097 - 25,993 */
+    var total = prev + fresh;
+    var cached = cm === "flash" ? 0 : Math.max(0, prev - 2049);
+    var rate = total ? cached / total : 0;
+    var pct = (Math.floor(rate * 1000) / 10).toFixed(1) + "%"; /* truncated, matching the reported 91.7% */
+    document.getElementById("psize-out").textContent = fmt(prev);
+    document.getElementById("rate").textContent = pct;
+    document.getElementById("cached").textContent = fmt(cached);
+    var hit = document.getElementById("hit"), miss = document.getElementById("miss");
+    hit.style.flexBasis = (rate * 100) + "%"; miss.style.flexBasis = (100 - rate * 100) + "%";
+    hit.textContent = rate > .18 ? (lang === "en" ? "cache read" : "缓存读") : "";
+    miss.textContent = (lang === "en" ? "uncached " : "未缓存 ") + fmt(total - cached);
+    document.getElementById("cache-sr").textContent = T[lang].srCache(pct, fmt(cached));
+  }
+  range.addEventListener("input", renderCache);
+  document.querySelectorAll("[data-cm]").forEach(function(b){
+    b.addEventListener("click", function(){
+      cm = b.dataset.cm;
+      document.querySelectorAll("[data-cm]").forEach(function(x){ x.setAttribute("aria-pressed", String(x === b)); });
+      renderCache();
+    });
+  });
+
+  var saved = null; try { saved = localStorage.getItem("agyb-lang"); } catch (e) {}
+  var q = /[?&]lang=(zh|en)/.exec(location.search);
+  setLang(q ? q[1] : saved || ((navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en"));
+})();
+</script>
+</body>
+</html>

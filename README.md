@@ -11,10 +11,10 @@
 </div>
 
 ```sh
-magpie plugin add ./opencode-antigravity-bridge
+magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 ```
 
-> 尚未发布到 npm，请从本地 checkout 安装。产品页 [`docs/index.html`](docs/index.html) 是单个自包含的
+> 直接从 GitHub 安装，无需 npm 发布。开发时也可安装本地 checkout。产品页 [`docs/index.html`](docs/index.html) 是单个自包含的
 > HTML 文件，目前没有在线托管：克隆仓库后直接用浏览器打开即可本地预览。
 
 ## 为什么选它
@@ -72,8 +72,8 @@ Prompt caching 由 Google 后端决定，插件不能保证命中率；它只让
 
 ## 更多能力与边界
 
-- **模型与思考等级**：会话中可在 Magpie 模型选择器切换模型和思考等级；ACP 保持 Zed 兼容身份
-  以支持 agy 的非 Gemini 模型 allowlist。型号以账号实际探测结果为准。
+- **模型与思考等级**：会话中可在 Magpie 模型选择器切换模型和思考等级；ACP 使用本插件的名称与版本。
+  型号以账号实际探测结果为准。
 - **Prompt 风险收敛**：精确移除独立计费伪 header、规范化已知 Agent SDK 身份句，
   不全局改写用户正文；通用 429 不再被直接当作确定配额耗尽。
 - **异常防重发**：同一逻辑 Prompt 在提交后失败、取消或进程退出时，不会因客户端
@@ -106,8 +106,8 @@ Prompt caching 由 Google 后端决定，插件不能保证命中率；它只让
   （已核对 1.5.4 的授权链接与输入流程）
 
 ```sh
-# 1. 安装插件（本地 checkout，尚未发布 npm）
-magpie plugin add ./opencode-antigravity-bridge
+# 1. 从 GitHub 安装插件
+magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 
 # 2. 在 Magpie 中：Providers → Antigravity Bridge → 登录
 #    已接入时点击「添加另一个 Antigravity Bridge 账号」，再选择「新增 Google 账号」

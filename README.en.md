@@ -11,10 +11,10 @@ Multiple Google accounts · shared ordinary model IDs · lean prompts · session
 </div>
 
 ```sh
-magpie plugin add ./opencode-antigravity-bridge
+magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 ```
 
-> Not yet published to npm; install from a local checkout. The product page
+> Install directly from GitHub; no npm release is required. Local checkouts also work for development. The product page
 > [`docs/index.html`](docs/index.html) is a single self-contained HTML file and is not hosted
 > anywhere yet: clone the repository and open it in a browser to preview it locally.
 
@@ -82,10 +82,10 @@ The minimal agent is enabled by default; set `AGY_BRIDGE_MINIMAL_AGENT=0` to dis
 
 ## Install
 
-From a local checkout (not yet published to npm):
+Install directly from GitHub:
 
 ```sh
-magpie plugin add ./opencode-antigravity-bridge
+magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 ```
 
 ## Use

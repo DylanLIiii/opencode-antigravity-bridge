@@ -21,8 +21,13 @@ jobs:
             node: 22
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: bridge fixture checkout
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: bridge fixture checkout
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1
+
+- Recover the context settings service after a Magpie hot update overlaps old and new plugin hosts. Wait in the background when the port belongs to a previous Bridge service, including 0.8.0, then take over after it closes. Keep model requests responsive and stop retrying unidentified applications after a bounded startup check.
+
 ## 0.8.0
 
 - Add an Antigravity Bridge context entry to Magpie's Provider menu and sidebar. Choose the default or managed unlock, review and confirm, follow background execution, retry failures, and restore default without deleting copies. Show saved, verified and running modes separately, including restart requirements and context overrides. WSL remains read-only for this native patcher.

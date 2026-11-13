@@ -10,7 +10,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
-import { createServer } from "node:http"
+import { createServer, request as httpRequest } from "node:http"
 import { Worker } from "node:worker_threads"
 import { contextStateDir } from "./context-unlock.mjs"
 
@@ -163,7 +163,7 @@ export function createContextService({ env = process.env, runtimeMode = () => "n
 
   const hostOk = req => req.headers.host === `127.0.0.1:${port}` || req.headers.host === `localhost:${port}`
   const loopbackPeer = req => ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress)
-  const base = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" }
+  const base = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Antigravity-Bridge-Context": "1" }
   const send = (res, status, body, extra = {}) => {
     res.writeHead(status, { ...base, "Content-Type": "application/json; charset=utf-8", ...extra })
     res.end(JSON.stringify(body))
@@ -274,14 +274,57 @@ export function createContextService({ env = process.env, runtimeMode = () => "n
   }
 }
 
-// Started at most once per plugin host process (Magpie only).
+// A hot update starts the new host while the old host finishes its calls. Its
+// page service can still own this port. Recognize only our service (including
+// 0.8.0, before the identity header existed), without running the page's script.
+function previousContextService(port) {
+  return new Promise(resolve => {
+    let req, settled = false
+    const finish = value => {
+      if (settled) return
+      settled = true
+      req?.destroy()
+      resolve(value)
+    }
+    try {
+      req = httpRequest({ hostname: "127.0.0.1", port, path: "/", method: "GET",
+        headers: { "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" } }, res => {
+        if (res.statusCode !== 200) return finish(false)
+        if (res.headers["x-antigravity-bridge-context"] === "1") return finish(true)
+        let prefix = ""
+        res.on("data", chunk => {
+          prefix = (prefix + chunk.toString()).slice(0, 1024)
+          if (prefix.includes("</title>") || prefix.length >= 1024) finish(prefix.includes("<title>Antigravity Bridge context</title>"))
+        })
+        res.on("end", () => finish(prefix.includes("<title>Antigravity Bridge context</title>")))
+        res.on("error", () => finish(false))
+      })
+      req.on("error", () => finish(false))
+      req.setTimeout(750, () => finish(false))
+      req.end()
+    } catch { finish(false) }
+  })
+}
+
+// Started at most once per host; handover waits only in the background. The
+// timer is unref'd so an old host's shutdown is never held open by a contender.
 let started = null
 export function startContextService({ port, ...options } = {}) {
   if (started) return started
   started = (async () => {
-    const service = createContextService(options)
     try {
-      await service.listen(contextPort(port))
+      const service = createContextService(options)
+      const target = contextPort(port)
+      let unknownOwnerAttempts = 0
+      for (;;) {
+        try { await service.listen(target); break }
+        catch (error) {
+          if (error.code !== "EADDRINUSE") throw error
+          if (await previousContextService(target)) unknownOwnerAttempts = 0
+          else if (++unknownOwnerAttempts >= 3) throw error
+          await new Promise(resolve => { const timer = setTimeout(resolve, 250); timer.unref?.() })
+        }
+      }
       process.once("exit", () => { service.close() })
       return service
     } catch (error) {

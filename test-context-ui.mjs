@@ -6,7 +6,7 @@ import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import vm from "node:vm"
-import { createContextService, runContextTask, contextPort, DEFAULT_CONTEXT_PORT, CAPABILITY_HEADER } from "./context-ui-service.mjs"
+import { createContextService, startContextService, runContextTask, contextPort, DEFAULT_CONTEXT_PORT, CAPABILITY_HEADER } from "./context-ui-service.mjs"
 
 const off = { enabled: false, active: false, state: "default" }
 const on = { enabled: true, active: true, state: "unlocked", path: "/private/account/agy", dir: "/private/state", source: "/private/agy" }
@@ -36,6 +36,7 @@ test("page navigation cannot be read through CORS; APIs require capability and J
   }
   const page = await request("/", { capability: false, headers: { "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "iframe" } })
   assert.equal(page.status, 200)
+  assert.equal(page.headers["x-antigravity-bridge-context"], "1")
   const script = /<script>([\s\S]*?)<\/script>/.exec(page.raw)[1]
   const hash = createHash("sha256").update(script).digest("base64")
   assert.ok(page.headers["content-security-policy"].includes(`'sha256-${hash}'`))
@@ -133,6 +134,51 @@ test("one bind attempt fails promptly and port options are validated", async t =
   await other.close()
   assert.equal(contextPort("39431"), 39431)
   for (const value of [0, -1, 65536, NaN, undefined, "oops"]) assert.equal(contextPort(value), DEFAULT_CONTEXT_PORT)
+})
+
+test("a hot-reloaded host takes over the previous Bridge service's port", async t => {
+  const old = createContextService({ runTask: async () => off })
+  await old.listen(0)
+  const port = old.port
+  const hold = setTimeout(() => {}, 5000)
+  t.after(() => { clearTimeout(hold); return old.close() })
+  const takingOver = startContextService({ port, runTask: async () => off })
+  // Release after the new instance has encountered the old listener.
+  const release = setTimeout(() => old.close(), 100)
+  t.after(() => clearTimeout(release))
+  const next = await takingOver
+  assert(next, "the next host must recover after an overlapping hot reload")
+  t.after(() => next.close())
+  assert.equal(next.port, port)
+  assert.notEqual(next.capability, old.capability)
+})
+
+test("a port belonging to another application is not waited on indefinitely", async t => {
+  const other = http.createServer((_, res) => res.end("another application"))
+  await new Promise(resolve => other.listen(0, "127.0.0.1", resolve))
+  t.after(() => new Promise(resolve => other.close(resolve)))
+  const { startContextService: startFresh } = await import("./context-ui-service.mjs?unrelated-port-test")
+  const logs = [], started = Date.now()
+  assert.equal(await startFresh({ port: other.address().port, log: message => logs.push(message) }), null)
+  assert(Date.now() - started < 4000)
+  assert(other.listening)
+  assert(logs.some(message => message.includes("unavailable")))
+})
+
+test("handover also recognizes 0.8.0 before its identity header existed", async t => {
+  const legacy = http.createServer((_, res) => res.end("<!doctype html><title>Antigravity Bridge context</title>"))
+  await new Promise(resolve => legacy.listen(0, "127.0.0.1", resolve))
+  const port = legacy.address().port
+  const hold = setTimeout(() => {}, 5000)
+  t.after(() => { clearTimeout(hold); if (legacy.listening) return new Promise(resolve => legacy.close(resolve)) })
+  const { startContextService: startFresh } = await import("./context-ui-service.mjs?legacy-handoff-test")
+  const takingOver = startFresh({ port, runTask: async () => off })
+  const release = setTimeout(() => legacy.close(), 100)
+  t.after(() => clearTimeout(release))
+  const next = await takingOver
+  assert(next)
+  t.after(() => next.close())
+  assert.equal(next.port, port)
 })
 
 test("timeout and close clean only their own terminated worker's staging copy", async t => {

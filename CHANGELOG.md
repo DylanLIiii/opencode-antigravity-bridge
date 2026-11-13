@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+- Fix model discovery by running the CLI catalog and a bounded 10-second ACP wait concurrently. Serve successful cached models during refresh, throttle failed probes, keep the full CLI catalog when ACP is unknown, and prefer live session handshakes over older probes.
+
 ## 0.7.0
 
 - Expose named Google profiles as separate native Magpie account rows sharing ordinary model IDs. Bind requests, model discovery, sessions and quota to the account selected by Magpie, enabling its existing account preferences and routing.

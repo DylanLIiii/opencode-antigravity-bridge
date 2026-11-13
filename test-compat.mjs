@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { after, test } from "node:test"
 
 // Expose private seams from an isolated copy, without adding production exports.
@@ -16,7 +16,7 @@ const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
-source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(new URL("./package.json", entry).pathname))
+source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(fileURLToPath(new URL("./package.json", entry))))
 source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts };\n"
 fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync };\n")
 const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)

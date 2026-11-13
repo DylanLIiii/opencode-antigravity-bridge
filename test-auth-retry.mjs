@@ -2,11 +2,12 @@ import assert from "node:assert/strict"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 import test from "node:test"
 
-const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy-auth-retry-"))
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy auth retry-"))
 const fakeAgyMjs = path.join(tmpRoot, "fake-agy.mjs")
-const fakeAgyBin = path.join(tmpRoot, "agy")
+const fakeAgyBin = path.join(tmpRoot, process.platform === "win32" ? "agy.cmd" : "agy")
 const logFile = path.join(tmpRoot, "events.jsonl")
 const stateDir = path.join(tmpRoot, "state")
 fs.mkdirSync(stateDir, { recursive: true })
@@ -50,6 +51,7 @@ if (argv[0] === "acp" && argv.includes("--login")) {
   })
   setInterval(() => {}, 1000)
 } else if (argv[0] === "acp") {
+  log({ type: "fixture-process", pid: process.pid })
   const flag = (n) => { const i = argv.indexOf(n); return i < 0 ? null : argv[i + 1] }
   const agentLog = flag("--log-file")
   const idePort = flag("--ide-mcp-port")
@@ -57,6 +59,20 @@ if (argv[0] === "acp" && argv.includes("--login")) {
   let mcp = null
   let nextMcpId = 0
   const mcpPending = new Map()
+
+  let stopping = false
+  function shutdown() {
+    if (stopping) return
+    stopping = true
+    if (!mcp) return process.exit(0)
+    mcp.once("close", () => process.exit(0))
+    mcp.stdin.end()
+    setTimeout(() => { mcp.kill(); process.exit(0) }, 1000).unref()
+  }
+  process.stdin.on("end", shutdown)
+  process.on("SIGTERM", shutdown)
+  // The parent test asks pooled ACP processes to exit before deleting files.
+  setInterval(() => { if (fs.existsSync(stateFile("stop-fixture"))) shutdown() }, 50).unref()
 
   function mcpReq(method, params) {
     return new Promise((resolve, reject) => {
@@ -68,7 +84,16 @@ if (argv[0] === "acp" && argv.includes("--login")) {
 
   async function connectIde() {
     if (!idePort || mcp) return
-    mcp = spawn("nc", ["127.0.0.1", idePort], { stdio: ["pipe", "pipe", "pipe"] })
+    // --ide-mcp-port is Bridge's private control endpoint, not an MCP socket.
+    // Use the real stdio MCP adapter with its inherited control port/token.
+    mcp = spawn(process.execPath, [process.env.FAKE_E2E_MCP_SERVER], { stdio: ["pipe", "pipe", "pipe"] })
+    log({ type: "fixture-process", pid: mcp.pid })
+    const fail = error => {
+      for (const waiter of mcpPending.values()) waiter.reject(error)
+      mcpPending.clear()
+    }
+    mcp.on("error", fail)
+    mcp.on("close", () => fail(new Error("fixture MCP adapter closed")))
     readline.createInterface({ input: mcp.stdout }).on("line", (line) => {
       const msg = JSON.parse(line)
       const w = mcpPending.get(msg.id)
@@ -80,6 +105,7 @@ if (argv[0] === "acp" && argv.includes("--login")) {
     await mcpReq("initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "agy", version: "1.5.1" } })
     mcp.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n")
     await mcpReq("tools/list", {})
+    log({ type: "mcp-ready" })
   }
 
   const update = (u) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: session.id, update: u } })
@@ -207,17 +233,41 @@ if (argv[0] === "acp" && argv.includes("--login")) {
 }
 `)
 
-fs.writeFileSync(fakeAgyBin, `#!/bin/sh\nexec "${process.execPath}" "${fakeAgyMjs}" "$@"\n`, { mode: 0o755 })
+const shellQuote = value => "'" + value.replaceAll("'", "'\\''") + "'"
+fs.writeFileSync(fakeAgyBin, process.platform === "win32"
+  ? `@echo off\r\n"${process.execPath}" "${fakeAgyMjs}" %*\r\n`
+  : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(fakeAgyMjs)} "$@"\n`, { mode: 0o755 })
 
 process.env.AGY_PATH = fakeAgyBin
 process.env.FAKE_E2E_LOG = logFile
 process.env.FAKE_E2E_STATE = stateDir
+process.env.FAKE_E2E_MCP_SERVER = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 process.env.AGY_BRIDGE_STATE_FILE = path.join(stateDir, "sessions.json")
 process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
+process.env.AGY_BRIDGE_ACCOUNTS_DIR = path.join(tmpRoot, "accounts")
+process.env.AGY_BRIDGE_CONTEXT_DIR = path.join(tmpRoot, "context")
+delete process.env.AGY_BRIDGE_WSL_DISTRO
 
 const readLogs = () => fs.existsSync(logFile)
   ? fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l))
   : []
+
+test.after(async () => {
+  fs.writeFileSync(path.join(stateDir, "stop-fixture"), "1")
+  const alive = pid => {
+    try { process.kill(pid, 0); return true } catch (error) {
+      if (error.code === "ESRCH") return false
+      throw error
+    }
+  }
+  const pids = [...new Set(readLogs().filter(event => event.type === "fixture-process" && event.pid).map(event => event.pid))]
+  const deadline = Date.now() + 5000
+  while (pids.some(alive) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25))
+  assert.deepEqual(pids.filter(alive), [], "fixture ACP and MCP processes exited before cleanup")
+  assert.ok(readLogs().some(event => event.type === "mcp-ready"), "the production MCP adapter completed a real handshake and tools/list")
+  fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  setTimeout(() => process.exit(process.exitCode || 0), 30)
+})
 
 const { default: Bridge } = await import("./index.mjs?auth-retry")
 const plugin = await Bridge.server({ client: null, directory: tmpRoot }, {})
@@ -344,10 +394,5 @@ test("stale-proc OAuth 401 retires stale proc, re-parks pre-turn history, sessio
     assert.notEqual(followUp.json?.error?.message?.includes("unfinished response"), true, "no attached/unfinished turn left behind")
   } finally {
     try { fs.unlinkSync(path.join(stateDir, "fail-401-always")) } catch {}
-    fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
-})
-
-test.after(() => {
-  setTimeout(() => process.exit(process.exitCode || 0), 30)
 })

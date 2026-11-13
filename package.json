@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Connect to Antigravity via the official agy CLI with lean prompts and session reuse. Native Magpie accounts share model IDs and use the host account router; OpenCode supports account-prefixed models.",
   "type": "module",
   "main": "./index.mjs",

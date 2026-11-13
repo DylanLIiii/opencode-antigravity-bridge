@@ -1402,22 +1402,27 @@ class Proc {
   async #setConfig(config, value) {
     if (this.dead) throw this.deadError
     const timeoutMs = configuredTimeout("AGY_BRIDGE_CONFIG_TIMEOUT_MS", 30_000)
+    const timedOut = () => Object.assign(new Error(
+      `agy bridge: session option ${config.id} confirmation timed out after ${timeoutMs}ms`,
+    ), { statusCode: 503, code: "config_confirmation_timeout" })
+    const rpcTimeoutMessage = `agy bridge: session/set_config_option ${config.id} timed out after ${timeoutMs}ms`
     let expectation = null
     let confirmed = Promise.resolve()
     if (nativeSessionSettings(this.agentVersion)) {
       // Install before sending: ACP permits notification before RPC response.
       confirmed = new Promise((resolve, reject) => {
         expectation = { id: config.id, value, resolve, reject, timer: null }
-        expectation.timer = setTimeout(() => reject(new Error(
-          `agy did not confirm session option ${config.id} via config_option_update after ${timeoutMs}ms`,
-        )), timeoutMs)
+        expectation.timer = setTimeout(() => reject(timedOut()), timeoutMs)
         this.configExpectation = expectation
       })
     }
     try {
       const response = this.conn.request("session/set_config_option", {
         sessionId: this.sessionId, configId: config.id, value,
-      }, timeoutMs).then(result => {
+      }, timeoutMs, rpcTimeoutMessage).catch(error => {
+        if (!error.acpError && error.message === rpcTimeoutMessage) throw timedOut()
+        throw error
+      }).then(result => {
         if (!Array.isArray(result?.configOptions)) throw new Error("agy returned no configOptions after setting a session option")
         const updated = result.configOptions.find(option => option.id === config.id)
         if (updated?.currentValue !== value) throw new Error(`agy did not apply session option ${config.id}`)
@@ -1464,6 +1469,7 @@ class Proc {
         await this.conn.request("session/set_model", { sessionId: this.sessionId, modelId: model }, 30_000)
       }
     } catch (error) {
+      if (error.code === "config_confirmation_timeout" || error.code === "config_confirmation_conflict") throw error
       const wrapped = new Error(`agy bridge: model ${model} is unavailable to this agy account: ${error.message}`)
       wrapped.statusCode = 400
       throw wrapped
@@ -1570,7 +1576,9 @@ class Proc {
       const option = expected && this.configOptions.find(option => option.id === expected.id)
       if (option) {
         if (option.currentValue !== expected.value) {
-          expected.error = new Error(`agy config_option_update contradicted session option ${expected.id}: expected ${expected.value}, got ${option.currentValue}`)
+          expected.error = Object.assign(new Error(
+            `agy config_option_update contradicted session option ${expected.id}: expected ${expected.value}, got ${option.currentValue}`,
+          ), { statusCode: 502, code: "config_confirmation_conflict" })
           expected.reject(expected.error)
         } else {
           expected.resolve()

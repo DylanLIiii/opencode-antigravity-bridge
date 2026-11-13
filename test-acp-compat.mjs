@@ -47,7 +47,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (p.configId === "model") { model = p.value; effort = "low" } else effort = p.value
     const next = options()
     if (mode === "close") return process.exit(0)
-    if (mode === "hang") return
+    if (mode === "hang" || mode === "legacy-hang") return
     if (mode === "bad-response") return reply({ configOptions: [] })
     if (mode === "notification-first") { update(next); return setTimeout(() => reply({ configOptions: next }), 30) }
     reply({ configOptions: next })
@@ -77,7 +77,7 @@ Object.assign(process.env, {
   AGY_PATH: executable, COMPAT_LOG: logFile, COMPAT_STOP: path.join(root, "stop"),
   AGY_BRIDGE_STATE_FILE: path.join(root, "sessions.json"), AGY_BRIDGE_CONVERSATIONS_DIR: path.join(root, "conversations"),
   AGY_BRIDGE_ACCOUNTS_DIR: path.join(root, "accounts"), AGY_BRIDGE_CONTEXT_DIR: path.join(root, "context"),
-  AGY_BRIDGE_CONFIG_TIMEOUT_MS: "250", AGY_BRIDGE_START_TIMEOUT_MS: "3000",
+  AGY_BRIDGE_CONFIG_TIMEOUT_MS: "500", AGY_BRIDGE_START_TIMEOUT_MS: "3000",
 })
 delete process.env.AGY_BRIDGE_WSL_DISTRO
 const logs = () => fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []
@@ -106,7 +106,7 @@ test.after(async () => {
   setTimeout(() => process.exit(process.exitCode || 0), 30)
 })
 
-for (const mode of ["response-first", "notification-first", "legacy", "unsupported", "missing", "missing-effort", "cross-session", "conflict", "conflict-effort", "bad-response", "real-error", "close", "hang"]) {
+for (const mode of ["response-first", "notification-first", "legacy", "legacy-hang", "unsupported", "missing", "missing-effort", "cross-session", "conflict", "conflict-effort", "bad-response", "real-error", "close", "hang"]) {
   test(`configuration protocol: ${mode}`, async () => {
     process.env.COMPAT_MODE = mode
     const start = logs().length
@@ -118,6 +118,16 @@ for (const mode of ["response-first", "notification-first", "legacy", "unsupport
     assert.equal(result.status === 200, success, JSON.stringify(body))
     assert.equal(events.filter(e => e.kind === "prompt").length, success ? 1 : 0)
     if (!success) assert.equal(events.filter(e => e.method === "session/set_model").length, 0, "real failures do not fall back")
+    if (["conflict", "conflict-effort"].includes(mode)) {
+      assert.equal(result.status, 502)
+      assert.equal(body.error?.code, "config_confirmation_conflict")
+      assert.match(body.error?.message || "", /contradicted/, "a contradictory notification fails immediately, not through a later timeout")
+    }
+    if (["missing", "missing-effort", "cross-session", "hang", "legacy-hang"].includes(mode)) {
+      assert.equal(result.status, 503, "confirmation deadlines remain retryable service failures")
+      assert.equal(body.error?.code, "config_confirmation_timeout")
+      assert.match(body.error?.message || "", /confirmation timed out/)
+    }
     if (mode === "unsupported") assert.ok(events.some(e => e.method === "session/set_model"))
     if (["response-first", "notification-first"].includes(mode)) {
       const effortAt = events.findIndex(e => e.kind === "request" && e.params?.configId === "thought_level")

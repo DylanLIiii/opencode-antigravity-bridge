@@ -3,7 +3,7 @@
 ## 0.8.4
 
 - Restore capability-advertised system append on every native agy 1.5+ resume, without repeating instructions in user turns or accumulating append text. Preserve older ACP behavior.
-- Wait for both the configuration response and a matching session notification before applying effort or sending a prompt on native agy 1.5+. Reject missing or contradictory confirmations within a bounded deadline (`AGY_BRIDGE_CONFIG_TIMEOUT_MS`, default 30 seconds), clean up on failure or shutdown, and retain legacy model fallback only for an unsupported method.
+- Bound configuration RPCs on all supported versions with `AGY_BRIDGE_CONFIG_TIMEOUT_MS` (default 30 seconds). Native agy 1.5+ also waits for the matching session notification before applying effort or sending a prompt. Missing confirmations return retryable HTTP 503, contradictory notifications return HTTP 502, and waits are cleaned up on failure or shutdown. Retain legacy model fallback only for an unsupported method.
 - Add production-provider/fake-ACP protocol regressions and run them in the existing cross-platform CI matrix, including Windows Node 22 and checkout paths with spaces.
 
 ## 0.8.3

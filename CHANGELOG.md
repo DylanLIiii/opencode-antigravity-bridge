@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0
+
+- Add an Antigravity Bridge context entry to Magpie's Provider menu and sidebar. Choose the default or managed unlock, review and confirm, follow background execution, retry failures, and restore default without deleting copies. Show saved, verified and running modes separately, including restart requirements and context overrides. WSL remains read-only for this native patcher.
+- Run blocking context verification and patching outside the shared plugin host, with a loopback-only service, capability-protected actions and bounded work. Official agy and existing sessions keep their original behavior until the user applies a new selection.
+- Redesign the Chinese and English READMEs and add a self-contained bilingual product page with synthetic account routing and cache illustrations. Document historical token/cache measurements with their conditions and distinguish declared context windows from verified capacity.
+
 ## 0.7.0
 
 - Expose named Google profiles as separate native Magpie account rows sharing ordinary model IDs. Bind requests, model discovery, sessions and quota to the account selected by Magpie, enabling its existing account preferences and routing.

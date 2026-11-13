@@ -411,8 +411,8 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
       <div class="warn"><strong>≈983K</strong><span lang="zh-CN">补丁后的 checkpoint gate 数值，不代表 1M 可用容量</span><span lang="en">patched checkpoint gate value, not 1M usable capacity</span></div>
     </div>
     <p class="intro" style="margin-top:28px">
-      <span lang="zh-CN"><span class="badge">开发中</span> 计划在 Provider 行菜单加入「Antigravity Bridge 上下文设置」，也可从侧边栏打开设置页：</span>
-      <span lang="en"><span class="badge">In development</span> A planned <strong>Antigravity Bridge context</strong> item in the Provider row menu, also reachable from the sidebar:</span>
+      <span lang="zh-CN">右键 Providers 中的 Antigravity Bridge 行，选择「Antigravity Bridge 上下文设置」，或从侧边栏打开同名页面：</span>
+      <span lang="en">Right-click the Antigravity Bridge row in Providers and choose <strong>Antigravity Bridge context</strong>, or open it from the sidebar:</span>
     </p>
     <ol class="steps">
       <li><span lang="zh-CN">选择方案</span><span lang="en">Choose an option</span></li>
@@ -422,8 +422,8 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
       <li><span lang="zh-CN">可恢复默认</span><span lang="en">Restore the default</span></li>
     </ol>
     <p class="note">
-      <span lang="zh-CN">已有会话需重启 Magpie 并刷新模型目录才用新设置。现有补丁只为已知构建生成受校验的副本，官方安装从不修改；新版 agy 的长上下文效果未经验证。当前可用的 CLI：</span>
-      <span lang="en">Existing sessions need a Magpie restart and a model-catalog refresh. The patcher only builds verified copies of known builds and never modifies the official install; long context on newer agy builds is unverified. The CLI available today:</span>
+      <span lang="zh-CN">保存后重启 Magpie 或重新加载 Bridge 插件，再刷新模型目录；已有会话保持原模式。WSL 页面仅显示状态说明。现有补丁只为已知构建生成受校验的副本，官方安装从不修改；新版 agy 的长上下文效果未经验证。CLI 入口同样可用：</span>
+      <span lang="en">After saving, restart Magpie or reload Bridge, then refresh models; running sessions keep their mode. The WSL page explains the limitation without changing host state. The patcher only builds verified copies of known builds and never modifies the official install; long context on newer agy builds is unverified. The CLI remains available:</span>
     </p>
 <pre class="cli">agy-bridge context status
 agy-bridge context unlock     # Python 3.8+, patches only a copy

@@ -1,6 +1,6 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Connect to Antigravity via the official agy CLI with lean prompts and session reuse. Native Magpie accounts share model IDs and use the host account router; OpenCode supports account-prefixed models.",
   "type": "module",
   "main": "./index.mjs",
@@ -58,8 +58,8 @@
   "magpie": {
     "name": "Antigravity Bridge",
     "summary": {
-      "en": "Official agy CLI bridge with lean prompts and session reuse. Magpie lists each account separately with shared model IDs and native account routing. Add Google accounts, import profiles, or register saved Bridge accounts; existing logins are kept.",
-      "zh": "通过官方 agy CLI 接入，精简提示词并复用会话。Magpie 独立显示每个账号，共用模型 ID，支持原生账号切换与路由。可新增 Google 账号、导入配置或登记已保存的 Bridge 账号，保留已有登录。"
+      "en": "Official agy CLI bridge with lean prompts, session reuse and observable cache usage. Native Magpie accounts share model IDs and use account routing. Add or import Google accounts, keep existing logins, and manage optional context unlock from the Provider menu.",
+      "zh": "通过官方 agy CLI 接入，精简提示词、复用会话并展示缓存用量。多个原生账号共用模型 ID，支持账号切换与路由；新增或导入 Google 账号并保留已有登录。Provider 菜单提供可选上下文解锁与恢复默认。"
     },
     "icon": "https://raw.githubusercontent.com/yetone/magpie/v0.1.1356/internal/gui/assets/icons/antigravity-color.svg",
     "maxConcurrency": 16,
@@ -67,7 +67,7 @@
       "file": "ui/context-bootstrap.html",
       "title": "Antigravity Bridge context",
       "titles": {
-        "zh": "Antigravity Bridge 上下文"
+        "zh": "Antigravity Bridge 上下文设置"
       },
       "service": {
         "port": 47821,
@@ -80,7 +80,7 @@
         "menu": "provider",
         "title": "Antigravity Bridge context",
         "titles": {
-          "zh": "Antigravity Bridge 上下文"
+          "zh": "Antigravity Bridge 上下文设置"
         }
       }
     ]

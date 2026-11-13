@@ -747,12 +747,14 @@ agy has no native flag for a larger context window or for its 64K per-message
 clamp. The only known mechanism is a version- and architecture-bound machine-code
 patch, so it is an explicit, reversible opt-in and never runs automatically.
 
-**Magpie entry (in development).** A later version plans an **Antigravity Bridge
-context** item in the Provider row menu, with a settings page also reachable from
-the sidebar: choose and review an option, confirm, see the asynchronous result,
-or restore the default. Existing sessions use the new setting only after Magpie
-restarts and the model catalog is refreshed. It drives the same patch flow below,
-and the CLI commands remain available; check the UI of the version you install.
+**Magpie entry.** Right-click the Antigravity Bridge row in Providers and choose
+**Antigravity Bridge context**, or open the same page from the sidebar. Choose
+default or managed unlock, review and confirm, then follow the asynchronous result.
+Retry a failure or restore default from the same page. Restart Magpie or reload
+the Bridge plugin after saving, then refresh models. The page separates the saved
+choice, verification for the next start and the running process; existing sessions
+keep their mode. It drives the same patch flow below, and the CLI commands remain
+available. WSL mode explains the limitation and cannot modify the host's unlock state.
 
 The patcher only builds verified copies of known agy builds. It removes agy's
 256K checkpoint gate; the patched threshold is about 983K (983,040). That is a
@@ -819,6 +821,9 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
 | `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | total UTF-8 text budget per submission plus session instructions; does not override the separate 180,000-byte ACP ceiling (including image-label reserves); oversized replay tries compact tool records, then omits oldest complete exchanges; irreducible input returns `context_length_exceeded` (`prompt_budget_exceeded` for a summary in the final eight messages) |
 | `AGY_BRIDGE_CONTEXT_WINDOW` | 256000 | client context declaration, integer 1–1048576; GPT-OSS capped at 131072; requires separately verified upstream capacity |
+| `AGY_BRIDGE_MODEL_PROBE_WAIT_MS` | 10000 | cold discovery wait for ACP confirmation, concurrent with the CLI catalog; timeout keeps the full CLI catalog |
+| `AGY_BRIDGE_MODEL_CACHE_TTL_MS` | 60000 | freshness of a successful account-scoped ACP catalog, measured from completion; stale results remain available during background refresh |
+| `AGY_BRIDGE_MODEL_PROBE_RETRY_MS` | 15000 | minimum retry delay after an empty, failed or unsupported ACP probe; failures keep the last successful result |
 | `AGY_BRIDGE_EVENTS` | on | `0` disables content-free session, tool and model usage diagnostics; each event category is limited to 30 entries per minute |
 | `AGY_BRIDGE_TOOL_LIST_WAIT_MS` | 5000 | fail before prompt if the current client tool catalog is not confirmed within this budget |
 | `AGY_BRIDGE_IDE_CALL_DEADLINE_MS` | 150000 | when a running client tool is reported as still running (must stay below agy's 180 s) |

@@ -233,7 +233,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
       </p>
       <div class="cta">
         <a class="btn primary" href="#install"><span lang="zh-CN">开始安装</span><span lang="en">Install</span></a>
-        <a class="btn" href="../README.md" data-readme><span lang="zh-CN">阅读 README</span><span lang="en">Read the README</span></a>
+        <a class="btn" href="https://github.com/DylanLIiii/opencode-antigravity-bridge/blob/main/README.md" data-readme><span lang="zh-CN">阅读 README</span><span lang="en">Read the README</span></a>
       </div>
     </div>
     <div class="install" id="install">
@@ -454,7 +454,7 @@ agy-bridge context disable [--purge]</pre>
   <div class="wrap">
     <span lang="zh-CN">MIT 许可 · 本页是仓库中的单文件 <code>docs/index.html</code>，可直接用浏览器本地打开。</span>
     <span lang="en">MIT licensed · This page is the single file <code>docs/index.html</code> in the repository; open it locally in a browser.</span>
-    <span><a href="../README.md" data-readme>README</a> · <a href="../README.en.md">README (English)</a> · <a href="https://github.com/DylanLIiii/opencode-antigravity-bridge">GitHub</a></span>
+    <span><a href="https://github.com/DylanLIiii/opencode-antigravity-bridge/blob/main/README.md" data-readme>README</a> · <a href="https://github.com/DylanLIiii/opencode-antigravity-bridge/blob/main/README.en.md">README (English)</a> · <a href="https://github.com/DylanLIiii/opencode-antigravity-bridge">GitHub</a></span>
   </div>
 </footer>
 
@@ -485,7 +485,7 @@ agy-bridge context disable [--purge]</pre>
     root.setAttribute("lang", lang === "en" ? "en" : "zh-CN");
     document.title = lang === "en" ? "Antigravity Bridge · the official agy CLI in Magpie / OpenCode" : "Antigravity Bridge · 官方 agy CLI 接入 Magpie / OpenCode";
     document.querySelectorAll("[data-set-lang]").forEach(function(b){ b.setAttribute("aria-pressed", String(b.dataset.setLang === lang)); });
-    document.querySelectorAll("[data-readme]").forEach(function(a){ a.setAttribute("href", lang === "en" ? "../README.en.md" : "../README.md"); });
+    document.querySelectorAll("[data-readme]").forEach(function(a){ a.setAttribute("href", "https://github.com/DylanLIiii/opencode-antigravity-bridge/blob/main/" + (lang === "en" ? "README.en.md" : "README.md")); });
     try { localStorage.setItem("agyb-lang", lang); } catch (e) {}
     renderAccounts(); renderReq(); renderCache();
   }

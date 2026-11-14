@@ -112,3 +112,23 @@ test("whitespace after a terminal banner is not recovery", () => {
     assert.equal(run(chunks).text, chunks.join(""))
   }
 })
+
+test("issue 66 notices handle chunk boundaries, recovery and quoted text", () => {
+  const invalid = "⚠ Model produced invalid output."
+  const terminals = ["⚠ There was a network issue connecting to the server, please try again.", "⚠ Your AI credits balance is too low to continue."]
+  for (const notice of [invalid, ...terminals]) {
+    for (const text of [`\`${notice}\``, `quoted ${notice}\n`, `\`\`\`\n${notice}\n\`\`\`\n`]) {
+      for (const chunks of [[text], split(text)]) assert.equal(run(chunks).text, text)
+    }
+    for (const suffix of ["", "\n"]) for (const chunks of [[notice + suffix], split(notice + suffix)]) {
+      const f = new AgentNoticeFilter()
+      let output = ""
+      for (const chunk of chunks) output += f.push(chunk)
+      output += f.flush({ holdTerminal: true })
+      assert.equal(output, "")
+      assert.equal(f.failureCandidate, true)
+      if (notice !== invalid) assert.equal(f.terminalDetail, notice)
+    }
+    assert.equal(run([notice + "\n", "Recovered."]).failureCandidate, false)
+  }
+})

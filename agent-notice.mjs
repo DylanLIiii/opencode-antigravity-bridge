@@ -10,6 +10,10 @@
 // a terminal banner is held until the caller checks the outcome.
 
 const ERROR_LINE = "⚠ Agent execution terminated due to error."
+const NETWORK_LINE = "⚠ There was a network issue connecting to the server, please try again."
+const CREDITS_LINE = "⚠ Your AI credits balance is too low to continue."
+const INVALID_LINE = "⚠ Model produced invalid output."
+const NEW_TERMINALS = [NETWORK_LINE, CREDITS_LINE]
 const INTERRUPT_LINE = "⚠ The stream was interrupted. Please continue the task you were working on."
 const API_HEAD = "⚠ API error (attempt "
 const API_FULL = /^⚠ API error \(attempt \d+\): /
@@ -25,6 +29,8 @@ export class AgentNoticeFilter {
     this.terminal = ""
     this.failureCandidate = false
     this.dropped = 0
+    this.terminalDetail = ""
+    this.apiDetail = ""
   }
 
   #classify(line, complete) {
@@ -35,13 +41,15 @@ export class AgentNoticeFilter {
     if (!complete && (ERROR_LINE.startsWith(line) ||
       (line.length <= ERROR_LINE.length + 16 && line.trimEnd() === ERROR_LINE))) return "hold"
     if (this.fence) return "emit"
+    if (complete && NEW_TERMINALS.some(value => line.trimEnd() === value)) return "new-error"
+    if (!complete && NEW_TERMINALS.some(value => value.startsWith(line) || line.trimEnd() === value)) return "hold"
     if (line.startsWith("⚠") || "⚠".startsWith(line)) {
-      if (complete ? line.trimEnd() === INTERRUPT_LINE : false) return "notice"
+      if (complete ? [INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) : false) return "notice"
       if (API_FULL.test(line)) return "api"
       if (!complete) {
-        if (ERROR_LINE.startsWith(line) || INTERRUPT_LINE.startsWith(line) || API_HEAD.startsWith(line)) return "hold"
+        if (ERROR_LINE.startsWith(line) || INTERRUPT_LINE.startsWith(line) || INVALID_LINE.startsWith(line) || API_HEAD.startsWith(line)) return "hold"
         if (line.startsWith(API_HEAD) && line.length <= API_HEAD.length + 16 && API_PARTIAL.test(line.slice(API_HEAD.length))) return "hold"
-        if (line.length <= INTERRUPT_LINE.length + 16 && (line.trimEnd() === ERROR_LINE || line.trimEnd() === INTERRUPT_LINE)) return "hold"
+        if (line.length <= INTERRUPT_LINE.length + 16 && (line.trimEnd() === ERROR_LINE || line.trimEnd() === INTERRUPT_LINE || line.trimEnd() === INVALID_LINE)) return "hold"
       }
     } else if (!complete && /^ {0,3}(?:`{1,2}|~{1,2})$/.test(line)) return "hold"
     return "emit"
@@ -54,6 +62,7 @@ export class AgentNoticeFilter {
     if (this.terminal && rest) { out = this.isDiagnostic() ? "" : this.terminal; this.terminal = ""; this.failureCandidate = !rest.trim() }
     while (rest) {
       if (this.dropLine || this.midLine) {
+        if (this.dropLine && this.apiDetail) this.apiDetail = (this.apiDetail + rest.split("\n", 1)[0]).slice(0, 2000)
         if (!this.dropLine && rest.trim()) this.failureCandidate = false
         const end = rest.indexOf("\n")
         if (end < 0) return out + (this.dropLine ? "" : rest)
@@ -72,7 +81,8 @@ export class AgentNoticeFilter {
         this.pending = rest
         return out
       }
-      if (kind === "error") {
+      if (kind === "error" || kind === "new-error") {
+        if (kind === "new-error") this.terminalDetail = line.trimEnd()
         this.terminal = lead + line + "\n"
         this.failureCandidate = true
         rest = body.slice(end + 1)
@@ -80,6 +90,7 @@ export class AgentNoticeFilter {
         return out
       }
       if (kind === "notice" || kind === "api") {
+        if (kind === "api") this.apiDetail = line.slice(0, 2000)
         this.dropped++
         this.failureCandidate = true
         if (end < 0) { this.dropLine = true; return out }
@@ -88,7 +99,7 @@ export class AgentNoticeFilter {
       }
       if (kind === "fence") this.fence = !this.fence
       out += lead + line
-      if (line.trim()) this.failureCandidate = false
+      if (line.trim()) { this.failureCandidate = false; this.terminalDetail = ""; this.apiDetail = "" }
       if (end < 0) {
         this.midLine = line.length > 0
         return out
@@ -113,7 +124,9 @@ export class AgentNoticeFilter {
     const line = rest[0] === "\n" ? rest.slice(1) : rest
     if (line.trimEnd() === ERROR_LINE) { this.failureCandidate = true; this.terminal += rest; return holdTerminal ? "" : this.flush() }
     if (!this.fence) {
-      if (line.trimEnd() === INTERRUPT_LINE || API_FULL.test(line)) { this.dropped++; this.failureCandidate = true; return "" }
+      if (NEW_TERMINALS.includes(line.trimEnd())) { this.failureCandidate = true; this.terminalDetail = line.trimEnd(); this.terminal += rest; return holdTerminal ? "" : this.flush() }
+      if (API_FULL.test(line)) this.apiDetail = line.slice(0, 2000)
+      if ([INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) || API_FULL.test(line)) { this.dropped++; this.failureCandidate = true; return "" }
     }
     this.midLine = !rest.endsWith("\n")
     return rest

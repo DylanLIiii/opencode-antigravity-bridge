@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.6
+
+- Recognize agy network and depleted AI credits failures, and suppress invalid-output retry notices while preserving quoted text.
+- Add a project Coding Hub with OpenCode routing, isolated delegation, and repository-specific validation rules.
+
 ## 0.8.5
 
 - Allow once for permission requests identifying advertised client MCP tools, while continuing to reject agy's built-in tools. This addresses tool calls stopped by agy 1.5.8 permission checks (#63).

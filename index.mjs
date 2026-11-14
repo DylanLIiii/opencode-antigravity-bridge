@@ -1753,7 +1753,8 @@ class Proc {
         // clears the candidate, even when an earlier retry logged an error.
         turn.flushText(true)
         if (turn.notices.failureCandidate) {
-          const detail = await lastAgentError(this.logPath, turn.logOffset)
+          const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
+          const detail = turn.notices.terminalDetail?.includes("credits balance") ? turn.notices.terminalDetail : (loggedDetail || turn.notices.terminalDetail || turn.notices.apiDetail)
           if (detail || result?.stopReason === "refusal") {
             turn.agentError = true
             throw this.#formatAgentError(detail, turn.promptGuardMatched)
@@ -2394,7 +2395,7 @@ function lastAgentErrorSync(file, offset) {
     const start = Math.max(offset || 0, size - LOG_TAIL_BYTES)
     const buffer = Buffer.alloc(Math.max(0, size - start))
     fs.readSync(fd, buffer, 0, buffer.length, start)
-    return /\] (?:agent executor error|failed to construct executor): .+/.test(buffer.toString("utf8"))
+    return !!extractAgentError(buffer.toString("utf8"))
   } catch { return false } finally { if (fd !== undefined) fs.closeSync(fd) }
 }
 
@@ -2415,10 +2416,14 @@ async function lastAgentError(file, offset) {
   } catch {
     return ""
   }
+  return extractAgentError(text)
+}
+
+function extractAgentError(text) {
   let found = ""
   for (const line of text.split("\n")) {
-    const match = /\] (?:agent executor error|failed to construct executor): (.+)$/.exec(line)
-    if (match) found = match[1]
+    const match = /\] (?:agent executor error|failed to construct executor): (.+)$|\] (inference connection failed.*|(?:Run|CallWithRetry): attempt \d+ failed.*)$/.exec(line)
+    if (match) found = match[1] || match[2]
   }
   if (!found) return ""
   const cut = found.lastIndexOf("generating and executing: ")

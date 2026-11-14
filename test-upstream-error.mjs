@@ -272,3 +272,7 @@ test("UNAUTHENTICATED / HTTP 401 is classified separately from 403 and never ret
   }
   assert.equal(classifyUpstreamError("PERMISSION_DENIED (code 403)").category, "forbidden")
 })
+
+test("depleted AI credits are classified as exhausted quota", () => {
+  assert.equal(classifyUpstreamError("⚠ Your AI credits balance is too low to continue.").category, "quota_exhausted")
+})

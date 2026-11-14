@@ -655,9 +655,10 @@ function validatePromptBudget(parts, instructions = "", body = null) {
   // Hosts such as Claude Code answer "prompt is too long" by compacting again.
   // Immediately re-compacting the same summary can loop. Once new history has
   // accumulated, however, the client must be allowed to compact again.
-  if (hasRecentCompactionSummary(body)) {
+  const compacting = openCodeCompactionStart(body?.messages) >= 0
+  if (compacting || hasRecentCompactionSummary(body)) {
     throw new ConflictError(
-      `agy bridge: the compacted conversation is still ${textBytes} UTF-8 text bytes, above the bridge budget of ${limit}. ` +
+      `agy bridge: the ${compacting ? "compaction request requires" : "compacted conversation is still"} ${textBytes} UTF-8 text bytes, above the bridge budget of ${limit}. ` +
       "Raise AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES or start a new conversation. " +
       "No model prompt or tool result from this request was sent.",
       "prompt_budget_exceeded",
@@ -675,9 +676,10 @@ function validatePromptBudget(parts, instructions = "", body = null) {
 function validateAcpPromptBudget(parts, instructions = "", body = null) {
   const bytes = acpPromptTextBytes(parts)
   if (bytes > acpPromptTextLimit()) {
-    const compacted = hasRecentCompactionSummary(body)
+    const compacting = openCodeCompactionStart(body?.messages) >= 0
+    const compacted = compacting || hasRecentCompactionSummary(body)
     throw new ConflictError(
-      (compacted ? "agy bridge: the compacted conversation" : "prompt is too long: agy bridge") +
+      (compacting ? "agy bridge: the compaction request" : compacted ? "agy bridge: the compacted conversation" : "prompt is too long: agy bridge") +
       ` would submit ${bytes} UTF-8 user-input bytes including image-label reserves (safe limit ${acpPromptTextLimit()}). ` +
       "AGY can silently truncate a larger user turn, losing the latest instruction. " +
       (compacted ? "Shorten the summary or current instruction, or start a new conversation. "

@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
+import { v2 as compactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
 
 // Exercise the public provider and its real Proc/AcpConnection with a subprocess.
 // The fake has no network, credentials, context unlock or MCP dependencies.
@@ -123,8 +124,6 @@ test.after(async () => {
   setTimeout(() => process.exit(process.exitCode || 0), 30)
 })
 
-const compactionPrompt = "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work.\n" +
-  "<template>\n## Objective\n## Next Move\n</template>\nDo not continue the task or call tools."
 const largeHistory = "ISSUE65-HISTORY-START\n" + "😀历史".repeat(40000) + "\nLATEST-INSTRUCTION: preserve this entire request."
 const summaryMessages = (kind = "flattened") => kind === "flattened"
   ? [{ role: "user", content: largeHistory }, { role: "user", content: compactionPrompt }]
@@ -201,15 +200,34 @@ for (const mode of ["compaction-failure", "compaction-refusal"]) {
 test("ordinary oversized requests and over-budget compactions reject before session creation", async () => {
   process.env.COMPAT_MODE = "response-first"
   const client = await loader()
-  for (const messages of [
-    [{ role: "user", content: largeHistory }],
-    [{ role: "user", content: "x".repeat(1100000) }, { role: "user", content: compactionPrompt }],
+  for (const [messages, compacting] of [
+    [[{ role: "user", content: largeHistory }], false],
+    [[{ role: "user", content: "x".repeat(1100000) }, { role: "user", content: compactionPrompt }], true],
   ]) {
     const before = logs().length
     const response = await request(client, messages)
-    assert.equal(response.status, 400, await response.text())
+    const payload = await response.json()
+    assert.equal(response.status, 400, JSON.stringify(payload))
+    assert.equal(payload.error.code, compacting ? "prompt_budget_exceeded" : "context_length_exceeded")
+    assert.equal(/prompt is too long/i.test(payload.error.message), !compacting)
+    assert.equal(response.headers.get("x-should-retry"), "false")
     assert.ok(!logs().slice(before).some(event => event.kind === "prompt" || event.method === "session/new"))
   }
+})
+
+test("a customized compaction-looking prompt keeps the ordinary request and instruction semantics", async () => {
+  process.env.COMPAT_MODE = "response-first"
+  const client = await loader()
+  const before = logs().length
+  const latest = compactionPrompt + "\n\nActually continue the work and use tools."
+  const response = await request(client, [{ role: "user", content: "history" }, { role: "user", content: latest }],
+    { system: "Keep the user's instructions." })
+  assert.equal(response.status, 200, await response.text())
+  const sent = logs().slice(before).filter(event => event.kind === "prompt")
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].append, /Keep the user's instructions/)
+  assert.ok(!sent[0].append.includes("You are summarizing an existing conversation"))
+  assert.ok(sent[0].prompt.some(part => part.text?.includes(latest)))
 })
 
 test("cancelling an ingestion prompt prevents remaining fragments from being submitted", async () => {

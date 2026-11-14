@@ -3,6 +3,7 @@
 ## 0.8.8
 
 - Recover oversized stock OpenCode compaction requests by sending ordered, UTF-8-safe history fragments within agy's per-prompt limit, then returning only the final summary (#65). Use a temporary tool-free session so pending tools keep their original owner; prevalidate the full bounded plan, suppress ingestion acknowledgements, and stop on cancellation or upstream failure. Ordinary oversized input is still rejected without truncation. Multi-fragment compaction uses additional model calls and remains subject to the configured total text budget and model context window.
+- Match complete verified stock prompts so added or customized instructions retain ordinary execution. Compaction budget failures return terminal `prompt_budget_exceeded` errors without requesting another compaction.
 
 ## 0.8.7
 

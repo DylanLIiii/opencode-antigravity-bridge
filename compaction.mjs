@@ -1,8 +1,16 @@
-// OpenCode's stock compaction prompts (v1.2.0 and v2.2.7). Match the final
-// instruction, never a quoted marker inside ordinary history or tool results.
-const V1 = "Provide a detailed prompt for continuing our conversation above."
-const V2 = "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work."
-const UPDATE = "Update the existing checkpoint in the conversation above into one consolidated summary."
+import { createHash } from "node:crypto"
+
+// Exact stock prompts, frozen in test/fixtures/opencode-compaction-prompts.mjs:
+// OpenCode v1.2.0 defaultPrompt and v2.2.7 buildPrompt(false), (true), (true,true).
+// A prefix match can override a later user instruction, so accept only the full
+// verified text (apart from transport CRLF and outer whitespace). Customized or
+// future prompts keep the ordinary request path until explicitly supported.
+const STOCK_PROMPTS = new Set([
+  "34ea7e10c83556231782fcf33999582681dc397cb9d49e83ba2ac4d52477001d",
+  "9816134b00ca0aea915930daa68289403ab951c8c7334d3ff01fc4818b32135e",
+  "7432c94c498ce37a5a0c049393d04e8fbf9a6ae4e1f321c0d842a217efbe1684",
+  "6c4096c2b2cf8dbce360bf0248054337ef1f1dc21b4633d247c56e1bcaa24e81",
+])
 const NUDGE = "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template."
 
 function textOnly(message) {
@@ -25,10 +33,7 @@ export function openCodeCompactionStart(messages) {
   const tail = last >= 0 && message.content[last]?.type === "text" ? message.content[last].text : null
   const text = typeof tail === "string" ? tail.trim() : textOnly(message)
   if ((index < 1 && last < 1) || !text) return -1
-  const v1 = text.startsWith(V1) && text.includes("The summary that you construct will be used so that another agent can read it and continue the work.")
-  const v2 = (text.startsWith(V2) || text.startsWith(UPDATE)) && text.includes("<template>") &&
-    text.includes("Do not continue the task or call tools.")
-  return v1 || v2 ? index : -1
+  return STOCK_PROMPTS.has(createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex")) ? index : -1
 }
 
 export const COMPACTION_INSTRUCTIONS = "You are summarizing an existing conversation for continuation. " +

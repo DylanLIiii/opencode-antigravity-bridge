@@ -1,6 +1,7 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { v1 as openCodeCompactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
 
 const here = path.dirname(new URL(import.meta.url).pathname)
 const suffix = `-${process.pid}`
@@ -1700,9 +1701,7 @@ for (const [summaryTool, withNotice] of [[false, false], [true, false], [false, 
   const owner = inits().at(-1)
   const result = "ISSUE65-RESULT-START\n" + "data".repeat(80000) + "\nISSUE65-RESULT-END"
   const continued = continuation(first, pending, result)
-  const summary = { ...continued, messages: [...continued.messages, { role: "user", content:
-    "Provide a detailed prompt for continuing our conversation above.\n" +
-    "The summary that you construct will be used so that another agent can read it and continue the work." }] }
+  const summary = { ...continued, messages: [...continued.messages, { role: "user", content: openCodeCompactionPrompt }] }
   const before = inits().length
   const response = await callFetch(summary)
   const events = (await readSSE(response)).events

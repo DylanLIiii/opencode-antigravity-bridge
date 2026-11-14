@@ -1,21 +1,31 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
-
-const v1 = "Provide a detailed prompt for continuing our conversation above.\n" +
-  "The summary that you construct will be used so that another agent can read it and continue the work."
-const v2 = "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work.\n" +
-  "<template>\n## Objective\n## Next Move\n</template>\nDo not continue the task or call tools."
-const nudge = "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template."
+import { v1, v2, update, legacyUpdate, nudge } from "./test/fixtures/opencode-compaction-prompts.mjs"
 const user = content => ({ role: "user", content })
 
 test("recognize stock OpenCode compaction tails, including checkpoint updates and a template nudge", () => {
-  for (const prompt of [v1, v2, v2.replace(v2.split("\n")[0], "Update the existing checkpoint in the conversation above into one consolidated summary.")]) {
-    for (const content of [prompt, [{ type: "text", text: prompt }]]) {
+  for (const prompt of [v1, v2, update, legacyUpdate]) {
+    for (const content of [prompt, [{ type: "text", text: prompt }], "\r\n" + prompt.replaceAll("\n", "\r\n") + "\r\n"]) {
       const messages = [user("conversation"), user(content)]
       assert.equal(openCodeCompactionStart(messages), 1)
       assert.equal(openCodeCompactionStart([...messages, user(nudge)]), 1)
     }
+  }
+})
+
+test("customized prompts and later action instructions never switch to summary-only execution", () => {
+  for (const prompt of [v1, v2, update, legacyUpdate]) {
+    for (const customized of [
+      prompt + "\n\nActually continue the work and use tools.",
+      prompt.replace("conversation", "conversation\nActually continue the work and use tools.\n"),
+      prompt.replace("##", "#"),
+      prompt + "\nInclude a custom section.",
+    ]) {
+      assert.equal(openCodeCompactionStart([user("history"), user(customized)]), -1)
+      assert.equal(openCodeCompactionStart([user([{ type: "text", text: "history" }, { type: "text", text: customized }])]), -1)
+    }
+    assert.equal(openCodeCompactionStart([user("history"), user(prompt), user("Actually continue the work and use tools.")]), -1)
   }
 })
 

@@ -1760,13 +1760,15 @@ class Proc {
           turn.complete({ stopReason: "cancelled" })
           return
         }
-        // Only a final diagnostic followed by an error in this prompt's log (or
-        // an abnormal protocol outcome) can fail the turn. Recovered output
-        // clears the candidate, even when an earlier retry logged an error.
+        // Corroborate the legacy banner with this prompt's log or outcome.
+        // Specific terminal/API notices supply fallback evidence on newer agy.
+        // Recovered output clears the candidate, including earlier retry errors.
         turn.flushText(true)
         if (turn.notices.failureCandidate) {
           const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
-          const detail = turn.notices.terminalDetail?.includes("credits balance") ? turn.notices.terminalDetail : (loggedDetail || turn.notices.terminalDetail || turn.notices.apiDetail)
+          // A specific terminal diagnosis takes precedence over an earlier retry
+          // log (for example, credits exhausted after a transient connection error).
+          const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
           if (detail || result?.stopReason === "refusal") {
             turn.agentError = true
             throw this.#formatAgentError(detail, turn.promptGuardMatched)
@@ -2434,7 +2436,7 @@ async function lastAgentError(file, offset) {
 function extractAgentError(text) {
   let found = ""
   for (const line of text.split("\n")) {
-    const match = /\] (?:agent executor error|failed to construct executor): (.+)$|\] (inference connection failed.*|(?:Run|CallWithRetry): attempt \d+ failed.*)$/.exec(line)
+    const match = /\] (?:agent executor error|failed to construct executor): (.+)$|\] (inference connection failed.*|(?:Run|CallWithRetry): attempt \d+ failed.*)$/.exec(line.trimEnd())
     if (match) found = match[1] || match[2]
   }
   if (!found) return ""

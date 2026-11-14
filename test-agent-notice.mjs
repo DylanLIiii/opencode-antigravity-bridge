@@ -120,15 +120,59 @@ test("issue 66 notices handle chunk boundaries, recovery and quoted text", () =>
     for (const text of [`\`${notice}\``, `quoted ${notice}\n`, `\`\`\`\n${notice}\n\`\`\`\n`]) {
       for (const chunks of [[text], split(text)]) assert.equal(run(chunks).text, text)
     }
-    for (const suffix of ["", "\n"]) for (const chunks of [[notice + suffix], split(notice + suffix)]) {
+    for (const suffix of ["", "\n", "\r\n", "\n\n", "\r\n \t\r\n"]) for (const chunks of [[notice + suffix], split(notice + suffix)]) {
       const f = new AgentNoticeFilter()
       let output = ""
       for (const chunk of chunks) output += f.push(chunk)
       output += f.flush({ holdTerminal: true })
-      assert.equal(output, "")
+      assert.equal(output.trim(), "")
       assert.equal(f.failureCandidate, true)
       if (notice !== invalid) assert.equal(f.terminalDetail, notice)
     }
-    assert.equal(run([notice + "\n", "Recovered."]).failureCandidate, false)
+    const recovered = run([notice + "\n", "Recovered."])
+    assert.equal(recovered.failureCandidate, false)
+    assert.equal(recovered.text, "Recovered.")
   }
+})
+
+test("terminal and API evidence survives notice chains but clears on any recovered output", () => {
+  const credits = "⚠ Your AI credits balance is too low to continue."
+  const network = "⚠ There was a network issue connecting to the server, please try again."
+  const api = "⚠ API error (attempt 4): RESOURCE_EXHAUSTED: quota exhausted"
+  for (const terminal of [credits, network]) {
+    const text = `${api}\r\n${terminal}\r\n\r\n`
+    // Every possible split, including inside CRLF and the API detail.
+    for (let i = 0; i <= text.length; i++) {
+      const f = new AgentNoticeFilter()
+      assert.equal((f.push(text.slice(0, i)) + f.push(text.slice(i)) + f.flush({ holdTerminal: true })).trim(), "")
+      assert.equal(f.failureCandidate, true)
+      assert.equal(f.terminalDetail, terminal)
+      assert.equal(f.apiDetail.trimEnd(), api)
+      assert.equal(f.push("Answer") + f.flush(), "Answer")
+      assert.equal(f.failureCandidate, false)
+      assert.equal(f.terminalDetail, "")
+      assert.equal(f.apiDetail, "")
+    }
+  }
+  const f = new AgentNoticeFilter()
+  f.push(api + "\n")
+  f.push("⚠ Model produced invalid output.")
+  f.push("\n")
+  f.flush({ holdTerminal: true })
+  assert.equal(f.apiDetail, api)
+  // A look-alike held until flush is ordinary recovered model output.
+  assert.equal(f.push("⚠ Model produced") + f.flush(), "⚠ Model produced")
+  assert.equal(f.failureCandidate, false)
+  assert.equal(f.apiDetail, "")
+})
+
+test("API detail buffering is bounded independently of split sizes", () => {
+  const f = new AgentNoticeFilter()
+  f.push("⚠ API error (attempt 2): ")
+  f.push("x".repeat(10_000))
+  f.push("y".repeat(10_000) + "\n")
+  assert.equal(f.apiDetail.length, 2000)
+  f.flush({ holdTerminal: true })
+  assert.equal(f.pending, "")
+  assert.equal(f.failureCandidate, true)
 })

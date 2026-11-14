@@ -1018,3 +1018,20 @@ test("issue49 error evidence excludes stale log entries", async () => {
   assert.match(await lastAgentError(file, offset), /current failure/)
   assert.equal(lastAgentErrorSync(file, offset), true)
 })
+
+test("issue66 connection and retry logs supply only current-prompt error evidence", async () => {
+  const file = path.join(workspace, "issue66-agent.log")
+  for (const detail of [
+    "inference connection failed (non-retryable): QUOTA_EXHAUSTED",
+    "Run: attempt 2 failed (connection reset), retrying in 1s",
+    "CallWithRetry: attempt 3 failed (EOF), retrying in 2s",
+  ]) {
+    fs.writeFileSync(file, "E] " + detail + "\n")
+    const offset = fs.statSync(file).size
+    assert.equal(await lastAgentError(file, offset), "")
+    assert.equal(lastAgentErrorSync(file, offset), false)
+    fs.appendFileSync(file, "E] " + detail + "\r\n")
+    assert.equal(await lastAgentError(file, offset), detail)
+    assert.equal(lastAgentErrorSync(file, offset), true)
+  }
+})

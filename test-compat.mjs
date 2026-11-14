@@ -840,6 +840,27 @@ test("strict historical server results retain failures encoded inside their cont
   assert.ok(!text.includes("max_uses_exceeded") && !text.includes("url_not_allowed"))
 }))
 
+test("compaction request with a pending question is framed as summary-only", () => {
+  const history = [
+    { role: "user", content: "Remember the codename HERON-7." },
+    { role: "assistant", content: "Noted: HERON-7." },
+  ]
+  const compact = promptText(renderInitialPromptParts({ messages: [...history,
+    { role: "user", content: "What is 17 times 23?\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests." },
+  ] }, null, true))
+  assert.ok(!compact.includes("Answer the current turn"))
+  assert.match(compact, /<\/conversation_history>\nSummarize this conversation as the current turn asks;/)
+  assert.match(compact, /<\/current_turn>\n\[This turn is a context-compaction request\./)
+  assert.ok(compact.includes("What is 17 times 23?"))
+
+  const normal = promptText(renderInitialPromptParts({ messages: [...history,
+    { role: "user", content: "What is 17 times 23?" },
+  ] }, null, true))
+  assert.match(normal, /<\/conversation_history>\nAnswer the current turn;/)
+  assert.ok(!normal.includes("context-compaction request"))
+  assert.ok(normal.endsWith("</current_turn>"))
+})
+
 test("state lock recovers a stale lock only after its owning process has exited", () => {
   const file = path.join(workspace, "dead-owner-state.json")
   fs.writeFileSync(file + ".lock", JSON.stringify({ pid: 2147483647 }))

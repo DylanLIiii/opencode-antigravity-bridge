@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.6
+
+- Frame Claude Code compaction requests as summary-only. When the client appends its compaction instruction to a still-unanswered prompt, the history footer and a closing reminder now ask for the summary and record the question as pending work, instead of "Answer the current turn", whose answer would be lost in the discarded compaction reply.
+
 ## 0.8.5
 
 - Allow once for permission requests identifying advertised client MCP tools, while continuing to reject agy's built-in tools. This addresses tool calls stopped by agy 1.5.8 permission checks (#63).

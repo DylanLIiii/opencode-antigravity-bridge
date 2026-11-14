@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.8
+
+- Recover oversized stock OpenCode compaction requests by sending ordered, UTF-8-safe history fragments within agy's per-prompt limit, then returning only the final summary (#65). Use a temporary tool-free session so pending tools keep their original owner; prevalidate the full bounded plan, suppress ingestion acknowledgements, and stop on cancellation or upstream failure. Ordinary oversized input is still rejected without truncation. Multi-fragment compaction uses additional model calls and remains subject to the configured total text budget and model context window.
+
 ## 0.8.7
 
 - Recognize agy network and depleted AI credits failures, retain API/retry-log error evidence, and suppress invalid-output retry notices while preserving quoted text and recovered replies (#66).

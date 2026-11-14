@@ -23,6 +23,7 @@ import { AgentNoticeFilter } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 import { outgoing, hint, turnsAway } from "./cloak.mjs"
+import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -87,7 +88,7 @@ const COMPACTION_SUMMARY_MARKER = "This session is being continued from a previo
 const COMPACTION_REQUEST_MARKER = "Your task is to create a detailed summary of the conversation so far"
 const COMPACTION_REQUEST_REMINDER = "[This turn is a context-compaction request. A question or request at the start of the current turn " +
   "is the newest message of the conversation: record it in the summary as pending work; do not answer it or carry it out. " +
-  "Reply only with the analysis and summary the compaction instructions ask for.]"
+  "Reply only in the format the compaction instructions ask for.]"
 // Client compaction policy. Raising this declaration requires a separately
 // verified upstream window and does not alter agy's checkpoint configuration.
 const DEFAULT_CONTEXT_WINDOW = 256_000
@@ -1047,6 +1048,9 @@ class Turn {
 
   push(event) {
     if (this.finalized) return
+    // Ingestion acknowledgements/thoughts are internal to one compaction HTTP
+    // response. Error notices still pass through the filters before this point.
+    if (this.hiddenCompactionOutput && ["text", "thinking"].includes(event.type)) return
     const waiter = this.waiters.shift()
     if (waiter) waiter.resolve(event)
     else this.events.push(event)
@@ -1233,6 +1237,7 @@ class Proc {
     this.instructions = opts.instructions || ""
     this.resumeFrom = opts.resume || null
     this.validateReplay = opts.validateReplay
+    this.compaction = opts.compaction === true
     this.replayReason = opts.replayReason || "no_matching_session"
     this.token = randomUUID()
     this.sessionId = null
@@ -1636,7 +1641,7 @@ class Proc {
     }
   }
 
-  startTurn(content, messages, model, selection, promptAttempt = null, promptGuardMatched = false) {
+  startTurn(content, messages, model, selection, promptAttempt = null, promptGuardMatched = false, compactionStages = []) {
     if (this.dead) throw this.deadError
     if (this.retiring) throw new BusyError("agy bridge: this conversation's process is being retired")
     if (this.turn) throw new BusyError("agy bridge: this conversation still has an unfinished response")
@@ -1648,6 +1653,8 @@ class Proc {
       prompt_text_bytes: textBytes, prompt_parts: content.length,
     })
     const turn = new Turn(this, messages)
+    turn.compactionStages = compactionStages.slice()
+    turn.hiddenCompactionOutput = compactionStages.length > 0
     turn.promptAttempt = promptAttempt
     turn.promptGuardMatched = promptGuardMatched
     this.turn = turn
@@ -1787,8 +1794,22 @@ class Proc {
         if (result?.stopReason === "refusal") {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
           if (detail) throw this.#formatAgentError(detail, turn.promptGuardMatched)
+          if (this.compaction) throw new AgentTurnError("agy bridge: upstream refused the compaction request; no summary was produced")
         }
         turn.flushText()
+        if (turn.compactionStages.length) {
+          // Never advance past a failed/cancelled/incomplete ingestion prompt.
+          // All fragments were prevalidated before the first one was submitted.
+          if (result?.stopReason !== "end_turn") {
+            throw new AgentTurnError("agy bridge: compaction history ingestion did not finish; no summary was produced")
+          }
+          promptParts = turn.compactionStages.shift()
+          turn.hiddenCompactionOutput = turn.compactionStages.length > 0
+          turn.notices = new AgentNoticeFilter(() => !!lastAgentErrorSync(this.logPath, turn.logOffset))
+          turn.outputLimit = new OutputLimitFilter()
+          lateCalls = null
+          continue
+        }
         // agy ended the turn without waiting for a long-running client tool:
         // deliver its real result in a follow-up prompt of the same response.
         const late = turn.calls.filter((call) => call.deferred && !call.lateDelivered)
@@ -2241,7 +2262,10 @@ class Proc {
     }
     if (this.turn === turn) {
       this.turn = null
-      if (!this.stopping && !this.retiring) park(this)
+      if (this.compaction) {
+        dropFromPool(this)
+        this.stop().catch(() => {})
+      } else if (!this.stopping && !this.retiring) park(this)
     }
   }
 
@@ -4065,14 +4089,15 @@ function renderTurnMessagesParts(messages) {
   return toPromptParts(out)
 }
 
-// agy's ACP server cuts a prompt at 128 KiB and appends "<truncated N bytes>",
-// which would drop </conversation_history> and the whole <current_turn> of a
-// long replay. Keep the initial prompt's text under this budget instead.
+// agy's per-user-input clamp can drop the current turn from a long replay.
+// Render complete parts; budget validation or explicit compaction staging owns
+// the transport limit rather than truncating this text.
 function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, stripResults = false, replay = null) {
-  const { history: originalHistory, messages: current } = trailingMessages(body)
+  const { history: originalHistory, messages: originalCurrent } = trailingMessages(body)
+  const current = replay?.current ?? originalCurrent
   const history = replay?.history ?? originalHistory
   const out = []
-  const compacting = isCompactionRequest(current)
+  const compacting = replay?.compacting || isCompactionRequest(current)
   if (!instructionsInSession) {
     const system = systemText(body)
     if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${outgoingSystemText(system)}\n</external_system_instructions>\n`)
@@ -4719,7 +4744,7 @@ function responseUsage(proc, turn, step, content, result) {
   const final = result !== undefined
   const translated = final ? translateUsage(result?.usage) : null
   const single = final && result?.stopReason !== "cancelled" && !turn.calls.length &&
-    !turn.toolResponseCount && !turn.hasLatePrompt && turn.promptCount <= 1 && turn.responseSteps.length === 1
+    !turn.toolResponseCount && ((!turn.hasLatePrompt && turn.promptCount <= 1) || proc.compaction) && turn.responseSteps.length === 1
   step.usageKind = single && translated ? "exact" : "bounded_step_estimate"
   if (single && translated) return translated
 
@@ -5602,6 +5627,48 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             let promptAttempt = null
 
             try {
+              const compactionStart = openCodeCompactionStart(body.messages)
+              if (compactionStart >= 0) {
+                // Compaction is a read-only snapshot, including pending tool
+                // results. It must not attach to or cancel their live owner.
+                const full = renderInitialPromptParts(body, callerWorkDir, false, false, {
+                  history: body.messages.slice(0, compactionStart),
+                  current: body.messages.slice(compactionStart), compacting: true,
+                })
+                validatePromptBudget(full, COMPACTION_INSTRUCTIONS, body)
+                const prefix = { type: "text", text: COMPACTION_INSTRUCTIONS + "\n\n" }
+                // Reserve for the older, no-system-append handshake too. Both
+                // modes must admit the full plan before any content is sent.
+                const prompts = compactionPrompts(full, acpPromptTextLimit() - promptTextBytes([prefix]))
+                // Include wrapper overhead in the total budget; reject the
+                // entire plan before startup if any fragment cannot fit.
+                validatePromptBudget(prompts.flatMap(prompt => [prefix, ...prompt]), "", body)
+                for (const prompt of prompts) validateAcpPromptBudget(prompt, COMPACTION_INSTRUCTIONS, body)
+                const key = `${convKey}:compaction`
+                promptAttempt = claimPromptAttempt(promptAttemptKey(key, body, trailing, model, selection, [], COMPACTION_INSTRUCTIONS))
+                const { proc } = await acquireProc(agy, key, {
+                  model, selection, tools: [], workDir, instructions: COMPACTION_INSTRUCTIONS,
+                  history: [], messages: body.messages, compaction: true,
+                  account: account.name, accountKey: account.key, geminiDir: account.dir,
+                  userId: body.metadata?.user_id || "",
+                }, true, true)
+                try {
+                  if (init.signal?.aborted) throw init.signal.reason || new Error("request aborted before compaction")
+                  // Older ACP servers without session append need the same
+                  // summary-only instructions in each user prompt.
+                  const prepared = proc.instructionsInSession ? prompts : prompts.map(prompt => [
+                    prefix, ...prompt,
+                  ])
+                  for (const prompt of prepared) validateAcpPromptBudget(prompt, "", body)
+                  const turn = proc.startTurn(prepared[0], body.messages, model, selection, promptAttempt,
+                    promptGuardMatched, prepared.slice(1))
+                  return streamResponse(proc, turn, body, init.signal)
+                } catch (error) {
+                  dropFromPool(proc)
+                  await proc.stop().catch(() => {})
+                  throw error
+                }
+              }
               const tools = normalizeTools(body)
               for (const message of body.messages) {
                 if (message.role !== "assistant" || !Array.isArray(message.content)) continue

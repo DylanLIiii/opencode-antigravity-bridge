@@ -345,7 +345,17 @@ user profile or VM.
   Code summary in the final eight messages instead produces `prompt_budget_exceeded`
   without "prompt is too long", avoiding immediate compaction loops; shorten the
   summary or current input to proceed. Older summaries do not prevent a later
-  compaction. The bridge leaves summarization to the client. Bounded, content-free
+  compaction. For stock OpenCode v1/v2 compaction prompts, the bridge instead
+  opens a temporary tool-free summarization session. Oversized history is sent
+  in ordered, UTF-8-safe fragments (at most 16), each within the ACP ceiling,
+  followed by the final summary request. It does not discard history to make
+  those fragments fit; intermediate acknowledgements are hidden and pending
+  tools remain owned by the original session. The entire plan, including
+  wrapper text, must fit the configured total text budget before any fragment
+  is sent. This costs additional model calls and remains subject to the model's
+  context window. Custom compaction prompts retain the ordinary budget checks.
+  Cancellation or failure stops the remaining fragments; submitted requests
+  are not automatically replayed. Bounded, content-free
   events record session IDs, replay reasons and
   prompt sizes; `AGY_BRIDGE_EVENTS=0` disables them.
 - **Upstream errors without retry amplification.** agy reports API failures as

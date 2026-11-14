@@ -174,6 +174,35 @@ if (argv[0] === "acp" && argv.includes("--login")) {
           send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } })
           return
         }
+        if (text.includes('NOTICE66_')) {
+          const scenario = /NOTICE66_(\w+)/.exec(text)[1]
+          const network = '⚠ There was a network issue connecting to the server, please try again.'
+          const credits = '⚠ Your AI credits balance is too low to continue.'
+          const invalid = '⚠ Model produced invalid output.'
+          const api = '⚠ API error (attempt 3): QUOTA_EXHAUSTED: individual quota exhausted'
+          let output
+          if (scenario === 'CREDITS') {
+            fs.appendFileSync(agentLog, 'E] inference connection failed: transient EOF\n')
+            output = '\n' + credits + '\r\n \t\r\n'
+          } else if (scenario.startsWith('CHAIN_')) {
+            output = '\n' + (scenario.includes('CREDITS') ? credits : network) + '\n⚠ Agent execution terminated due to error.\n' +
+              (scenario.endsWith('RECOVER') ? 'Recovered answer.' : '\n')
+          } else if (scenario === 'NETWORK') output = '\n' + network + '\r\n\r\n'
+          else if (scenario === 'API_ONLY') output = '\n' + api
+          else if (scenario === 'RETRY_LOG') {
+            fs.appendFileSync(agentLog, 'E] CallWithRetry: attempt 3 failed (QUOTA_EXHAUSTED), retrying in 1s\n')
+            output = '\n⚠ Agent execution terminated due to error.\n'
+          } else if (scenario === 'FENCED') output = 'Quoted:\n' + String.fromCharCode(96).repeat(3) + '\n' + network + '\n' + credits + '\n' + invalid + '\n' + String.fromCharCode(96).repeat(3)
+          else if (scenario === 'INVALID_ONLY') output = '\n' + invalid
+          else {
+            fs.appendFileSync(agentLog, 'E] Run: attempt 2 failed (QUOTA_EXHAUSTED), retrying in 1s\n')
+            output = '\n' + api + '\r\n' + (scenario === 'INVALID_RECOVER' ? invalid : network) + '\r\nRecovered answer.'
+          }
+          // Single-character chunks cover prefixes and the CR/LF boundary.
+          for (const char of output) chunk(char)
+          send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } })
+          return
+        }
         if (text.includes('NOTICE49_')) {
           const fenced = text.includes('FENCE')
           const prefix = fenced ? 'Here:\n' + String.fromCharCode(96).repeat(3) + 'js\nconst a = 1;\n' : ''
@@ -280,6 +309,48 @@ const postJson = async (body) => {
     body: JSON.stringify({ model: "gemini-4-carbon", max_tokens: 1024, stream: false, ...body }),
   })
   return { status: res.status, json: await res.json() }
+}
+
+for (const stream of [false, true]) for (const scenario of [
+  'CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'FENCED', 'INVALID_ONLY', 'INVALID_RECOVER', 'NETWORK_RECOVER',
+  'CHAIN_CREDITS', 'CHAIN_NETWORK', 'CHAIN_CREDITS_RECOVER', 'CHAIN_NETWORK_RECOVER',
+]) {
+  test(`issue66 production notice ${scenario}, stream=${stream}`, async () => {
+    const res = await loader.fetch('agy://local/messages', { method: 'POST', body: JSON.stringify({
+      model: 'gemini-4-carbon', stream, metadata: { user_id: `notice66-${scenario}-${stream}` },
+      messages: [{ role: 'user', content: 'NOTICE66_' + scenario }],
+    }) })
+    const body = await res.text()
+    const frames = stream ? body.split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6))) : []
+    const json = stream ? null : JSON.parse(body)
+    const error = stream ? frames.find(frame => frame.type === 'error')?.error : json.error
+    const output = stream ? frames.filter(frame => frame.delta?.type === 'text_delta').map(frame => frame.delta.text).join('')
+      : (json.content || []).map(block => block.text || '').join('')
+    if (['CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'CHAIN_CREDITS', 'CHAIN_NETWORK'].includes(scenario)) {
+      assert.ok(error, body)
+      if (scenario.endsWith('NETWORK')) {
+        assert.equal(res.status, stream ? 200 : 502)
+        assert.match(error.message, /network issue/)
+      } else {
+        assert.equal(res.status, stream ? 200 : 429)
+        assert.equal(error.type, 'rate_limit_error')
+        assert.equal(error.code, 'AGY_ERROR_QUOTA_EXHAUSTED')
+        assert.equal(error.retryable, false)
+      }
+      assert.ok(!output.includes('⚠'), output)
+      if (stream) assert.ok(!frames.some(frame => frame.delta?.stop_reason === 'end_turn'))
+    } else {
+      assert.equal(res.status, 200, body)
+      assert.equal(error, undefined, body)
+      if (scenario === 'FENCED') {
+        assert.match(output, /⚠ There was a network issue/)
+        assert.match(output, /⚠ Your AI credits/)
+        assert.match(output, /⚠ Model produced invalid output/)
+      } else {
+        assert.equal(output.trim(), scenario === 'INVALID_ONLY' ? '' : 'Recovered answer.')
+      }
+    }
+  })
 }
 
 for (const scenario of ['FENCE_FAIL', 'WHITESPACE_FAIL', 'FENCE_NO_LOG', 'WHITESPACE_NO_LOG', 'FENCE_RECOVER']) {

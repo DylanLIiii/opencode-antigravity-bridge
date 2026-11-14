@@ -17,12 +17,165 @@ const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
 source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(fileURLToPath(new URL("./package.json", entry))))
-source += "\nexport { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts };\n"
+source += "\nexport { Turn, Proc, estimateInputTokens, responseUsage, streamResponse, maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts };\n"
 fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync };\n")
 const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
-const { maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+const { Turn, Proc, estimateInputTokens, responseUsage, streamResponse, maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+
+function responseFixture(body) {
+  const proc = new Proc("unused-test-agy", "response-retention-test", { tools: body.tools || [], messages: body.messages })
+  // Exercise the real lifecycle without starting or parking an ACP process.
+  proc.stopping = true
+  proc.expectedMessages = body.messages.slice()
+  const turn = new Turn(proc, body.messages)
+  proc.turn = turn
+  return { proc, turn, cleanup() { proc.finalizeTurn(turn); allProcs.delete(proc) } }
+}
+
+test("response steps release old request bodies and snapshots while retaining usage metadata", () => {
+  const body = { messages: [{ role: "user", content: "inspect screenshots" }] }
+  const f = responseFixture(body)
+  try {
+    for (let i = 0; i < 48; i++) {
+      const request = { ...body, messages: [...body.messages, { role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "a".repeat(32_768) + i } },
+      ] }] }
+      const previous = f.turn.currentResponse
+      const step = f.turn.registerResponse(request)
+      if (previous) {
+        assert.equal(previous.body, null)
+        assert.equal(previous.contentSnapshot, null)
+        // Settlement can complete after registration without the old payload.
+        const usage = responseUsage(f.proc, f.turn, previous, [{ type: "text", text: "done" }])
+        f.turn.recordResponseUsage(previous, usage, false)
+        assert.equal(previous.usage, usage)
+      }
+      step.contentSnapshot = () => [{ type: "text", text: `step ${i}` }]
+      assert.equal(step.body, request)
+      assert.equal(typeof step.contentSnapshot, "function")
+      assert.equal(f.turn.responseSteps.filter(item => item.body).length, 1)
+      assert.equal(f.turn.responseSteps.filter(item => item.contentSnapshot).length, 1)
+    }
+    const step = f.turn.currentResponse
+    const usage = responseUsage(f.proc, f.turn, step, [], { usage: { inputTokens: 48_000, outputTokens: 200 } })
+    f.turn.recordResponseUsage(step, usage, true)
+    assert.equal(step.body.messages.length, 2)
+    assert.equal(typeof step.contentSnapshot, "function")
+    assert.equal(responseUsage(f.proc, f.turn, step, []), usage)
+    assert.equal(f.turn.responseSteps.length, 48)
+    assert.equal(f.turn.stepInputEstimates.length, 48)
+    assert.equal(f.turn.emittedOutputTokens, f.turn.responseSteps.reduce((sum, item) => sum + item.usage.output_tokens, 0))
+    f.proc.finalizeTurn(f.turn)
+    assert.equal(step.body, null)
+    assert.equal(step.contentSnapshot, null)
+    assert.equal(step.usage, usage)
+  } finally { f.cleanup() }
+})
+
+test("a settled current response keeps its snapshot and request options for a late prompt", () => {
+  const body = { system: "instructions ".repeat(100), tools: [{ name: "Read", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "opening" }] }
+  const f = responseFixture(body)
+  try {
+    const step = f.turn.registerResponse(body)
+    f.turn.beginPrompt([], [])
+    const content = [{ type: "text", text: "partial answer ".repeat(50) }]
+    step.contentSnapshot = () => content
+    f.turn.recordResponseUsage(step, responseUsage(f.proc, f.turn, step, content), false)
+    const parts = [{ type: "text", text: "late result ".repeat(50) }]
+    const number = f.turn.beginPrompt(parts, [{ id: "late-call" }])
+    const estimate = estimateInputTokens({ ...body, messages: [...body.messages,
+      { role: "assistant", content }, { role: "user", content: parts }] })
+    assert.equal(f.turn.stepInputEstimates[1], estimate)
+    assert.deepEqual(f.turn.pendingPromptStep, { estimateIndex: 1, promptNumbers: [number] })
+    const next = f.turn.registerResponse(body)
+    assert.equal(step.body, null)
+    assert.equal(step.contentSnapshot, null)
+    assert.equal(next.body, body)
+    assert.equal(next.estimateIndex, 1)
+    assert.deepEqual(next.promptNumbers, [number])
+    assert.equal(f.turn.stepInputEstimates.length, 2)
+    assert.equal(f.turn.stepInputEstimates[1], Math.max(estimate, estimateInputTokens(body)))
+  } finally { f.cleanup() }
+})
+
+for (const stream of [true, false]) {
+  test(`production response snapshots survive settlement and release on continuation (stream=${stream})`, async () => {
+    const body = { stream, model: "test-model", system: "keep instructions", messages: [{ role: "user", content: "opening" }] }
+    const f = responseFixture(body)
+    try {
+      f.turn.beginPrompt([], [])
+      const response = streamResponse(f.proc, f.turn, body)
+      const step = f.turn.currentResponse
+      f.turn.push({ type: "text", text: "open text block" })
+      await Promise.resolve()
+      assert.deepEqual(step.contentSnapshot(), [{ type: "text", text: "open text block" }])
+      const parts = [{ type: "text", text: "late input" }]
+      f.turn.beginPrompt(parts, [{ id: "late" }])
+      assert.equal(f.turn.stepInputEstimates[0], estimateInputTokens({ ...body, messages: [...body.messages,
+        { role: "assistant", content: step.contentSnapshot() }, { role: "user", content: parts }] }))
+      f.turn.push({ type: "tool", call: { id: "tool-1", name: "Read", arguments: { path: "screen.png" } } })
+      const first = await response
+      const output = stream ? await first.text() : await first.json()
+      assert.equal(first.status, 200)
+      if (stream) assert.match(output, /"stop_reason":"tool_use"/)
+      else assert.equal(output.stop_reason, "tool_use")
+      assert.equal(step.settled, true)
+      assert.deepEqual(step.contentSnapshot().map(block => block.type), ["text", "tool_use"])
+      const continued = { ...body, messages: [...f.proc.expectedMessages,
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tool-1", content: "image read" }] }] }
+      const nextResponse = streamResponse(f.proc, f.turn, continued)
+      assert.equal(step.body, null)
+      assert.equal(step.contentSnapshot, null)
+      const next = f.turn.currentResponse
+      f.turn.push({ type: "result", result: { stopReason: "end_turn", usage: { inputTokens: 200, outputTokens: 20 } } })
+      const last = await nextResponse
+      if (stream) assert.match(await last.text(), /"stop_reason":"end_turn"/)
+      else assert.equal((await last.json()).stop_reason, "end_turn")
+      assert.equal(f.turn.finalized, true)
+      assert.equal(next.body, null)
+      assert.equal(next.contentSnapshot, null)
+      assert.equal(next.settled, true)
+      assert.ok(next.usage.output_tokens >= 0)
+    } finally { f.cleanup() }
+  })
+}
+
+test("tool-result history keys bound image bytes and preserve ordered content, errors and normalized IDs", () => {
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: "a".repeat(1_048_576) } }
+  const history = (id = "original", content = [{ type: "text", text: "before" }, image, { type: "text", text: "after" }], is_error = false) => [
+    { role: "user", content: "opening" },
+    { role: "assistant", content: [{ type: "tool_use", id, name: "Read", input: { path: "screen.png" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error }] },
+  ]
+  const original = history()
+  const key = historyKey(original)
+  assert.ok(key.length < 1000, `image history key retained ${key.length} bytes`)
+  assert.equal(key, historyKey(history("renamed")))
+  const result = JSON.parse(key).at(-1).content[0]
+  assert.equal(result.id, 1)
+  assert.equal(result.isError, false)
+  assert.deepEqual(result.content.map(part => part.type), ["text", "image", "text"])
+  assert.deepEqual(Object.keys(result.content[1]).sort(), ["mimeType", "sha256", "type"])
+  assert.match(result.content[1].sha256, /^[a-f0-9]{64}$/)
+  const changedImage = source => ({ ...image, source: { ...image.source, ...source } })
+  for (const content of [
+    [{ type: "text", text: "before" }, changedImage({ data: image.source.data.slice(0, -1) + "b" }), { type: "text", text: "after" }],
+    [{ type: "text", text: "before" }, changedImage({ media_type: "image/jpeg" }), { type: "text", text: "after" }],
+    [{ type: "text", text: "after" }, image, { type: "text", text: "before" }],
+    [image, { type: "text", text: "before" }, { type: "text", text: "after" }],
+    [{ type: "text", text: "before" }, image, image, { type: "text", text: "after" }],
+  ]) assert.notEqual(key, historyKey(history("original", content)))
+  assert.notEqual(key, historyKey(history("original", original.at(-1).content[0].content, true)))
+  // Identity construction must not mutate the transmission payload.
+  assert.deepEqual(toolResult(original.at(-1).content[0]), { isError: false, content: [
+    { type: "text", text: "before" }, { type: "image", mimeType: "image/png", data: image.source.data }, { type: "text", text: "after" },
+  ] })
+  assert.equal(historyKey(history("original", [changedImage({ data: "a" })])).length,
+    historyKey(history("original", [image])).length)
+})
 
 test("reclaimed routing is bounded, expires and rejects ambiguous or incompatible owners", () => {
   const history = [{ role: "user", content: "opening" }, { role: "assistant", content: [
@@ -1017,4 +1170,21 @@ test("issue49 error evidence excludes stale log entries", async () => {
   fs.appendFileSync(file, "E] agent executor error: FAILED_PRECONDITION: current failure\n")
   assert.match(await lastAgentError(file, offset), /current failure/)
   assert.equal(lastAgentErrorSync(file, offset), true)
+})
+
+test("issue66 connection and retry logs supply only current-prompt error evidence", async () => {
+  const file = path.join(workspace, "issue66-agent.log")
+  for (const detail of [
+    "inference connection failed (non-retryable): QUOTA_EXHAUSTED",
+    "Run: attempt 2 failed (connection reset), retrying in 1s",
+    "CallWithRetry: attempt 3 failed (EOF), retrying in 2s",
+  ]) {
+    fs.writeFileSync(file, "E] " + detail + "\n")
+    const offset = fs.statSync(file).size
+    assert.equal(await lastAgentError(file, offset), "")
+    assert.equal(lastAgentErrorSync(file, offset), false)
+    fs.appendFileSync(file, "E] " + detail + "\r\n")
+    assert.equal(await lastAgentError(file, offset), detail)
+    assert.equal(lastAgentErrorSync(file, offset), true)
+  }
 })

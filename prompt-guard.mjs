@@ -1,5 +1,6 @@
 const NEUTRAL_IDENTITY = "You are an AI coding assistant."
-const BILLING_HEADER = /^x-anthropic-billing-header:[ \t]+cc_version=[^;\r\n]+;[ \t]+cc_entrypoint=[^;\r\n]+;$/
+const INVISIBLE_RE = /[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]/g
+const BILLING_HEADER = /^x-anthropic-billing-header:[ \t]+cc_version=[^;\s]+;[ \t]+cc_entrypoint=[^;\s]+(?:;[ \t]*[a-z][a-z0-9_-]*=[^;\s]+)*;$/i
 
 const identityRules = [
   {
@@ -13,7 +14,7 @@ const identityRules = [
 ]
 
 function isStandaloneBillingHeader(text) {
-  const trimmed = text.trim()
+  const trimmed = text.replace(INVISIBLE_RE, "").trim()
   return !/[\r\n]/.test(trimmed) && BILLING_HEADER.test(trimmed)
 }
 

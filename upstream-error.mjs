@@ -5,7 +5,7 @@ const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000
 const UNAUTHENTICATED_RE = /\bUNAUTHENTICATED\b|\bcode\s*[:=]?\s*401\b|\bstatus(?:code)?\s*[:=]?\s*401\b|\bhttp(?:\/\d(?:\.\d)?)?\s+401\b|\b401\s+Unauthorized\b/i
 const FORBIDDEN_RE = /\bTOS_VIOLATION\b|\bPERMISSION_DENIED\b|\bVALIDATION_REQUIRED\b|\bcode\s*[:=]?\s*403\b|\bstatus(?:code)?\s*[:=]?\s*403\b|\bhttp(?:\/\d(?:\.\d)?)?\s+403\b|\b403\s+Forbidden\b/i
 const MODEL_CAPACITY_RE = /\bMODEL_CAPACITY_EXHAUSTED\b/i
-const QUOTA_RE = /\bQUOTA_EXHAUSTED\b|\bquota\s+(?:has\s+been\s+)?exhausted\b|\bindividual\s+quota\b|\bquota\s+(?:limit\s+)?exceeded\b|\bexceeded\s+(?:your\s+)?(?:current\s+)?quota\b|\binsufficient\s+quota\b|\bquota[\s_-]*reset/i
+const QUOTA_RE = /\b(?:AI\s+)?credits\s+balance\s+is\s+too\s+low\b|\bQUOTA_EXHAUSTED\b|\bquota\s+(?:has\s+been\s+)?exhausted\b|\bindividual\s+quota\b|\bquota\s+(?:limit\s+)?exceeded\b|\bexceeded\s+(?:your\s+)?(?:current\s+)?quota\b|\binsufficient\s+quota\b|\bquota[\s_-]*reset/i
 const EXPLICIT_RATE_LIMIT_RE = /\bToo\s+Many\s+Requests\b|\brate[\s_-]*limit(?:ed|[\s_-]*exceeded)?\b|\bTPM\b|\bRPM\b|\btokens?\s+per\s+minute\b|\brequests?\s+per\s+minute\b/i
 const RESOURCE_EXHAUSTED_RE = /\bRESOURCE_EXHAUSTED\b/i
 const HTTP_429_RE = /\bcode\s*[:=]?\s*429\b|\bstatus(?:code)?\s*[:=]?\s*429\b|\bhttp(?:\/\d(?:\.\d)?)?\s+429\b/i

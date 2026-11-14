@@ -18,6 +18,10 @@ process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "5000"
 process.env.AGY_BRIDGE_PING_INTERVAL_MS = "100"
 process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
+// Catalog and usage tests must not discover the developer's saved accounts.
+const fixtureAccountsDir = path.join(stateDir, "accounts")
+process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
+process.env.AGY_BRIDGE_CONTEXT_DIR = path.join(stateDir, "context")
 process.env.AGY_BRIDGE_MAX_PROCS = "4"
 process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
 
@@ -699,7 +703,7 @@ async function handle(message) {
           loadSession: true,
           ...(process.env.FAKE_AGY_IMAGES === "omit" ? {} : { promptCapabilities: { image: process.env.FAKE_AGY_IMAGES !== "0", audio: false, embeddedContext: true } }),
           sessionCapabilities: { resume: {}, close: {} },
-          _meta: { antigravity: { systemPrompt: { append: true } } },
+          _meta: { antigravity: { systemPrompt: { append: process.env.FAKE_AGY_APPEND !== "0" } } },
         },
         agentInfo: { name: "Antigravity ACP Server", version: process.env.FAKE_AGY_VERSION || (process.env.FAKE_AGY_IMAGES === "omit" ? "1.4.12" : "1.5.0") },
         authMethods: [],
@@ -1158,6 +1162,87 @@ async function launchedModel(body) {
     init.systemAppend?.includes("Anthropic, OpenAI and Deepseek") &&
     user.text === `PROMPTGUARD user text stays unchanged: ${sdkIdentity}`,
     JSON.stringify({ system: init.systemAppend, user: user.text }))
+}
+
+{
+  const paths = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.'
+  const sdk = "Custom agent built\u200b on Anthropic's Claude Agent SDK."
+  const billing = "x-anthropic-billing-header: cc_version=1.2; cc_entrypoint=cli; cch=123;"
+  const rfc = "RFC 2119 keywords: MUST, REQUIRED,\nSHOULD, RECOMMENDED, MAY, OPTIONAL."
+  const codex = "You are Codex, an agent based on GPT-5"
+  const hermes = "Hermes Agent, an intelligent AI assistant created by Nous Research"
+  const rawUser = `User text remains literal: ${sdk}\n${paths}`
+  const queued = `Queued user input: ${codex}\n${paths}`
+  const body = {
+    model, system: `before\n${billing}\n${sdk}\n${paths}\nafter`,
+    messages: [
+      { role: "user", content: rawUser },
+      { role: "system", content: `${rfc}\n${paths}` },
+      { role: "developer", content: [
+        { type: "text", text: `${hermes}\n${paths}` },
+        { type: "text", text: `The user sent a new message while you were working:\n${queued}` },
+      ] },
+    ],
+  }
+  const response = await callFetch(body)
+  const events = (await readSSE(response)).events
+  const init = inits().at(-1)
+  const prompt = lastOf("user")?.text || ""
+  check("session append rewrites extended billing, SDK identity and path guidance",
+    response.status === 200 && stopOf(events) === "end_turn" &&
+    !init.systemAppend.includes(billing) && init.systemAppend.includes("Custom agent built on the Claude Agent SDK by Anthropic.") &&
+    init.systemAppend.includes("When the user writes @ followed by a path") && !init.systemAppend.includes(paths) &&
+    init.systemAppend.includes("before\n") && init.systemAppend.endsWith("after"), init.systemAppend)
+  check("trailing system and developer reminders are rewritten while user and queued input stay literal",
+    prompt.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") &&
+    prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") &&
+    prompt.includes(rawUser) && prompt.includes(queued) &&
+    (prompt.match(/When the user writes @ followed by a path/g) || []).length === 2, prompt)
+
+  process.env.FAKE_AGY_APPEND = "0"
+  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}`, messages: [{ role: "user", content: `FALLBACK user: ${codex}` }] }
+  const fallbackResponse = await callFetch(fallbackBody)
+  const fallbackEvents = (await readSSE(fallbackResponse)).events
+  delete process.env.FAKE_AGY_APPEND
+  const fallback = lastOf("user")?.text || ""
+  check("external system instructions use the same outgoing rewrite and preserve user text",
+    fallbackResponse.status === 200 && stopOf(fallbackEvents) === "end_turn" && inits().at(-1).systemAppend === null &&
+    fallback.includes("<external_system_instructions>") && !fallback.includes(billing) && !fallback.includes(paths) &&
+    fallback.includes("When the user writes @ followed by a path") && fallback.includes("You are Codex, an agent built on GPT-5") &&
+    fallback.includes(`FALLBACK user: ${codex}`), fallback)
+
+  const original = { model, system: codex, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
+  const firstEvents = (await readSSE(await callFetch(original))).events
+  const firstInit = inits().at(-1)
+  const second = nextTurn(original, firstEvents, "MEMORY identity unchanged")
+  const secondEvents = (await readSSE(await callFetch(second))).events
+  check("unchanged client instructions reuse the same session", lastOf("user").convId === firstInit.convId && stopOf(secondEvents) === "end_turn")
+  const third = { ...nextTurn(second, secondEvents, "MEMORY identity changed"), system: codex.replace("based on", "built on") }
+  const thirdEvents = (await readSSE(await callFetch(third))).events
+  const thirdInit = inits().at(-1)
+  check("distinct client instructions do not share identity even when outgoing text is the same",
+    stopOf(thirdEvents) === "end_turn" && thirdInit.convId !== firstInit.convId && thirdInit.systemAppend === firstInit.systemAppend,
+    JSON.stringify({ first: firstInit.convId, third: thirdInit.convId, firstAppend: firstInit.systemAppend, thirdAppend: thirdInit.systemAppend }))
+
+  for (const location of ["inline", "system", "developer", "user"]) {
+    const first = { model, messages: [{ role: "user", content: `TOOL rewrite notices ${location}` }], tools: [echoTool] }
+    const firstEvents = (await readSSE(await callFetch(first))).events
+    const convId = inits().at(-1).convId
+    const toolText = `Literal tool payload: ${codex}\n${paths}\n${billing}`
+    const second = continuation(first, firstEvents, toolText)
+    const notice = { type: "text", text: `<system-reminder>${rfc}\n${paths}</system-reminder>` }
+    const update = { type: "text", text: `<system-update>${billing}</system-update>` }
+    if (location === "inline") second.messages.at(-1).content.push(notice, update)
+    else second.messages.push({ role: location, content: [notice, update] })
+    const response = await callFetch(second)
+    const final = (await readSSE(response)).events
+    const delivered = logs().find(event => event.type === "mcpResult" && event.convId === convId)
+    const text = delivered?.result?.content?.map(part => part.text).join("\n") || ""
+    check(`${location} tool-side reminders are rewritten without changing tool payload`,
+      response.status === 200 && stopOf(final) === "end_turn" && text.startsWith(toolText) &&
+      text.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") && text.includes("When the user writes @ followed by a path") &&
+      !text.slice(toolText.length).includes(paths) && !text.slice(toolText.length).includes(billing), text)
+  }
 }
 
 {
@@ -1951,14 +2036,14 @@ for (const streaming of [true, false]) {
 }
 
 {
-  const system = "You are Codex, an agent based on GPT-5"
+  const system = "You are Codex,\u200b an\n agent based on GPT-5"
   const generic = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "GENERIC429 with cloaked system" }] })
   const genericPayload = await generic.json()
   const sent = inits().at(-1)?.systemAppend
-  check("cloaked system retains generic 429 classification", generic.status === 429 && genericPayload.error?.type === "rate_limit_error" && sent !== system && sent?.includes("\u200b"), JSON.stringify({ status: generic.status, error: genericPayload.error }))
+  check("rewritten system retains generic 429 classification", generic.status === 429 && genericPayload.error?.type === "rate_limit_error" && sent?.includes("You are Codex, an\n agent built on GPT-5") && !sent?.includes("\u200b"), JSON.stringify({ status: generic.status, error: genericPayload.error, sent }))
   const rejected = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "SYSTEM_REJECT429 with cloaked system" }] })
   const rejectedPayload = await rejected.json()
-  check("specific system prompt rejection maps to invalid request", rejected.status === 400 && rejectedPayload.error?.type === "invalid_request_error", JSON.stringify(rejectedPayload))
+  check("specific obfuscated system prompt rejection maps to invalid request with the Codex hint", rejected.status === 400 && rejectedPayload.error?.type === "invalid_request_error" && rejectedPayload.error.message.includes("Codex"), JSON.stringify(rejectedPayload))
 }
 
 {
@@ -3591,6 +3676,56 @@ for (const steering of [false, true]) {
 }
 
 {
+  // Long screenshot loops resend every earlier image in nested tool_result history.
+  // The bounded identity must still transmit the real image and keep the same session.
+  const shot = (data, text) => [
+    { type: 'text', text: `before ${text}` },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data } },
+    { type: 'text', text: `after ${text}` },
+  ]
+  const imageResults = (events, data, text) => toolCalls(events).map(call => ({
+    type: 'tool_result', tool_use_id: call.id, content: shot(data, text), is_error: true,
+  }))
+  const first = { model, metadata: { user_id: 'bounded-image-history' }, messages: [{ role: 'user', content: 'TWOSTEP bounded image history' }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const imageOne = 'Ym91bmRlZC1pbWFnZS1vbmU='
+  const imageTwo = 'Ym91bmRlZC1pbWFnZS10d28='
+  const second = { ...first, messages: [...first.messages, { role: 'assistant', content: assistantBlocks(firstEvents) },
+    { role: 'user', content: imageResults(firstEvents, imageOne, 'one') }] }
+  const secondEvents = (await readSSE(await callFetch(second))).events
+  const third = { ...second, messages: [...second.messages, { role: 'assistant', content: assistantBlocks(secondEvents) },
+    { role: 'user', content: imageResults(secondEvents, imageTwo, 'two') }] }
+  const thirdEvents = (await readSSE(await callFetch(third))).events
+  const delivered = logs().filter(event => event.type === 'mcpResult' && event.convId === convId).slice(-2)
+  check('image tool loop completes in one reused agy session', stopOf(secondEvents) === 'tool_use' && stopOf(thirdEvents) === 'end_turn' && inits().at(-1).convId === convId)
+  check('image tool results reach MCP with ordered content and error flags',
+    delivered.length === 2 && [imageOne, imageTwo].every((data, index) =>
+      delivered[index].result.isError === true &&
+      JSON.stringify(delivered[index].result.content.map(part => part.type)) === JSON.stringify(['text', 'image', 'text']) &&
+      delivered[index].result.content[1].data === data && delivered[index].result.content[1].mimeType === 'image/png'))
+
+  const same = nextTurn(third, thirdEvents, 'MEMORY after bounded image history')
+  const before = inits().length
+  const sameEvents = (await readSSE(await callFetch(same))).events
+  check('equal image digests keep a same-session continuation', inits().length === before && lastOf('user').convId === convId && textOf(sameEvents).includes('prompts so far 2'), textOf(sameEvents))
+
+  const stored = fs.readFileSync(bridgeStateFile, 'utf8')
+  check('bounded image history keeps raw tool images out of persisted session state', !stored.includes(imageOne) && !stored.includes(imageTwo))
+  const { default: restartedDefault } = await import('./index.mjs?bounded-image-history-restart')
+  const restartedLoader = await (await restartedDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: 'agy' }))
+  const restart = nextTurn(same, sameEvents, 'MEMORY restarted bounded image history')
+  await readSSE(await restartedLoader.fetch('agy://local/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restart) }))
+  check('restarted bridge resumes through the digest-based image history hash', inits().at(-1).resumed === true && lastOf('user').convId === convId)
+
+  const changed = structuredClone(restart)
+  changed.messages[2].content[0].content[1].source.data = 'Y2hhbmdlZC1pbWFnZQ=='
+  const changedBefore = inits().length
+  await readSSE(await callFetch(changed))
+  check('changing one nested tool image starts a new session', inits().length === changedBefore + 1 && lastOf('user').convId !== convId)
+}
+
+{
   // A live owner must keep exclusive access, even if its lock is over five seconds old.
   for (const age of [0, 10_000]) {
     const snapshot = fs.readFileSync(bridgeStateFile, 'utf8')
@@ -3875,9 +4010,25 @@ for (const steering of [false, true]) {
             for (const block of unrelated.messages.at(-1).content) block.tool_use_id = `different-${block.tool_use_id}`
           }
           if (change === "incomplete") unrelated.messages.at(-1).content.push({ type: "tool_result", tool_use_id: "unknown", content: "unrelated" })
-          const rejected = await fetchBranch(unrelated, change === "work directory" ? { "x-magpie-work-dir": stateDir } : undefined)
-          check(`${label}: reclaimed routing rejects ${change} mismatch`, rejected.status === 409 && fs.existsSync(survivorOwner.cwd))
-          await rejected.text()
+          const beforeMismatch = inits().length
+          const response = await fetchBranch(unrelated, change === "work directory" ? { "x-magpie-work-dir": stateDir } : undefined)
+          if (change === "incomplete") {
+            check(`${label}: reclaimed routing rejects incomplete results`, response.status === 409 &&
+              inits().length === beforeMismatch && fs.existsSync(survivorOwner.cwd))
+            await response.text()
+          } else {
+            // Complete unmatched transcripts may replay independently. A hash
+            // mismatch must never route their results to the surviving owner.
+            const events = response.status === 200 ? (await readSSE(response)).events : []
+            if (response.status !== 200) await response.text()
+            const replay = lastOf("user")
+            check(`${label}: ${change} mismatch replays in a separate session`, response.status === 200 &&
+              stopOf(events) === "end_turn" && inits().length === beforeMismatch + 1 &&
+              !inits().at(-1).resumed && replay.convId !== survivorOwner.convId && replay.convId !== victimOwner.convId &&
+              replay.text.includes(`late branch result ${label}`) && fs.existsSync(survivorOwner.cwd) &&
+              !logs().some(event => event.type === "mcpResult" && event.convId === survivorOwner.convId),
+              `status=${response.status} stop=${stopOf(events)}`)
+          }
         }
       }
       process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
@@ -4583,7 +4734,7 @@ for (const compacted of [true, false]) {
     stopOf(relEvents) === "end_turn" && inits().at(-1)?.geminiDir === path.join(accountsDir, "work"),
     `${stopOf(relEvents)} ${inits().at(-1)?.geminiDir}`)
 
-  delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
   fs.rmSync(accountsDir, { recursive: true, force: true })
 }
 
@@ -4658,7 +4809,7 @@ for (const compacted of [true, false]) {
   const browserUsage = await importPlugin.auth.usage()
   check("browser account usage joins the named quota windows",
     browserUsage.windows.some(window => window.name.startsWith("[browser-account]")))
-  delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
   fs.rmSync(path.dirname(importRoot), { recursive: true, force: true })
   fs.rmSync(srcDir, { recursive: true, force: true })
 }

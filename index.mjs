@@ -22,7 +22,7 @@ import { OutputLimitFilter } from "./output-limit.mjs"
 import { AgentNoticeFilter } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
-import { cloak, hint, turnsAway } from "./cloak.mjs"
+import { outgoing, hint, turnsAway } from "./cloak.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -954,9 +954,19 @@ class Turn {
     } else {
       this.stepInputEstimates.push(estimate)
     }
+    this.releaseResponsePayload()
     this.responseSteps.push(step)
     this.currentResponse = step
     return step
+  }
+
+  releaseResponsePayload() {
+    if (!this.currentResponse) return
+    // Usage accounting needs only the step's estimates and settled usage. Keep
+    // the current payload even after settlement: a late prompt may still need
+    // its request options and output snapshot until the next HTTP step attaches.
+    this.currentResponse.body = null
+    this.currentResponse.contentSnapshot = null
   }
 
   beginPrompt(parts, lateCalls) {
@@ -1369,7 +1379,7 @@ class Proc {
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
-      ? { _meta: { antigravity: { systemPrompt: { append: cloak(this.instructions) } } } }
+      ? { _meta: { antigravity: { systemPrompt: { append: outgoingSystemText(this.instructions) } } } }
       : {}
 
     let session = null
@@ -1760,12 +1770,15 @@ class Proc {
           turn.complete({ stopReason: "cancelled" })
           return
         }
-        // Only a final diagnostic followed by an error in this prompt's log (or
-        // an abnormal protocol outcome) can fail the turn. Recovered output
-        // clears the candidate, even when an earlier retry logged an error.
+        // Corroborate the legacy banner with this prompt's log or outcome.
+        // Specific terminal/API notices supply fallback evidence on newer agy.
+        // Recovered output clears the candidate, including earlier retry errors.
         turn.flushText(true)
         if (turn.notices.failureCandidate) {
-          const detail = await lastAgentError(this.logPath, turn.logOffset)
+          const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
+          // A specific terminal diagnosis takes precedence over an earlier retry
+          // log (for example, credits exhausted after a transient connection error).
+          const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
           if (detail || result?.stopReason === "refusal") {
             turn.agentError = true
             throw this.#formatAgentError(detail, turn.promptGuardMatched)
@@ -2199,6 +2212,7 @@ class Proc {
   finalizeTurn(turn) {
     if (turn.finalized) return
     turn.finalized = true
+    turn.releaseResponsePayload()
     if (turn.stepsFile && turn.promptCount > 0 && !turn.stepUsageReconciled) this.stepUsageTrusted = false
     for (const attempt of [turn.promptAttempt, ...turn.steeringAttempts].filter(Boolean)) {
       if (promptAttempts.get(attempt.key) !== attempt) continue
@@ -2406,7 +2420,7 @@ function lastAgentErrorSync(file, offset) {
     const start = Math.max(offset || 0, size - LOG_TAIL_BYTES)
     const buffer = Buffer.alloc(Math.max(0, size - start))
     fs.readSync(fd, buffer, 0, buffer.length, start)
-    return /\] (?:agent executor error|failed to construct executor): .+/.test(buffer.toString("utf8"))
+    return !!extractAgentError(buffer.toString("utf8"))
   } catch { return false } finally { if (fd !== undefined) fs.closeSync(fd) }
 }
 
@@ -2427,10 +2441,14 @@ async function lastAgentError(file, offset) {
   } catch {
     return ""
   }
+  return extractAgentError(text)
+}
+
+function extractAgentError(text) {
   let found = ""
   for (const line of text.split("\n")) {
-    const match = /\] (?:agent executor error|failed to construct executor): (.+)$/.exec(line)
-    if (match) found = match[1]
+    const match = /\] (?:agent executor error|failed to construct executor): (.+)$|\] (inference connection failed.*|(?:Run|CallWithRetry): attempt \d+ failed.*)$/.exec(line.trimEnd())
+    if (match) found = match[1] || match[2]
   }
   if (!found) return ""
   const cut = found.lastIndexOf("generating and executing: ")
@@ -3255,6 +3273,17 @@ function replaceClosedSystemReminders(text, replacer) {
   return out
 }
 
+// Rewriting inside an identified reminder also handles a billing line directly
+// adjacent to its tags, without treating a tag in ordinary user text as a notice.
+function outgoingSystemText(text) {
+  const withReminders = replaceClosedSystemReminders(text, (block) => {
+    const start = block.indexOf(">") + 1
+    const end = block.length - "</system-reminder>".length
+    return block.slice(0, start) + outgoing(block.slice(start, end)) + block.slice(end)
+  })
+  return outgoing(withReminders)
+}
+
 function stripVolatileOpening(text) {
   return replaceClosedSystemReminders(stripBillingHeader(text), (block) => stripAgentClockLines(block))
 }
@@ -3480,7 +3509,13 @@ function historyKey(messages) {
         ids.set(block.id, ordinal)
         value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
       } else if (block.type === "tool_result") {
-        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
+        const result = toolResult(block)
+        // Match image identities without copying base64 into every history key.
+        // Keep toolResult's raw data intact for MCP transmission and replay.
+        const content = result.content.map(part => part.type === "image"
+          ? { type: "image", mimeType: part.mimeType, sha256: digest(part.data) }
+          : part)
+        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...result, content }
       } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
         block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
         value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }
@@ -3969,9 +4004,13 @@ function renderTurnMessage(message) {
   const out = []
   const joinedReminders = reminders.join("").trim()
   if (joinedReminders) {
-    out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(joinedReminders)
-      ? joinedReminders
-      : `<system-reminder>\n${joinedReminders}\n</system-reminder>`)
+    // Queued messages are user input and must be kept verbatim. Rewrite only
+    // the system/developer content before the queued text is reattached.
+    const systemText = message.role === "system" || message.role === "developer"
+      ? outgoingSystemText(joinedReminders) : joinedReminders
+    if (systemText.trim()) out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(systemText)
+      ? systemText
+      : `<system-reminder>\n${systemText}\n</system-reminder>`)
   }
   out.push(...queuedParts)
   return out.join("\n\n")
@@ -3979,8 +4018,7 @@ function renderTurnMessage(message) {
 
 function renderTurnMessageParts(message, historical = false, stripResults = false) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
-    let text = renderTurnMessage(message)
-    if (message.role === "system" || message.role === "developer") text = cloak(text)
+    const text = renderTurnMessage(message)
     return text === "" ? [] : [{ type: "text", text }]
   }
   const parts = []
@@ -4037,7 +4075,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   const compacting = isCompactionRequest(current)
   if (!instructionsInSession) {
     const system = systemText(body)
-    if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${cloak(system)}\n</external_system_instructions>\n`)
+    if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${outgoingSystemText(system)}\n</external_system_instructions>\n`)
     if (callerWorkDir) appendPrompt(out, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   if (history.length) {
@@ -4309,6 +4347,17 @@ const UNCLOSED_NOTICE_RE = new RegExp(
   `<\\/?(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b`,
 )
 
+function outgoingNotice(notice) {
+  const open = /^<([a-z][a-z0-9-]*)(?:\s[^>]*)?>/i.exec(notice)
+  if (open) {
+    const close = `</${open[1]}>`
+    if (notice.endsWith(close)) {
+      return open[0] + outgoingSystemText(notice.slice(open[0].length, -close.length)) + close
+    }
+  }
+  return outgoingSystemText(notice)
+}
+
 // Forward complete protocol-generated context notices, Claude Code hook outputs,
 // and tool-companion blocks without turning arbitrary inline user instructions
 // into MCP function_response text. Mid-turn queued_command prompts and follow-up
@@ -4419,16 +4468,16 @@ function inspectToolTurn(results, body) {
         if (wrapped || message.role === "system" || message.role === "developer") {
           const inner = wrapped ? wrapped[1] : rest
           if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) userSteered = true
-          else if (!isNoise(inner)) notices.push(cloak(inner))
+          else if (!isNoise(inner)) notices.push(inner)
         } else if (message.role === "user") userSteered = true
-        else if (!isNoise(rest)) notices.push(cloak(rest))
+        else if (!isNoise(rest)) notices.push(rest)
         continue
       }
       if (message.role === "system" || message.role === "developer") {
         if (extractQueuedPrompt(rest) !== null || userInterruption.test(rest)) {
           userSteered = true
         } else if (!isNoise(rest)) {
-          notices.push(cloak(rest))
+          notices.push(rest)
         }
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
@@ -4440,7 +4489,8 @@ function inspectToolTurn(results, body) {
     }
   }
   const finalResults = notices.length
-    ? appendResultText(out, out.length - 1, `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>`)
+    ? appendResultText(out, out.length - 1, `<system-reminder>\n${notices.map(notice =>
+      userInterruption.test(notice) ? notice : outgoingNotice(notice)).join("\n\n")}\n</system-reminder>`)
     : out
   return { results: finalResults, userSteered }
 }

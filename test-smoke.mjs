@@ -18,6 +18,10 @@ process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "1000"
 process.env.AGY_BRIDGE_TURN_TIMEOUT_MS = "5000"
 process.env.AGY_BRIDGE_PING_INTERVAL_MS = "100"
 process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
+// Catalog and usage tests must not discover the developer's saved accounts.
+const fixtureAccountsDir = path.join(stateDir, "accounts")
+process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
+process.env.AGY_BRIDGE_CONTEXT_DIR = path.join(stateDir, "context")
 process.env.AGY_BRIDGE_MAX_PROCS = "4"
 process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
 
@@ -3925,9 +3929,25 @@ for (const steering of [false, true]) {
             for (const block of unrelated.messages.at(-1).content) block.tool_use_id = `different-${block.tool_use_id}`
           }
           if (change === "incomplete") unrelated.messages.at(-1).content.push({ type: "tool_result", tool_use_id: "unknown", content: "unrelated" })
-          const rejected = await fetchBranch(unrelated, change === "work directory" ? { "x-magpie-work-dir": stateDir } : undefined)
-          check(`${label}: reclaimed routing rejects ${change} mismatch`, rejected.status === 409 && fs.existsSync(survivorOwner.cwd))
-          await rejected.text()
+          const beforeMismatch = inits().length
+          const response = await fetchBranch(unrelated, change === "work directory" ? { "x-magpie-work-dir": stateDir } : undefined)
+          if (change === "incomplete") {
+            check(`${label}: reclaimed routing rejects incomplete results`, response.status === 409 &&
+              inits().length === beforeMismatch && fs.existsSync(survivorOwner.cwd))
+            await response.text()
+          } else {
+            // Complete unmatched transcripts may replay independently. A hash
+            // mismatch must never route their results to the surviving owner.
+            const events = response.status === 200 ? (await readSSE(response)).events : []
+            if (response.status !== 200) await response.text()
+            const replay = lastOf("user")
+            check(`${label}: ${change} mismatch replays in a separate session`, response.status === 200 &&
+              stopOf(events) === "end_turn" && inits().length === beforeMismatch + 1 &&
+              !inits().at(-1).resumed && replay.convId !== survivorOwner.convId && replay.convId !== victimOwner.convId &&
+              replay.text.includes(`late branch result ${label}`) && fs.existsSync(survivorOwner.cwd) &&
+              !logs().some(event => event.type === "mcpResult" && event.convId === survivorOwner.convId),
+              `status=${response.status} stop=${stopOf(events)}`)
+          }
         }
       }
       process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
@@ -4633,7 +4653,7 @@ for (const compacted of [true, false]) {
     stopOf(relEvents) === "end_turn" && inits().at(-1)?.geminiDir === path.join(accountsDir, "work"),
     `${stopOf(relEvents)} ${inits().at(-1)?.geminiDir}`)
 
-  delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
   fs.rmSync(accountsDir, { recursive: true, force: true })
 }
 
@@ -4708,7 +4728,7 @@ for (const compacted of [true, false]) {
   const browserUsage = await importPlugin.auth.usage()
   check("browser account usage joins the named quota windows",
     browserUsage.windows.some(window => window.name.startsWith("[browser-account]")))
-  delete process.env.AGY_BRIDGE_ACCOUNTS_DIR
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
   fs.rmSync(path.dirname(importRoot), { recursive: true, force: true })
   fs.rmSync(srcDir, { recursive: true, force: true })
 }

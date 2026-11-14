@@ -8,6 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { after, test } from "node:test"
+import { v2 as openCodeCompactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
 
 // Expose private seams from an isolated copy, without adding production exports.
 // The smoke suite covers the fetch/ACP/MCP path; these cases cover batched
@@ -1186,5 +1187,21 @@ test("issue66 connection and retry logs supply only current-prompt error evidenc
     fs.appendFileSync(file, "E] " + detail + "\r\n")
     assert.equal(await lastAgentError(file, offset), detail)
     assert.equal(lastAgentErrorSync(file, offset), true)
+  }
+})
+
+test("both compaction budgets fail terminally without asking the client to compact again", () => {
+  const body = { messages: [{ role: "user", content: "conversation" }, { role: "user", content: openCodeCompactionPrompt }] }
+  const previous = process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = "100"
+  try {
+    for (const [validate, text] of [[validatePromptBudget, "x".repeat(101)], [validateAcpPromptBudget, "x".repeat(180001)]]) {
+      assert.throws(() => validate([{ type: "text", text }], "", body), error =>
+        error.statusCode === 400 && error.code === "prompt_budget_exceeded" && error.noRetry &&
+        !/prompt is too long/i.test(error.message))
+    }
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+    else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
   }
 })

@@ -1,6 +1,7 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { v1 as openCodeCompactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
 
 const here = path.dirname(new URL(import.meta.url).pathname)
 const suffix = `-${process.pid}`
@@ -308,6 +309,14 @@ async function prompt(params, recorded = false) {
   const text = params.prompt.map(block => block.text || "").join("")
   const images = params.prompt.filter(block => block.type === "image").length
   if (!recorded) recordPrompt(params)
+  if (text.includes("[Bridge compaction fragment ")) {
+    chunk("ACK-INTERNAL")
+    return finish("ACK-INTERNAL")
+  }
+  if (text.startsWith("All conversation fragments")) {
+    chunk("## Objective\nContinue the pending task after compaction.")
+    return finish("compaction-summary")
+  }
   if (text.includes("NATIVE_FINAL")) {
     await new Promise(resolve => setTimeout(resolve, 80))
     chunk("NATIVE_FINAL_AFTER_ACK")
@@ -1683,6 +1692,30 @@ for (const [summaryTool, withNotice] of [[false, false], [true, false], [false, 
   const mainFollow = (await readSSE(await callFetch(nextTurn(mainResult, mainDone, "MEMORY primary follow-up")))).events
   check(`${label}: the main follow-up retains its original session`, stopOf(mainFollow) === "end_turn" &&
     inits().length === beforeFollow && lastOf("user").convId === primary.convId)
+}
+
+{
+  const first = { model, metadata: { user_id: "issue65-pending-owner" },
+    messages: [{ role: "user", content: "ESCCALL issue65 pending owner" }], tools: [echoTool] }
+  const pending = (await readSSE(await callFetch(first))).events
+  const owner = inits().at(-1)
+  const result = "ISSUE65-RESULT-START\n" + "data".repeat(80000) + "\nISSUE65-RESULT-END"
+  const continued = continuation(first, pending, result)
+  const summary = { ...continued, messages: [...continued.messages, { role: "user", content: openCodeCompactionPrompt }] }
+  const before = inits().length
+  const response = await callFetch(summary)
+  const events = (await readSSE(response)).events
+  const summarizer = inits().at(-1)
+  check("issue65 compacts an oversized pending tool transcript in a tool-free isolated session",
+    response.status === 200 && stopOf(events) === "end_turn" && inits().length === before + 1 &&
+    summarizer.convId !== owner.convId && summarizer.tools.length === 0 &&
+    textOf(events).includes("## Objective") && !textOf(events).includes("ACK-INTERNAL"))
+  check("issue65 compaction leaves the original pending MCP owner untouched",
+    fs.existsSync(owner.cwd) && !logs().some(event => event.type === "mcpResult" && event.convId === owner.convId))
+  const finished = (await readSSE(await callFetch(continued))).events
+  const received = logs().filter(event => event.type === "mcpResult" && event.convId === owner.convId)
+  check("issue65 original tool result still completes once in its original session",
+    stopOf(finished) === "end_turn" && received.length === 1 && received[0].result.content[0].text === result)
 }
 
 {

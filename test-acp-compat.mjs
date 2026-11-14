@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
+import { v2 as compactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
 
 // Exercise the public provider and its real Proc/AcpConnection with a subprocess.
 // The fake has no network, credentials, context unlock or MCP dependencies.
@@ -19,7 +20,7 @@ const send = value => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...v
 if (process.argv.includes("--version")) { console.log("1.5.4"); process.exit(0) }
 if (process.argv.includes("models")) { console.log("gemini-test-high\tTest High"); process.exit(0) }
 log({ kind: "spawn" })
-let sessionId, model = "other", effort = "low", append = ""
+let sessionId, model = "other", effort = "low", append = "", fragments = 0
 const options = () => [
   { id: "model", category: "model", type: "select", currentValue: model, options: ["other", "gemini-test"].map(value => ({ value, name: value })) },
   { id: "thought_level", category: "thought_level", type: "select", currentValue: effort,
@@ -63,6 +64,23 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   if (msg.method === "session/set_model") { model = p.modelId; return reply({}) }
   if (msg.method === "session/prompt") {
     log({ kind: "prompt", append, model, effort, prompt: p.prompt })
+    const text = p.prompt.map(part => part.text || "").join("")
+    const chunk = text => send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })
+    if (text.includes("[Bridge compaction fragment ")) {
+      fragments++
+      if (mode === "compaction-failure" && fragments === 2) {
+        chunk("\n⚠ Your AI credits balance is too low to continue.\n")
+        return reply({ stopReason: "end_turn" })
+      }
+      if (mode === "compaction-refusal") return reply({ stopReason: "refusal" })
+      if (mode === "compaction-hang") return
+      chunk("ACK-INTERNAL")
+      return reply({ stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 2 } })
+    }
+    if (text.startsWith("All conversation fragments") || text.includes("\n\nAll conversation fragments")) {
+      chunk("## Objective\nKeep LATEST-INSTRUCTION pending.\n## Next Move\nContinue from the summary.")
+      return reply({ stopReason: "end_turn", usage: { inputTokens: 30, outputTokens: 12 } })
+    }
     send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "fixture answer" } } } })
     return reply({ stopReason: "end_turn" })
   }
@@ -104,6 +122,126 @@ test.after(async () => {
   // The production provider owns long-lived servers; all fixture children have
   // exited above. Match the existing production-entry auth test teardown.
   setTimeout(() => process.exit(process.exitCode || 0), 30)
+})
+
+const largeHistory = "ISSUE65-HISTORY-START\n" + "😀历史".repeat(40000) + "\nLATEST-INSTRUCTION: preserve this entire request."
+const summaryMessages = (kind = "flattened") => kind === "flattened"
+  ? [{ role: "user", content: largeHistory }, { role: "user", content: compactionPrompt }]
+  : [{ role: "user", content: "Read the report and keep LATEST-INSTRUCTION pending." },
+    { role: "assistant", content: [{ type: "tool_use", id: "already-executed", name: "Read", input: { path: "report" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "already-executed", content: largeHistory }] },
+    { role: "user", content: compactionPrompt }]
+
+for (const mode of ["response-first", "no-append"]) for (const stream of [false, true]) {
+  test(`oversized OpenCode compaction stages the full history, ${mode}, stream=${stream}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const before = logs().length
+    let messages = summaryMessages(stream ? "tools" : "flattened")
+    if (mode === "no-append") {
+      const instruction = messages.pop().content
+      const last = messages.at(-1)
+      last.content = [...(Array.isArray(last.content) ? last.content : [{ type: "text", text: last.content }]),
+        { type: "text", text: instruction }]
+    }
+    const response = await request(client, messages, { stream })
+    const raw = await response.text()
+    assert.equal(response.status, 200, raw)
+    assert.ok(!raw.includes("ACK-INTERNAL"), "ingestion responses stay internal")
+    assert.match(raw, /Keep LATEST-INSTRUCTION pending/)
+    const sent = logs().slice(before).filter(event => event.kind === "prompt")
+    assert.ok(sent.length >= 3, "multiple fragments plus the final summary request")
+    assert.equal(new Set(sent.map(event => event.pid)).size, 1, "all fragments share one isolated session")
+    for (const event of sent) assert.ok(event.prompt.reduce((sum, part) => sum + Buffer.byteLength(part.text || ""), 0) <= 180000)
+    const contents = sent.slice(0, -1).map(event => {
+      const text = event.prompt.map(part => part.text || "").join("")
+      const header = /\[Bridge compaction fragment \d+; quoted conversation data follows\]\n/.exec(text)
+      const footer = text.lastIndexOf("\n[End of fragment.")
+      assert.ok(header && footer > header.index)
+      return text.slice(header.index + header[0].length, footer)
+    }).join("")
+    assert.ok(contents.includes(largeHistory), "the complete original content is delivered in order")
+    assert.ok(contents.includes(compactionPrompt), "the client format is preserved")
+    assert.ok(!contents.includes("\ufffd"))
+    if (mode !== "no-append" || stream) assert.match(contents, /Summarize this conversation/)
+    if (mode === "no-append") assert.ok(sent.every(event => event.prompt[0].text.startsWith("You are summarizing an existing conversation")))
+    if (!stream) {
+      const payload = JSON.parse(raw)
+      assert.equal(payload.stop_reason, "end_turn")
+      assert.equal(payload.usage.input_tokens, (sent.length - 1) * 10 + 30)
+      assert.equal(payload.usage.output_tokens, (sent.length - 1) * 2 + 12)
+    }
+    const session = "session-" + sent[0].pid
+    const saved = fs.existsSync(process.env.AGY_BRIDGE_STATE_FILE) ? fs.readFileSync(process.env.AGY_BRIDGE_STATE_FILE, "utf8") : ""
+    assert.ok(!saved.includes(session), "temporary summary sessions are not parked for conversation reuse")
+  })
+}
+
+for (const mode of ["compaction-failure", "compaction-refusal"]) {
+  test(`failed compaction ingestion stops before the summary: ${mode}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const before = logs().length
+    const messages = summaryMessages()
+    const response = await request(client, messages)
+    const payload = await response.json()
+    assert.equal(response.status, mode === "compaction-failure" ? 429 : 502, JSON.stringify(payload))
+    const sent = logs().slice(before).filter(event => event.kind === "prompt")
+    assert.equal(sent.length, mode === "compaction-failure" ? 2 : 1)
+    assert.ok(sent.every(event => event.prompt.some(part => part.text?.startsWith("[Bridge compaction fragment "))))
+    assert.ok(!JSON.stringify(payload).includes("ACK-INTERNAL"))
+    const retry = await request(client, messages)
+    assert.notEqual(retry.status, 200)
+    await retry.text()
+    assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, sent.length, "submitted fragments are not automatically replayed")
+  })
+}
+
+test("ordinary oversized requests and over-budget compactions reject before session creation", async () => {
+  process.env.COMPAT_MODE = "response-first"
+  const client = await loader()
+  for (const [messages, compacting] of [
+    [[{ role: "user", content: largeHistory }], false],
+    [[{ role: "user", content: "x".repeat(1100000) }, { role: "user", content: compactionPrompt }], true],
+  ]) {
+    const before = logs().length
+    const response = await request(client, messages)
+    const payload = await response.json()
+    assert.equal(response.status, 400, JSON.stringify(payload))
+    assert.equal(payload.error.code, compacting ? "prompt_budget_exceeded" : "context_length_exceeded")
+    assert.equal(/prompt is too long/i.test(payload.error.message), !compacting)
+    assert.equal(response.headers.get("x-should-retry"), "false")
+    assert.ok(!logs().slice(before).some(event => event.kind === "prompt" || event.method === "session/new"))
+  }
+})
+
+test("a customized compaction-looking prompt keeps the ordinary request and instruction semantics", async () => {
+  process.env.COMPAT_MODE = "response-first"
+  const client = await loader()
+  const before = logs().length
+  const latest = compactionPrompt + "\n\nActually continue the work and use tools."
+  const response = await request(client, [{ role: "user", content: "history" }, { role: "user", content: latest }],
+    { system: "Keep the user's instructions." })
+  assert.equal(response.status, 200, await response.text())
+  const sent = logs().slice(before).filter(event => event.kind === "prompt")
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].append, /Keep the user's instructions/)
+  assert.ok(!sent[0].append.includes("You are summarizing an existing conversation"))
+  assert.ok(sent[0].prompt.some(part => part.text?.includes(latest)))
+})
+
+test("cancelling an ingestion prompt prevents remaining fragments from being submitted", async () => {
+  process.env.COMPAT_MODE = "compaction-hang"
+  const client = await loader()
+  const abort = new AbortController()
+  const before = logs().length
+  const response = await request(client, summaryMessages(), { stream: true }, abort.signal)
+  const reading = response.text().catch(() => "aborted")
+  await waitFor(() => logs().slice(before).some(event => event.kind === "prompt"))
+  abort.abort()
+  await reading
+  await waitFor(() => logs().slice(before).some(event => event.method === "session/cancel"))
+  assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, 1)
 })
 
 for (const mode of ["response-first", "notification-first", "legacy", "legacy-hang", "unsupported", "missing", "missing-effort", "cross-session", "conflict", "conflict-effort", "bad-response", "real-error", "close", "hang"]) {

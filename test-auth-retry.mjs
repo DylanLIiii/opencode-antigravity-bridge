@@ -184,6 +184,9 @@ if (argv[0] === "acp" && argv.includes("--login")) {
           if (scenario === 'CREDITS') {
             fs.appendFileSync(agentLog, 'E] inference connection failed: transient EOF\n')
             output = '\n' + credits + '\r\n \t\r\n'
+          } else if (scenario.startsWith('CHAIN_')) {
+            output = '\n' + (scenario.includes('CREDITS') ? credits : network) + '\n⚠ Agent execution terminated due to error.\n' +
+              (scenario.endsWith('RECOVER') ? 'Recovered answer.' : '\n')
           } else if (scenario === 'NETWORK') output = '\n' + network + '\r\n\r\n'
           else if (scenario === 'API_ONLY') output = '\n' + api
           else if (scenario === 'RETRY_LOG') {
@@ -310,6 +313,7 @@ const postJson = async (body) => {
 
 for (const stream of [false, true]) for (const scenario of [
   'CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'FENCED', 'INVALID_ONLY', 'INVALID_RECOVER', 'NETWORK_RECOVER',
+  'CHAIN_CREDITS', 'CHAIN_NETWORK', 'CHAIN_CREDITS_RECOVER', 'CHAIN_NETWORK_RECOVER',
 ]) {
   test(`issue66 production notice ${scenario}, stream=${stream}`, async () => {
     const res = await loader.fetch('agy://local/messages', { method: 'POST', body: JSON.stringify({
@@ -322,9 +326,9 @@ for (const stream of [false, true]) for (const scenario of [
     const error = stream ? frames.find(frame => frame.type === 'error')?.error : json.error
     const output = stream ? frames.filter(frame => frame.delta?.type === 'text_delta').map(frame => frame.delta.text).join('')
       : (json.content || []).map(block => block.text || '').join('')
-    if (['CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG'].includes(scenario)) {
+    if (['CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'CHAIN_CREDITS', 'CHAIN_NETWORK'].includes(scenario)) {
       assert.ok(error, body)
-      if (scenario === 'NETWORK') {
+      if (scenario.endsWith('NETWORK')) {
         assert.equal(res.status, stream ? 200 : 502)
         assert.match(error.message, /network issue/)
       } else {

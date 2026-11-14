@@ -176,3 +176,21 @@ test("API detail buffering is bounded independently of split sizes", () => {
   assert.equal(f.pending, "")
   assert.equal(f.failureCandidate, true)
 })
+
+test("terminal evidence suppresses a following legacy banner before failure or recovery", () => {
+  for (const notice of [
+    "⚠ Your AI credits balance is too low to continue.",
+    "⚠ There was a network issue connecting to the server, please try again.",
+  ]) for (const recovery of ["\n", "Recovered."]) {
+    const text = notice + "\n" + ERR + recovery
+    for (const chunks of [[text], split(text), [notice + "\n", ERR, recovery]]) {
+      const f = new AgentNoticeFilter()
+      let output = ""
+      for (const chunk of chunks) output += f.push(chunk)
+      output += f.flush({ holdTerminal: true })
+      assert.equal(output.trim(), recovery.trim())
+      assert.equal(f.failureCandidate, recovery === "\n")
+      assert.equal(f.terminalDetail, recovery === "\n" ? notice : "")
+    }
+  }
+})

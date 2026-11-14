@@ -63,7 +63,7 @@ export class AgentNoticeFilter {
     let rest = this.pending + chunk
     this.pending = ""
     let out = ""
-    if (this.terminal && rest) { out = this.isDiagnostic() || this.apiDetail ? "" : this.terminal; this.terminal = "" }
+    if (this.terminal && rest) { out = this.isDiagnostic() || this.apiDetail || this.terminalDetail ? "" : this.terminal; this.terminal = "" }
     while (rest) {
       if (this.dropLine || this.midLine) {
         if (this.captureApi) this.apiDetail = (this.apiDetail + rest.split("\n", 1)[0]).slice(0, 2000)
@@ -97,7 +97,7 @@ export class AgentNoticeFilter {
         this.terminal = lead + line + "\n"
         this.failureCandidate = true
         rest = body.slice(end + 1)
-        if (rest) { out += this.isDiagnostic() || this.apiDetail ? "" : this.terminal; this.terminal = ""; continue }
+        if (rest) { out += this.isDiagnostic() || this.apiDetail || this.terminalDetail ? "" : this.terminal; this.terminal = ""; continue }
         return out
       }
       if (kind === "notice" || kind === "api") {

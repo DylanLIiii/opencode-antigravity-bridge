@@ -22,7 +22,7 @@ import { OutputLimitFilter } from "./output-limit.mjs"
 import { AgentNoticeFilter } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
-import { cloak, hint, turnsAway } from "./cloak.mjs"
+import { outgoing, hint, turnsAway } from "./cloak.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -1369,7 +1369,7 @@ class Proc {
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
-      ? { _meta: { antigravity: { systemPrompt: { append: cloak(this.instructions) } } } }
+      ? { _meta: { antigravity: { systemPrompt: { append: outgoingSystemText(this.instructions) } } } }
       : {}
 
     let session = null
@@ -3260,6 +3260,17 @@ function replaceClosedSystemReminders(text, replacer) {
   return out
 }
 
+// Rewriting inside an identified reminder also handles a billing line directly
+// adjacent to its tags, without treating a tag in ordinary user text as a notice.
+function outgoingSystemText(text) {
+  const withReminders = replaceClosedSystemReminders(text, (block) => {
+    const start = block.indexOf(">") + 1
+    const end = block.length - "</system-reminder>".length
+    return block.slice(0, start) + outgoing(block.slice(start, end)) + block.slice(end)
+  })
+  return outgoing(withReminders)
+}
+
 function stripVolatileOpening(text) {
   return replaceClosedSystemReminders(stripBillingHeader(text), (block) => stripAgentClockLines(block))
 }
@@ -3974,9 +3985,13 @@ function renderTurnMessage(message) {
   const out = []
   const joinedReminders = reminders.join("").trim()
   if (joinedReminders) {
-    out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(joinedReminders)
-      ? joinedReminders
-      : `<system-reminder>\n${joinedReminders}\n</system-reminder>`)
+    // Queued messages are user input and must be kept verbatim. Rewrite only
+    // the system/developer content before the queued text is reattached.
+    const systemText = message.role === "system" || message.role === "developer"
+      ? outgoingSystemText(joinedReminders) : joinedReminders
+    if (systemText.trim()) out.push(/^<system-reminder(?:\s[^>]*)?>[\s\S]*<\/system-reminder(?:\s[^>]*)?>$/.test(systemText)
+      ? systemText
+      : `<system-reminder>\n${systemText}\n</system-reminder>`)
   }
   out.push(...queuedParts)
   return out.join("\n\n")
@@ -3984,8 +3999,7 @@ function renderTurnMessage(message) {
 
 function renderTurnMessageParts(message, historical = false, stripResults = false) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
-    let text = renderTurnMessage(message)
-    if (message.role === "system" || message.role === "developer") text = cloak(text)
+    const text = renderTurnMessage(message)
     return text === "" ? [] : [{ type: "text", text }]
   }
   const parts = []
@@ -4042,7 +4056,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   const compacting = isCompactionRequest(current)
   if (!instructionsInSession) {
     const system = systemText(body)
-    if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${cloak(system)}\n</external_system_instructions>\n`)
+    if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${outgoingSystemText(system)}\n</external_system_instructions>\n`)
     if (callerWorkDir) appendPrompt(out, `\n${workDirNote(callerWorkDir)}\n\n`)
   }
   if (history.length) {
@@ -4314,6 +4328,17 @@ const UNCLOSED_NOTICE_RE = new RegExp(
   `<\\/?(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b`,
 )
 
+function outgoingNotice(notice) {
+  const open = /^<([a-z][a-z0-9-]*)(?:\s[^>]*)?>/i.exec(notice)
+  if (open) {
+    const close = `</${open[1]}>`
+    if (notice.endsWith(close)) {
+      return open[0] + outgoingSystemText(notice.slice(open[0].length, -close.length)) + close
+    }
+  }
+  return outgoingSystemText(notice)
+}
+
 // Forward complete protocol-generated context notices, Claude Code hook outputs,
 // and tool-companion blocks without turning arbitrary inline user instructions
 // into MCP function_response text. Mid-turn queued_command prompts and follow-up
@@ -4424,16 +4449,16 @@ function inspectToolTurn(results, body) {
         if (wrapped || message.role === "system" || message.role === "developer") {
           const inner = wrapped ? wrapped[1] : rest
           if (extractQueuedPrompt(inner) !== null || userInterruption.test(inner)) userSteered = true
-          else if (!isNoise(inner)) notices.push(cloak(inner))
+          else if (!isNoise(inner)) notices.push(inner)
         } else if (message.role === "user") userSteered = true
-        else if (!isNoise(rest)) notices.push(cloak(rest))
+        else if (!isNoise(rest)) notices.push(rest)
         continue
       }
       if (message.role === "system" || message.role === "developer") {
         if (extractQueuedPrompt(rest) !== null || userInterruption.test(rest)) {
           userSteered = true
         } else if (!isNoise(rest)) {
-          notices.push(cloak(rest))
+          notices.push(rest)
         }
       } else if (!isNoise(rest)) {
         if ((hookOutput.test(rest) || claudeMetaFeedback.test(rest)) && !userInterruption.test(rest)) {
@@ -4445,7 +4470,8 @@ function inspectToolTurn(results, body) {
     }
   }
   const finalResults = notices.length
-    ? appendResultText(out, out.length - 1, `<system-reminder>\n${notices.join("\n\n")}\n</system-reminder>`)
+    ? appendResultText(out, out.length - 1, `<system-reminder>\n${notices.map(notice =>
+      userInterruption.test(notice) ? notice : outgoingNotice(notice)).join("\n\n")}\n</system-reminder>`)
     : out
   return { results: finalResults, userSteered }
 }

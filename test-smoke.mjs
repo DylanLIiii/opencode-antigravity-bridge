@@ -398,13 +398,23 @@ async function prompt(params, recorded = false) {
     return { stopReason: "end_turn" }
   }
   if (text.includes("PERMISSION")) {
+    const scenario = text.match(/PERMISSION_CASE:([a-z_]+)/)?.[1]
+    const toolCall = {
+      client_name: { sessionUpdate: "tool_call", name: "mcp_ide-tools_echo", title: "Run mcp_ide-tools_echo", status: "pending", kind: "other", rawInput: { token: "example" } },
+      client_title: { title: "mcp_ide-tools_echo" },
+      client_mcp_title: { title: "mcp(ide-tools/echo)" },
+      unknown: { name: "mcp_ide-tools_unknown" },
+      spoofed: { name: "run_command", title: "Run mcp_ide-tools_echo?" },
+      missing: {},
+      no_allow_once: { name: "mcp_ide-tools_echo" },
+    }[scenario] || { title: "Run run_command?", rawInput: { CommandLine: "printf SHOULD_NOT_RUN" } }
     const outcome = await new Promise(resolve => {
       pendingClient.set("perm", resolve)
       send({ jsonrpc: "2.0", id: "perm", method: "session/request_permission", params: {
         sessionId: session.id,
-        toolCall: { toolCallId: "call_perm", title: "Run run_command?", rawInput: { CommandLine: "printf SHOULD_NOT_RUN" } },
+        toolCall: { toolCallId: "call_perm", ...toolCall },
         options: [
-          { optionId: "allow", name: "Allow once", kind: "allow_once" },
+          ...(scenario === "no_allow_once" ? [] : [{ optionId: "allow", name: "Allow once", kind: "allow_once" }]),
           { optionId: "always", name: "Allow always", kind: "allow_always" },
           { optionId: "deny", name: "Deny", kind: "reject_once" },
         ],
@@ -1824,6 +1834,15 @@ for (const change of ["tools", "tools-steering", "tools-shrink", "model"]) {
   const permission = lastOf("permission")
   check("built-in tool permission requests are denied", permission?.outcome?.outcome === "selected" && permission.outcome.optionId === "deny", JSON.stringify(permission))
   check("a denied built-in tool does not fail the turn", stopOf(events) === "end_turn")
+}
+
+for (const [scenario, expected] of [
+  ["client_name", "allow"], ["client_title", "allow"], ["client_mcp_title", "allow"], ["unknown", "deny"],
+  ["spoofed", "deny"], ["missing", "deny"], ["no_allow_once", "deny"],
+]) {
+  await readSSE(await callFetch({ model, tools: [echoTool], messages: [{ role: "user", content: `PERMISSION_CASE:${scenario}` }] }))
+  const permission = lastOf("permission")
+  check(`permission ${scenario} selects ${expected}`, permission?.outcome?.outcome === "selected" && permission.outcome.optionId === expected, JSON.stringify(permission))
 }
 
 for (const [prompt, expected] of [

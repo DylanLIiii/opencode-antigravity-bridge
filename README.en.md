@@ -422,9 +422,9 @@ user profile or VM.
   `tools: []`, `inheritMcp: false`, `inheritCustomizations: false` and
   `excludeDefaultComponents: true`, so the user's global MCP servers, skills and
   plugins never reach the model. agy is not started with
-  `--dangerously-skip-permissions`: every `session/request_permission` (shell,
-  file edits, browser, questions) is answered with a rejection. Client tools
-  need no permission because they arrive through MCP. An available absolute
+  `--dangerously-skip-permissions`: permission requests for advertised client
+  MCP tools are allowed once and execution remains with the client; requests for
+  agy's built-in tools (shell, file edits, browser, questions) are rejected. An available absolute
   client directory from `x-magpie-work-dir` or the caller's environment text is
   added with `--add-dir`; agy still runs in its isolated workspace, and the
   session instructions say where client tools execute.

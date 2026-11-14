@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.5
+
+- Allow once for permission requests identifying advertised client MCP tools, while continuing to reject agy's built-in tools. This addresses tool calls stopped by agy 1.5.8 permission checks (#63).
+
 ## 0.8.4
 
 - Restore capability-advertised system append on every native agy 1.5+ resume, without repeating instructions in user turns or accumulating append text. Preserve older ACP behavior.

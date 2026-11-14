@@ -1555,8 +1555,15 @@ class Proc {
       throw Object.assign(new Error("unknown session"), { code: -32602 })
     }
     if (method === "session/request_permission") {
-      // Client tools arrive through MCP and never ask. Deny anything that would
-      // run inside agy itself (shell, file edits, questions, browser).
+      // Only approve explicitly identified, currently advertised client MCP tools.
+      // Their execution is still delegated to the client through the MCP adapter.
+      const call = params?.toolCall
+      const isClientTool = this.tools.some(tool =>
+        call?.name === IDE_TOOL_PREFIX + tool.name
+        || call?.title === IDE_TOOL_PREFIX + tool.name
+        || call?.title === `mcp(ide-tools/${tool.name})`)
+      const allow = isClientTool && (params?.options || []).find(option => option?.kind === "allow_once")
+      if (allow) return { outcome: { outcome: "selected", optionId: allow.optionId } }
       this.deniedPermissions++
       const reject = (params?.options || []).find((option) => option?.kind === "reject_once")
         || (params?.options || []).find((option) => option?.kind === "reject_always")

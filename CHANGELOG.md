@@ -1,9 +1,13 @@
 # Changelog
 
-## 0.8.6
+## 0.8.7
 
 - Recognize agy network and depleted AI credits failures, and suppress invalid-output retry notices while preserving quoted text.
 - Add a project Coding Hub with OpenCode routing, isolated delegation, and repository-specific validation rules.
+
+## 0.8.6
+
+- Frame Claude Code compaction requests as summary-only. When the client appends its compaction instruction to a still-unanswered prompt, the history footer and a closing reminder now ask for the summary and record the question as pending work, instead of "Answer the current turn", whose answer would be lost in the discarded compaction reply.
 
 ## 0.8.5
 

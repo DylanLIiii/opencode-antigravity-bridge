@@ -82,6 +82,12 @@ const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const DEFAULT_MAX_PROMPT_TEXT_BYTES = 1024 * 1024
 // Claude Code prefixes the first message after compaction with this summary.
 const COMPACTION_SUMMARY_MARKER = "This session is being continued from a previous conversation"
+// Claude Code's compaction request. When the user submits while context is full,
+// it appends this instruction to the still-unanswered prompt in the same turn.
+const COMPACTION_REQUEST_MARKER = "Your task is to create a detailed summary of the conversation so far"
+const COMPACTION_REQUEST_REMINDER = "[This turn is a context-compaction request. A question or request at the start of the current turn " +
+  "is the newest message of the conversation: record it in the summary as pending work; do not answer it or carry it out. " +
+  "Reply only with the analysis and summary the compaction instructions ask for.]"
 // Client compaction policy. Raising this declaration requires a separately
 // verified upstream window and does not alter agy's checkpoint configuration.
 const DEFAULT_CONTEXT_WINDOW = 256_000
@@ -627,6 +633,12 @@ function isCompactionSummary(message) {
   if (typeof message.content === "string") return message.content.includes(COMPACTION_SUMMARY_MARKER)
   return Array.isArray(message.content) && message.content.some(block =>
     block?.type === "text" && typeof block.text === "string" && block.text.includes(COMPACTION_SUMMARY_MARKER))
+}
+
+// The reply to a compaction request is consumed by the client and never shown;
+// an answer written there is lost, so the request must not read as a turn to answer.
+function isCompactionRequest(messages) {
+  return messages.some(message => message?.role === "user" && messageText(message).includes(COMPACTION_REQUEST_MARKER))
 }
 
 function hasRecentCompactionSummary(body) {
@@ -4027,6 +4039,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   const { history: originalHistory, messages: current } = trailingMessages(body)
   const history = replay?.history ?? originalHistory
   const out = []
+  const compacting = isCompactionRequest(current)
   if (!instructionsInSession) {
     const system = systemText(body)
     if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${cloak(system)}\n</external_system_instructions>\n`)
@@ -4047,13 +4060,15 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
         appendPrompt(out, "\n")
       }
     }
-    appendPrompt(out, "</conversation_history>\nAnswer the current turn; do not replay historical tool records.\n\n")
+    appendPrompt(out, "</conversation_history>\n" + (compacting ? "Summarize this conversation as the current turn asks" : "Answer the current turn") +
+      "; do not replay historical tool records.\n\n")
   }
   const currentParts = renderTurnMessagesParts(current)
   if (!out.length) return currentParts
   appendPrompt(out, "<current_turn>\n")
   appendPrompt(out, currentParts)
   appendPrompt(out, "\n</current_turn>")
+  if (compacting) appendPrompt(out, "\n" + COMPACTION_REQUEST_REMINDER)
   return out
 }
 

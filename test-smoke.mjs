@@ -3591,6 +3591,56 @@ for (const steering of [false, true]) {
 }
 
 {
+  // Long screenshot loops resend every earlier image in nested tool_result history.
+  // The bounded identity must still transmit the real image and keep the same session.
+  const shot = (data, text) => [
+    { type: 'text', text: `before ${text}` },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data } },
+    { type: 'text', text: `after ${text}` },
+  ]
+  const imageResults = (events, data, text) => toolCalls(events).map(call => ({
+    type: 'tool_result', tool_use_id: call.id, content: shot(data, text), is_error: true,
+  }))
+  const first = { model, metadata: { user_id: 'bounded-image-history' }, messages: [{ role: 'user', content: 'TWOSTEP bounded image history' }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(first))).events
+  const convId = inits().at(-1).convId
+  const imageOne = 'Ym91bmRlZC1pbWFnZS1vbmU='
+  const imageTwo = 'Ym91bmRlZC1pbWFnZS10d28='
+  const second = { ...first, messages: [...first.messages, { role: 'assistant', content: assistantBlocks(firstEvents) },
+    { role: 'user', content: imageResults(firstEvents, imageOne, 'one') }] }
+  const secondEvents = (await readSSE(await callFetch(second))).events
+  const third = { ...second, messages: [...second.messages, { role: 'assistant', content: assistantBlocks(secondEvents) },
+    { role: 'user', content: imageResults(secondEvents, imageTwo, 'two') }] }
+  const thirdEvents = (await readSSE(await callFetch(third))).events
+  const delivered = logs().filter(event => event.type === 'mcpResult' && event.convId === convId).slice(-2)
+  check('image tool loop completes in one reused agy session', stopOf(secondEvents) === 'tool_use' && stopOf(thirdEvents) === 'end_turn' && inits().at(-1).convId === convId)
+  check('image tool results reach MCP with ordered content and error flags',
+    delivered.length === 2 && [imageOne, imageTwo].every((data, index) =>
+      delivered[index].result.isError === true &&
+      JSON.stringify(delivered[index].result.content.map(part => part.type)) === JSON.stringify(['text', 'image', 'text']) &&
+      delivered[index].result.content[1].data === data && delivered[index].result.content[1].mimeType === 'image/png'))
+
+  const same = nextTurn(third, thirdEvents, 'MEMORY after bounded image history')
+  const before = inits().length
+  const sameEvents = (await readSSE(await callFetch(same))).events
+  check('equal image digests keep a same-session continuation', inits().length === before && lastOf('user').convId === convId && textOf(sameEvents).includes('prompts so far 2'), textOf(sameEvents))
+
+  const stored = fs.readFileSync(bridgeStateFile, 'utf8')
+  check('bounded image history keeps raw tool images out of persisted session state', !stored.includes(imageOne) && !stored.includes(imageTwo))
+  const { default: restartedDefault } = await import('./index.mjs?bounded-image-history-restart')
+  const restartedLoader = await (await restartedDefault.server({ client: null, directory: os.tmpdir() }, {})).auth.loader(async () => ({ key: 'agy' }))
+  const restart = nextTurn(same, sameEvents, 'MEMORY restarted bounded image history')
+  await readSSE(await restartedLoader.fetch('agy://local/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restart) }))
+  check('restarted bridge resumes through the digest-based image history hash', inits().at(-1).resumed === true && lastOf('user').convId === convId)
+
+  const changed = structuredClone(restart)
+  changed.messages[2].content[0].content[1].source.data = 'Y2hhbmdlZC1pbWFnZQ=='
+  const changedBefore = inits().length
+  await readSSE(await callFetch(changed))
+  check('changing one nested tool image starts a new session', inits().length === changedBefore + 1 && lastOf('user').convId !== convId)
+}
+
+{
   // A live owner must keep exclusive access, even if its lock is over five seconds old.
   for (const age of [0, 10_000]) {
     const snapshot = fs.readFileSync(bridgeStateFile, 'utf8')

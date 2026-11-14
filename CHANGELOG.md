@@ -3,6 +3,7 @@
 ## 0.8.7
 
 - Recognize agy network and depleted AI credits failures, retain API/retry-log error evidence, and suppress invalid-output retry notices while preserving quoted text and recovered replies (#66).
+- Replace zero-width system-prompt cloaking with equivalent wording across whitespace and invisible characters, remove standalone billing metadata, and reword path-reference guidance on system/developer/reminder outputs while preserving user text, tool payloads and session identities (#67).
 - Release prior HTTP response payloads during multi-step tool turns and hash nested tool-result images in session identities, reducing memory retained by screenshot loops while preserving late-result usage estimates (#68). Previously parked sessions containing tool-result images replay once after this identity-format change.
 - Isolate smoke tests from saved account profiles and verify separate-session replay for complete unmatched tool histories while preserving the surviving branch.
 - Add a project Coding Hub with OpenCode routing, isolated delegation, and repository-specific validation rules.

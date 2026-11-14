@@ -954,9 +954,19 @@ class Turn {
     } else {
       this.stepInputEstimates.push(estimate)
     }
+    this.releaseResponsePayload()
     this.responseSteps.push(step)
     this.currentResponse = step
     return step
+  }
+
+  releaseResponsePayload() {
+    if (!this.currentResponse) return
+    // Usage accounting needs only the step's estimates and settled usage. Keep
+    // the current payload even after settlement: a late prompt may still need
+    // its request options and output snapshot until the next HTTP step attaches.
+    this.currentResponse.body = null
+    this.currentResponse.contentSnapshot = null
   }
 
   beginPrompt(parts, lateCalls) {
@@ -2200,6 +2210,7 @@ class Proc {
   finalizeTurn(turn) {
     if (turn.finalized) return
     turn.finalized = true
+    turn.releaseResponsePayload()
     if (turn.stepsFile && turn.promptCount > 0 && !turn.stepUsageReconciled) this.stepUsageTrusted = false
     for (const attempt of [turn.promptAttempt, ...turn.steeringAttempts].filter(Boolean)) {
       if (promptAttempts.get(attempt.key) !== attempt) continue
@@ -3485,7 +3496,13 @@ function historyKey(messages) {
         ids.set(block.id, ordinal)
         value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
       } else if (block.type === "tool_result") {
-        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...toolResult(block) }
+        const result = toolResult(block)
+        // Match image identities without copying base64 into every history key.
+        // Keep toolResult's raw data intact for MCP transmission and replay.
+        const content = result.content.map(part => part.type === "image"
+          ? { type: "image", mimeType: part.mimeType, sha256: digest(part.data) }
+          : part)
+        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...result, content }
       } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
         block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
         value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }

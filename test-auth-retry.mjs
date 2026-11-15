@@ -12,6 +12,7 @@ const fakeAgyBin = path.join(tmpRoot, process.platform === "win32" ? "agy.cmd" :
 const logFile = path.join(tmpRoot, "events.jsonl")
 const stateDir = path.join(tmpRoot, "state")
 fs.mkdirSync(stateDir, { recursive: true })
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
 
 // A PID is not a process identity: Windows quickly reuses IDs from earlier
 // OAuth retries for other test workers. Track a unique connection held by each

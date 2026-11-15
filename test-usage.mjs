@@ -235,7 +235,7 @@ else if (version) {
   await fs.writeFile(executable, process.platform === "win32"
     ? `@echo off\r\nsetlocal DisableDelayedExpansion\r\n"${process.execPath.replace(/%/g, "%%")}" "${script.replace(/%/g, "%%")}" %*\r\n`
     : `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} "$@"\n`, { mode: 0o700 })
-  const env = { ...process.env, TEST_LOG: logPath, TEST_REPORT: JSON.stringify(report([group([bucket()])])), TEST_DESCENDANT: descendantPath, ...extraEnv }
+  const env = { ...process.env, AGY_BRIDGE_STORED_SIGNIN: "skip", TEST_LOG: logPath, TEST_REPORT: JSON.stringify(report([group([bucket()])])), TEST_DESCENDANT: descendantPath, ...extraEnv }
   const home = path.join(directory, "home")
   await fs.mkdir(home, { recursive: true })
   return {
@@ -544,7 +544,7 @@ async function windowsFixture(t, { mode = "success", taskkill = "success", clean
   }
   const env = Object.freeze({
     Path: "C:\\Program Files\\Tools;D:\\bin", ComSpec: "D:\\Windows\\System32\\cmd.exe", SystemRoot: "D:\\Windows", PathExt: ".EXE;.BAT",
-    browser: "old-browser", agy_cli_disable_auto_update: "false", CALLER_ONLY: "kept",
+    browser: "old-browser", agy_cli_disable_auto_update: "false", AGY_BRIDGE_STORED_SIGNIN: "skip", CALLER_ONLY: "kept",
   })
   const home = path.join(directory, "home")
   await fs.mkdir(home)

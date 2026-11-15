@@ -3,26 +3,34 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { agySpawnSpec, childEnv, wslDistro } from "./platform.mjs"
+import { cannotSignIn, isDead, noteDead, readAccountSignIn, storedSignIn } from "./signin.mjs"
 
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const CLEANUP_TIMEOUT_MS = 1000
+const SIGN_IN_TALK = /not (?:logged|signed) in|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again/i
 
-class UsageError extends Error {}
+class UsageError extends Error {
+  constructor(message, { kind, output } = {}) {
+    super(message)
+    this.kind = kind ?? null
+    this.output = output ?? ""
+  }
+}
 
 const text = value => typeof value === "string" ? value.trim() : ""
 const field = (value, camel, snake) => value?.[camel] ?? value?.[snake]
 
 function commandFailure(output) {
-  if (/not (?:logged|signed) in|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again/i.test(output)) {
-    return new UsageError("agy usage needs authentication. Run `agy` in a terminal to sign in again.")
+  if (SIGN_IN_TALK.test(output)) {
+    return new UsageError("agy usage needs authentication. Run `agy` in a terminal to sign in again.", { kind: "auth", output })
   }
   const eligibility = /eligibility check failed|not eligible|unsupported (?:country|region)|does not support google tos/i.test(output)
   const network = /\b(?:eof|timeout|timed out|deadline exceeded|no such host|connection (?:refused|reset)|network|proxy|tls|ssl|certificate)\b/i.test(output)
-  if (network) return new UsageError(`agy usage ${eligibility ? "eligibility check " : ""}failed on a network request. Check network or proxy settings.`)
-  if (eligibility) return new UsageError("agy reports that this account is not eligible for Antigravity.")
-  return new UsageError("agy could not read usage. Run `agy` in a terminal to check its status.")
+  if (network) return new UsageError(`agy usage ${eligibility ? "eligibility check " : ""}failed on a network request. Check network or proxy settings.`, { output })
+  if (eligibility) return new UsageError("agy reports that this account is not eligible for Antigravity.", { output })
+  return new UsageError("agy could not read usage. Run `agy` in a terminal to check its status.", { output })
 }
 
 function resetTime(value) {
@@ -217,7 +225,10 @@ function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, platform,
       code, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"),
     }))
     signal?.addEventListener("abort", abort, { once: true })
-    timer = setTimeout(() => finish(new UsageError("agy usage query timed out.")), Math.max(1, deadline - Date.now()))
+    timer = setTimeout(() => {
+      const output = Buffer.concat(stdout).toString("utf8") + "\n" + Buffer.concat(stderr).toString("utf8")
+      finish(new UsageError("agy usage query timed out.", { kind: "timeout", output }))
+    }, Math.max(1, deadline - Date.now()))
     // Cover cancellation during spawn, after registering error/close handlers.
     if (signal?.aborted) abort()
   })
@@ -345,23 +356,47 @@ export function createUsageReader(resolveAgy, options = {}) {
     }
     return pending.get(key)
   }
+  const signInFor = async (account, env, platform) => {
+    if (options.signIn) return await options.signIn(account)
+    if (account.dir) return await readAccountSignIn(account.dir, { env })
+    return await storedSignIn({ env, platform })
+  }
   return async () => {
-    if (usageDisabled(options.env ?? process.env)) return { windows: [], signIn: "kept" }
+    const env = options.env ?? process.env
+    const platform = options.platform ?? process.platform
+    if (usageDisabled(env)) return { windows: [], signIn: "kept" }
     try {
       const agy = resolveAgy()
       const accounts = options.resolveAccounts
         ? await options.resolveAccounts(agy)
         : [{ name: null, dir: null }]
       const results = await Promise.all(accounts.map(async account => {
+        const stored = wslDistro(env, platform) ? { state: "unknown" } : await signInFor(account, env, platform)
+        const preProblem = cannotSignIn(stored) || (isDead(stored) ? "agy's sign-in no longer works" : "")
+        if (preProblem) {
+          return { account, expired: `${preProblem}: run \`agy\` in a terminal to sign in` }
+        }
         try {
           return { account, report: await query(agy, account) }
         } catch (error) {
+          const authFailure = error instanceof UsageError && stored?.state === "present" && (
+            error.kind === "auth" ||
+            (error.kind === "timeout" && stored.expired && (!error.output.trim() || SIGN_IN_TALK.test(error.output)))
+          )
+          if (authFailure) {
+            noteDead(stored)
+            return { account, expired: error.message }
+          }
           return { account, error }
         }
       }))
       const windows = []
       const errors = []
-      for (const { account, report, error } of results) {
+      for (const { account, report, error, expired } of results) {
+        if (expired) {
+          errors.push(`${account.name ?? "default"}: ${expired}`)
+          continue
+        }
         if (error) {
           errors.push(`${account.name ?? "default"}: ${error instanceof UsageError ? error.message : "agy usage query failed."}`)
           continue
@@ -370,6 +405,9 @@ export function createUsageReader(resolveAgy, options = {}) {
         for (const window of structuredClone(report).windows) {
           windows.push(account.name ? { ...window, name: `[${account.name}] ${window.name}` } : window)
         }
+      }
+      if (!windows.length && results.length && results.every(item => item.expired)) {
+        return { windows: [], error: errors.join("; "), signIn: "expired" }
       }
       if (!windows.length && errors.length) {
         return { windows: [], error: errors.join("; "), signIn: "kept" }

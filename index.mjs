@@ -22,8 +22,11 @@ import { OutputLimitFilter } from "./output-limit.mjs"
 import { AgentNoticeFilter } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
-import { outgoing, hint, turnsAway } from "./cloak.mjs"
+import { cloakUser, outgoing, hint, turnsAway } from "./cloak.mjs"
+import { fitTools } from "./tool-budget.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedSignInNow } from "./signin.mjs"
 import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
+import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -42,6 +45,23 @@ const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
+
+export function ideToolOf(call) {
+  for (const value of [call?.name, call?.title, call?.toolName]) {
+    if (typeof value !== "string") continue
+    const text = value.trim().replace(/\?$/, "")
+    const match = /^(?:mcp\(ide-tools\/([^()\s]+)\)|(?:mcp\s+)?"?ide-tools\/([^()\s"]+)"?|mcp_ide-tools_(\S+))$/.exec(text)
+    if (match) return match[1] || match[2] || match[3]
+  }
+  return null
+}
+
+export function userTurnParts(parts) {
+  if (!Array.isArray(parts)) return parts
+  return parts.map((part) => (part?.type === "text" && typeof part.text === "string"
+    ? { ...part, text: cloakUser(part.text) }
+    : part))
+}
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
 function maxProcs() {
   const value = Number(process.env.AGY_BRIDGE_MAX_PROCS)
@@ -168,10 +188,16 @@ function configuredTimeout(name, fallback) {
     : fallback
 }
 
-function contextWindow(model) {
+function contextWindow(model, liveContext = null) {
   const requested = Number(process.env.AGY_BRIDGE_CONTEXT_WINDOW)
-  const window = Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576
-    ? requested : (agyUnlocked() ? UNLOCKED_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW)
+  if (Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576) {
+    const cap = Number.isSafeInteger(liveContext) && liveContext > 0 ? Math.min(requested, liveContext) : requested
+    return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(cap, 131_072) : cap
+  }
+  if (Number.isSafeInteger(liveContext) && liveContext > 0) {
+    return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(liveContext, 131_072) : liveContext
+  }
+  const window = agyUnlocked() ? UNLOCKED_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW
   return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(window, 131_072) : window
 }
 
@@ -278,6 +304,11 @@ async function listAgyModels(agyPath, extraArgs = []) {
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const catalogCache = new Map()
 const offeredProbes = new Map()
+
+function catalogWarming() {
+  const pending = [...offeredProbes.values()].map(entry => entry.promise).filter(Boolean)
+  return pending.length ? Promise.allSettled(pending).then(() => undefined) : null
+}
 
 function offeredKey(agyPath, account) {
   return `${wslDistro() || "native"}|${agyPath}|${account.key}`
@@ -386,6 +417,7 @@ async function getAccounts(agy, { refresh = false } = {}) {
   const usable = [DEFAULT_ACCOUNT]
   await Promise.all(accounts.slice(1).map(async account => {
     if (!agy) return
+    if (await backgroundBlocked({ dir: account.dir })) return
     const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "--version"], {
       timeoutMs: 3_000,
       env: accountEnv(process.env, account.dir),
@@ -449,6 +481,9 @@ function buildModelCatalog(list) {
 async function loadModelCatalog(agyPath, refresh = false, account = DEFAULT_ACCOUNT) {
   const key = `${agyPath}|${account.key}`
   if (!refresh && catalogCache.has(key)) return catalogCache.get(key)
+  if (refresh && !wslDistro() && (await backgroundBlocked({ dir: account.dir }))) {
+    return buildModelCatalog(FALLBACK_MODELS)
+  }
   const extraArgs = account.dir ? [`--gemini_dir=${account.dir}`] : []
   const catalog = buildModelCatalog(await listAgyModels(agyPath, extraArgs))
   catalogCache.set(key, catalog)
@@ -908,6 +943,8 @@ class Turn {
     this.cancelContinuation = false
     this.cancelledExpectedHash = null
     this.agentError = false
+    this.deliveredTextChars = 0
+    this.deliveredThinkingChars = 0
     this.notices = new AgentNoticeFilter(() => !!lastAgentErrorSync(this.proc.logPath, this.logOffset))
     this.outputLimit = new OutputLimitFilter()
     // agy's title summarizer shares this session's thought stream (#39).
@@ -1084,7 +1121,10 @@ class Turn {
   pushThought(chunk) {
     if (this.done || this.finalized) return
     const text = this.summaryThoughts ? this.summaryThoughts.push(chunk) : chunk
-    if (text) this.push({ type: "thinking", text })
+    if (text) {
+      if (text.trim()) this.deliveredThinkingChars += text.length
+      this.push({ type: "thinking", text })
+    }
   }
 
   // Any held thought prefix is real reasoning only when it never completed the
@@ -1092,14 +1132,20 @@ class Turn {
   flushThoughts() {
     if (!this.summaryThoughts) return
     const text = this.summaryThoughts.flush()
-    if (text && !this.done && !this.finalized) this.push({ type: "thinking", text })
+    if (text && !this.done && !this.finalized) {
+      if (text.trim()) this.deliveredThinkingChars += text.length
+      this.push({ type: "thinking", text })
+    }
   }
 
   // agy reports an upstream failure as an ordinary message chunk followed by
   // end_turn, and its retry notices the same way. Only standalone lines count.
   #pushVisible(chunk) {
     const text = this.notices.push(chunk)
-    if (text) this.push({ type: "text", text })
+    if (text) {
+      if (text.trim()) this.deliveredTextChars += text.length
+      this.push({ type: "text", text })
+    }
   }
 
   flushText(holdTerminal = false) {
@@ -1111,7 +1157,14 @@ class Turn {
     if (rest) this.#pushVisible(rest)
     if (this.agentError) return
     const text = this.notices.flush({ holdTerminal })
-    if (text) this.push({ type: "text", text })
+    if (text) {
+      if (text.trim()) this.deliveredTextChars += text.length
+      this.push({ type: "text", text })
+    }
+  }
+
+  hasDeliveredOutput() {
+    return this.deliveredTextChars > 0 || this.deliveredThinkingChars > 0 || this.calls.length > 0
   }
 
   complete(result) {
@@ -1243,6 +1296,14 @@ function nativeSessionSettings(version) {
   return !!parsed && (Number(parsed[1]) > 1 || (Number(parsed[1]) === 1 && Number(parsed[2]) >= 5))
 }
 
+function fitProcTools(tools) {
+  const marked = (tools || []).map((tool) => ({
+    ...tool,
+    _meta: { ...(tool._meta && typeof tool._meta === "object" ? tool._meta : {}), "antigravity/alwaysLoad": true },
+  }))
+  return fitTools(marked)
+}
+
 class Proc {
   constructor(agyPath, convKey, opts) {
     this.agyPath = agyPath
@@ -1257,6 +1318,7 @@ class Proc {
     this.model = opts.model
     this.selection = opts.selection
     this.tools = opts.tools
+    this.fittedTools = fitProcTools(opts.tools)
     this.toolsSignature = JSON.stringify(opts.tools)
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
@@ -1557,7 +1619,7 @@ class Proc {
       waiter.resolve()
     }
     this.listWaiters = this.listWaiters.filter((item) => item.version > this.listedVersion)
-    return this.tools
+    return this.fittedTools
   }
 
   addWatcher(socket) {
@@ -1580,6 +1642,7 @@ class Proc {
       return
     }
     this.tools = tools
+    this.fittedTools = fitProcTools(tools)
     this.toolsSignature = signature
     await this.#announceTools()
   }
@@ -1611,11 +1674,8 @@ class Proc {
     if (method === "session/request_permission") {
       // Only approve explicitly identified, currently advertised client MCP tools.
       // Their execution is still delegated to the client through the MCP adapter.
-      const call = params?.toolCall
-      const isClientTool = this.tools.some(tool =>
-        call?.name === IDE_TOOL_PREFIX + tool.name
-        || call?.title === IDE_TOOL_PREFIX + tool.name
-        || call?.title === `mcp(ide-tools/${tool.name})`)
+      const toolName = ideToolOf(params?.toolCall)
+      const isClientTool = !!toolName && this.tools.some(tool => tool.name === toolName)
       const allow = isClientTool && (params?.options || []).find(option => option?.kind === "allow_once")
       if (allow) return { outcome: { outcome: "selected", optionId: allow.optionId } }
       this.deniedPermissions++
@@ -1795,7 +1855,7 @@ class Proc {
       turn.stepCursor = modelUsageCursor(turn.stepsFile)
       if (turn.stepsFile && turn.stepCursor === null) this.stepUsageTrusted = false
       // Content a cancelled turn never delivered still belongs to the session.
-      let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
+      let promptParts = userTurnParts(mergePromptParts(this.unsentPrompt, toPromptParts(content)))
       this.unsentPrompt = null
       let usage = null
       let lateCalls = null
@@ -1864,6 +1924,33 @@ class Proc {
           const detail = await lastAgentError(this.logPath, turn.logOffset)
           if (detail) throw this.#formatAgentError(detail, turn.promptGuardMatched)
           if (this.compaction) throw new AgentTurnError("agy bridge: upstream refused the compaction request; no summary was produced")
+        }
+        if (!turn.notices.failureCandidate && result?.stopReason !== "refusal") {
+          const hasContent = turn.hasDeliveredOutput()
+          if (!hasContent) {
+            const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
+            const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
+            if (detail) {
+              turn.agentError = true
+              throw this.#formatAgentError(detail, turn.promptGuardMatched)
+            }
+            if (this.compaction) {
+              throw new AgentTurnError("agy bridge: upstream returned an empty compaction response; no summary was produced")
+            }
+            if (result?.stopReason === "end_turn") {
+              turn.agentError = true
+              throw new AgentTurnError("agy bridge: upstream ended the turn without producing a model response", "api_error")
+            }
+          } else if (!turn.calls.length && turn.stepsFile && turn.stepCursor != null && fs.existsSync(turn.stepsFile)) {
+            const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
+            if (loggedDetail) {
+              const batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+              if (!batch || batch.pending || (batch.steps?.length || 0) === 0) {
+                turn.agentError = true
+                throw this.#formatAgentError(loggedDetail, turn.promptGuardMatched)
+              }
+            }
+          }
         }
         turn.flushText()
         if (turn.compactionStages.length) {
@@ -2225,8 +2312,8 @@ class Proc {
           content: Array.isArray(message.content)
             ? message.content.filter(block => block?.type !== "tool_result") : message.content,
         }))
-        const parts = mergePromptParts(late.length ? renderLateResultParts(late, this.supportsImages) : [],
-          mergePromptParts(renderContinuedTurnParts(messages), outputFormatReminder(body)))
+        const parts = userTurnParts(mergePromptParts(late.length ? renderLateResultParts(late, this.supportsImages) : [],
+          mergePromptParts(renderContinuedTurnParts(messages), outputFormatReminder(body))))
         validateAcpPromptBudget(parts, this.instructions, body)
         validatePromptBudget(results.flatMap(item => item.result.content), this.instructions, body)
         if (promptHasImage(parts) && !this.supportsImages) throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
@@ -2256,11 +2343,12 @@ class Proc {
           turn.recordPromptUsage(number, result?.usage)
         }, error => {
           if (!isUnsupportedSteering(error) || turn.cancelRequested || turn.done || this.dead) throw error
-          validateAcpPromptBudget(content, this.instructions, body)
+          const fallbackParts = userTurnParts(content)
+          validateAcpPromptBudget(fallbackParts, this.instructions, body)
           this.nativeSteeringRejected = true
           if (turn.stepsFile) this.stepUsageTrusted = false
           turn.stepCursor = null
-          turn.steeringFallback = content
+          turn.steeringFallback = fallbackParts
           // Repeat this batch's results in the follow-up: cancellation can cause
           // AGY to store a cancellation in place of an already delivered result.
           for (const call of turn.calls) {
@@ -2675,6 +2763,8 @@ function unpark(convKey) {
   saveParked()
 }
 
+const USER_CLOAK = 1
+
 // Remember a session so a later request, or a restarted bridge, resumes it
 // instead of replaying history. Called after every completed turn and on retire.
 function park(proc) {
@@ -2690,6 +2780,7 @@ function park(proc) {
     toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
     instructionsHash: digest(instructionsIdentity(proc.instructions)),
     workDir: proc.workDir,
+    userCloak: USER_CLOAK,
     at: Date.now(),
   })
   while (parked.size > MAX_PARKED) parked.delete(parked.keys().next().value)
@@ -2700,7 +2791,7 @@ function peekParked(convKey, opts) {
   loadParked()
   const entry = parked.get(convKey)
   if (!entry || Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions))) return null
+    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions)) || entry.userCloak !== USER_CLOAK) return null
   if (entry.historyHash === digest(historyKey(opts.history))) return entry
   const ids = toolUseIdentitiesKey(opts.history)
   if (ids == null || entry.toolUseIdentitiesHash !== digest(ids) ||
@@ -4977,7 +5068,7 @@ function responseUsage(proc, turn, step, content, result) {
   const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
   const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
   let cacheRatio = Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
-  let input = Math.max(1, tokenCount(estimate * scale))
+  let input = estimate > 0 ? Math.max(1, tokenCount(estimate * scale)) : 0
   let write = 0
   if (final) {
     const sum = turn.stepInputEstimates.reduce((total, value) => total + value, 0)
@@ -5009,7 +5100,7 @@ function responseUsage(proc, turn, step, content, result) {
   const emitted = responseOutputEstimate(content)
   const output = final
     ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
-    : Math.max(1, emitted.output)
+    : emitted.output
   const thinking = Math.min(output, emitted.thinking)
   return {
     input_tokens: input - read,
@@ -5121,7 +5212,10 @@ async function measuredUsage(turn, step, content, result) {
     output_tokens: output, thinking_tokens: thinking,
     context_tokens: last.input + last.read + last.write,
     local_context_estimate: last.context,
-    declared_context_window: contextWindow(turn.proc.currentModel),
+    declared_context_window: contextWindow(
+      turn.proc.currentModel,
+      resolveModelMetadata(turn.proc.currentModel, getCachedCloudCodeModels({ key: turn.proc.accountKey }))?.context,
+    ),
   })
   return {
     input_tokens: last.input,
@@ -5459,7 +5553,7 @@ function estimateInputTokens(body) {
   if (Array.isArray(body.tools) && body.tools.length) {
     total += estimateTextTokens(JSON.stringify(body.tools))
   }
-  return Math.max(1, total + images * 1600)
+  return total + images * 1600
 }
 
 async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
@@ -5705,6 +5799,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
     accountsCache = null
     invalidateAccounts()
     catalogCache.clear()
+    offeredProbes.clear()
+    forgetStoredSignIn({ dead: true })
+    invalidateModelMetadataCache()
   } })
   return {
     auth: {
@@ -5747,6 +5844,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 error: wslDistro() ? `WSL agy failed (${why}). Check wsl.exe, distro ${wslDistro()} and AGY_PATH, then run agy in that same distro to sign in.` : `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
               }
             }
+            forgetStoredSignIn({ dead: true })
+            offeredProbes.clear()
             return { type: "success", key: "agy" }
           },
         },
@@ -5768,6 +5867,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "models"], { timeoutMs: 15_000, env: accountEnv(process.env, account.dir), signal })
               if (signal?.aborted) return { type: "failed", error: "Account registration was cancelled." }
               if (probe.err || probe.code !== 0 || !probe.stdout.trim()) return { type: "failed", error: "agy could not verify this saved account. Check its login before registering it." }
+              forgetStoredSignIn({ dead: true })
+              offeredProbes.clear()
               return result
             } catch (error) {
               return { type: "failed", error: error instanceof NativeAccountError || error instanceof ImportError ? error.message : "Could not register the saved Bridge account." }
@@ -5832,6 +5933,17 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               }
             } catch (error) {
               return jsonError(error.statusCode ?? 503, error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", error.code, true)
+            }
+            if (!account.dir && !wslDistro()) {
+              const notSignedIn = cannotSignIn(storedSignInNow())
+              if (notSignedIn) {
+                return jsonError(
+                  401,
+                  `${notSignedIn}: sign in again in magpie, or run \`agy\` in a terminal`,
+                  "unauthenticated",
+                  { headers: { "X-Magpie-Sign-In": "expired" } },
+                )
+              }
             }
             const requestedModel = modelId.replace(/\[1m\]$/i, "")
             const layout = canonicalBody(body) === body ? "hoisted" : "inline"
@@ -6146,6 +6258,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
     provider: {
       id: PROVIDER_ID,
       npm: NPM_ANTHROPIC,
+      warming: () => catalogWarming(),
       models: async (_provider, context = {}) => {
         const agy = findAgy()
         if (cachedAgyError) throw new Error(cachedAgyError)
@@ -6154,11 +6267,13 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
           : agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
         const out = {}
         await Promise.all(accounts.map(async account => {
-          const catalogPromise = agy ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS))
-          const offeredPromise = agy
+          const blocked = agy && !wslDistro() ? await backgroundBlocked({ dir: account.dir }) : ""
+          const catalogPromise = agy && !blocked ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS))
+          const offeredPromise = agy && !blocked
             ? probeOfferedModels(agy, account, configuredTimeout("AGY_BRIDGE_MODEL_PROBE_WAIT_MS", MODEL_PROBE_WAIT_MS))
             : Promise.resolve(null)
-          const [catalog, offered] = await Promise.all([catalogPromise, offeredPromise])
+          const cloudPromise = blocked ? Promise.resolve(null) : fetchCloudCodeModels(account, agy, true)
+          const [catalog, offered, cloudData] = await Promise.all([catalogPromise, offeredPromise, cloudPromise])
           const offeredIds = new Set((offered || []).map(item => item.id))
           // ACP is an optional confirmation. Unknown/empty/failed probes must
           // never narrow the CLI catalog (notably Claude, Sonnet and GPT-OSS).
@@ -6170,19 +6285,29 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             // Named accounts expose the same catalog under "<account>/<model>".
             const id = !native && account.name ? `${account.name}/${model.id}` : model.id
             const name = !native && account.name ? `[${account.name}] ${model.name}` : model.name
-            const imageModel = /^(?:gemini-|claude-)/.test(model.id)
+            const variantIds = [...(catalog.routes.get(model.id)?.byEffort?.values() || [])]
+            const meta = resolveModelMetadata(model.id, cloudData, variantIds)
+            const context = contextWindow(model.id, meta?.context)
+            const output = meta?.output > 0 ? meta.output : 0
+            const hasReasoning = isReasoningModel(model.id, model.variants)
+            const imageModel = typeof meta?.supportsImages === "boolean"
+              ? meta.supportsImages
+              : /^(?:gemini-|claude-)/.test(model.id)
             out[id] = {
               id,
               name,
               npm: NPM_ANTHROPIC,
               api: { id, url: "agy://local", npm: NPM_ANTHROPIC },
-              limit: { context: contextWindow(model.id) },
+              limit: {
+                context,
+                ...(output > 0 ? { output } : {}),
+              },
               capabilities: {
                 ...(imageModel ? { attachment: true, input: { text: true, image: true }, output: { text: true } } : {}),
-                ...(model.variants ? { reasoning: true } : {}),
+                ...(hasReasoning ? { reasoning: true } : {}),
               },
+              ...(hasReasoning ? { reasoning: true } : {}),
               ...(model.variants ? {
-                reasoning: true,
                 variants: Object.fromEntries(model.variants.map(effort => [effort, {}])),
               } : {}),
             }
@@ -6196,7 +6321,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
 
 // Permanent tool-history errors and already-submitted prompts opt out of retries.
 // Magpie header forwarding has not been verified; other 409s retain their semantics.
-function jsonError(status, message, code, noRetry = false) {
+function jsonError(status, message, code, optionsOrNoRetry = false) {
+  const opts = typeof optionsOrNoRetry === "object" && optionsOrNoRetry !== null
+    ? optionsOrNoRetry
+    : { noRetry: Boolean(optionsOrNoRetry) }
   return new Response(
     JSON.stringify({
       type: "error",
@@ -6204,7 +6332,8 @@ function jsonError(status, message, code, noRetry = false) {
         ...(code ? { code } : {}), message: String(message || "unknown error") },
     }),
     { status, headers: { "Content-Type": "application/json",
-      ...(noRetry ? { "x-should-retry": "false" } : {}) } },
+      ...(opts.noRetry ? { "x-should-retry": "false" } : {}),
+      ...(opts.headers || {}) } },
   )
 }
 

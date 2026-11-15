@@ -82,7 +82,7 @@ const configure = (scope, value) => {
 configure("default", { acp: FULL })
 Object.assign(process.env, {
   AGY_PATH: executable, AGY_BRIDGE_ACCOUNTS_DIR: accountsDir, AGY_BRIDGE_STATE_FILE: path.join(root, "state.json"),
-  AGY_BRIDGE_CONVERSATIONS_DIR: root, AGY_BRIDGE_STEP_USAGE: "0", FAKE_CONFIG: configPath, FAKE_LOG: logPath,
+  AGY_BRIDGE_CONVERSATIONS_DIR: root, AGY_BRIDGE_STEP_USAGE: "0", AGY_BRIDGE_STORED_SIGNIN: "skip", FAKE_CONFIG: configPath, FAKE_LOG: logPath,
   FAKE_CLI: JSON.stringify(CLI),
 })
 delete process.env.AGY_BRIDGE_WSL_DISTRO

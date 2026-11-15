@@ -11,7 +11,8 @@
 - Prevent silent empty or failed `agy` turns from falsely returning HTTP 200 by checking `agy-acp.log`, notice state, delivered content, and SQLite step completion (`step_type=15`) before settling a turn.
 - Remove bogus `1`-token floor in `responseUsage` for zero-output non-final steps and zero-estimate inputs.
 - Add client tool-budget capping (`tool-budget.mjs`) to protect small-window OpenCode / IDE callers from oversized `tools[]` definitions and map `ideToolOf` tool call names cleanly.
-- Incorporate `agy-cli` 0.1.55 cloak updates (`cloak.mjs`, `cloakUser`) and pre-spawn stored sign-in health checking (`signin.mjs`) so dead/missing credentials fail fast without wasting `agy` spawns or background usage checks.
+- Incorporate `agy-cli` 0.1.55–0.1.64 parity updates: `cloak.mjs` DeepSeek Harness / Claude Code CLI rules, pre-spawn stored sign-in health & `storedEmail` naming (`signin.mjs`), `Symbol.for("magpie.fellBack")` fallback signaling, explicit `status: 400` in `streamErrorOf` (`plugins#1151`), managed fallback CLI installer & `auth.cli` (`install.mjs`, `ownAgyPath`, `X_OK` cache re-validation), `run_command` `toolSummary` deduplication (`plugins#1174`), and glog startup diagnostic stripping / `invalid_grant` & structured failure handling in `usage.mjs` (`plugins#1177`).
+- Deliver client system instructions in first-turn `<external_system_instructions>` by default (`AGY_BRIDGE_SYSTEM_APPEND=1` opt-in for `session/new` `systemPrompt.append`), track `systemAppend` in parked session compatibility, suppress `agy` 1.5.9 `⚠ RESOURCE_EXHAUSTED (code 429)` / attempt-1 refusal banners and fast-fail via `refuseTurn`, and avoid mislabeling sanitized 429 errors as `AGY_ERROR_PROMPT_GUARD_MATCHED`.
 - Split the OpenCode 1.x / 2.x plugin entrypoint (`opencode.mjs` / `opencode2.mjs`) and expose `"."` -> `"./opencode2.mjs"` in `package.json` while keeping `main` as `"./index.mjs"`.
 
 ## 0.8.8

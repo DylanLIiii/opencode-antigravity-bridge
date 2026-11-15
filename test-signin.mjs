@@ -6,12 +6,14 @@ import { test } from "node:test"
 import {
   backgroundBlocked,
   cannotSignIn,
+  emailOf,
   forgetStoredSignIn,
   isDead,
   noteDead,
   parseStored,
   readAccountSignIn,
   readStoredSignIn,
+  storedEmail,
 } from "./signin.mjs"
 import { createUsageReader } from "./usage.mjs"
 
@@ -122,4 +124,25 @@ test("createUsageReader avoids spawning agy when expired/dead and latches dead c
   assert.equal(isDead(stored), true)
   noteDead(stored)
   assert.match(await backgroundBlocked({ dir: workDir, env }), /no longer works/)
+})
+
+test("emailOf and storedEmail extract id_token_email without leaking missing or skipped states", async () => {
+  const raw = JSON.stringify({ token: { access_token: "a" }, id_token_email: "  alice@example.com  " })
+  assert.equal(emailOf(`go-keyring-base64:${Buffer.from(raw).toString("base64")}`), "alice@example.com")
+  assert.equal(emailOf("not-json"), "")
+  assert.equal(await storedEmail({
+    platform: "darwin",
+    env: {},
+    exec: async () => ({ code: 0, stdout: raw, stderr: "" }),
+  }), "alice@example.com")
+  assert.equal(await storedEmail({
+    platform: "darwin",
+    env: {},
+    exec: async () => ({ code: 44, stdout: "", stderr: "" }),
+  }), "")
+  assert.equal(await storedEmail({
+    platform: "darwin",
+    env: { AGY_BRIDGE_STORED_SIGNIN: "skip" },
+    exec: async () => { throw new Error("should not call security") },
+  }), "")
 })

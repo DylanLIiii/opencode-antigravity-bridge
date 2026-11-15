@@ -50,16 +50,20 @@ function run(file, args) {
   })
 }
 
-export function parseStored(raw, now = Date.now()) {
+function decodeStored(raw) {
   let value = String(raw ?? "").trim()
-  const fp = createHash("sha256").update(value).digest("hex").slice(0, 32)
   if (value.startsWith("go-keyring-base64:")) {
     value = Buffer.from(value.slice("go-keyring-base64:".length), "base64").toString("utf8")
   } else if (value.startsWith("go-keyring-encoded:")) {
     value = Buffer.from(value.slice("go-keyring-encoded:".length), "hex").toString("utf8")
   }
-  let stored
-  try { stored = JSON.parse(value) } catch { return { state: "unknown" } }
+  try { return JSON.parse(value) } catch { return null }
+}
+
+export function parseStored(raw, now = Date.now()) {
+  const fp = createHash("sha256").update(String(raw ?? "").trim()).digest("hex").slice(0, 32)
+  const stored = decodeStored(raw)
+  if (!stored) return { state: "unknown" }
   if (typeof stored?.api_key === "string" && stored.api_key !== "") return { state: "unknown" }
   const token = stored?.token
   if (!token || typeof token !== "object") return { state: "unknown" }
@@ -69,6 +73,11 @@ export function parseStored(raw, now = Date.now()) {
   const at = Date.parse(token.expiry ?? "")
   const expiresAt = Number.isFinite(at) && at > 0 ? at : 0
   return { state: "present", fp, canRenew, expiresAt, expired: expiresAt > 0 && now >= expiresAt }
+}
+
+export function emailOf(raw) {
+  const email = decodeStored(raw)?.id_token_email
+  return typeof email === "string" ? email.trim().slice(0, 200) : ""
 }
 
 export async function readAccountSignIn(geminiDir, { now = Date.now(), env = process.env } = {}) {
@@ -85,14 +94,14 @@ export async function readAccountSignIn(geminiDir, { now = Date.now(), env = pro
   }
 }
 
-export async function readStoredSignIn({ platform = process.platform, exec = run, now = Date.now(), env = process.env } = {}) {
+async function readStoredValue({ platform = process.platform, exec = run, env = process.env } = {}) {
   if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
   if (platform === "darwin") {
     const r = await exec("/usr/bin/security", ["find-generic-password", "-s", SERVICE, "-a", USER, "-w"])
     if (r.code === 44) return { state: "missing" }
     if (r.code !== 0) return { state: "unknown" }
-    return parseStored(r.stdout, now)
+    return { raw: r.stdout }
   }
   if (platform === "win32") {
     const r = await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_SCRIPT])
@@ -100,9 +109,23 @@ export async function readStoredSignIn({ platform = process.platform, exec = run
     if (r.code !== 0) return { state: "unknown" }
     if (out === "MISSING") return { state: "missing" }
     if (!out.startsWith("OK ")) return { state: "unknown" }
-    return parseStored(Buffer.from(out.slice(3), "base64").toString("utf8"), now)
+    return { raw: Buffer.from(out.slice(3), "base64").toString("utf8") }
   }
   return { state: "unknown" }
+}
+
+export async function readStoredSignIn({ now = Date.now(), ...opts } = {}) {
+  const value = await readStoredValue(opts)
+  return "raw" in value ? parseStored(value.raw, now) : value
+}
+
+export async function storedEmail(opts) {
+  try {
+    const value = await readStoredValue(opts)
+    return "raw" in value ? emailOf(value.raw) : ""
+  } catch {
+    return ""
+  }
 }
 
 export function cannotSignIn(s) {

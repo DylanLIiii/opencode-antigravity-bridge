@@ -194,3 +194,24 @@ test("terminal evidence suppresses a following legacy banner before failure or r
     }
   }
 })
+
+test("agy 1.5.9 RESOURCE_EXHAUSTED banner and attempt-1 refused 429 capture refusedDetail without leaking tokens", () => {
+  const bare = "⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
+  const attempt = "⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
+  for (const notice of [bare, attempt]) {
+    for (const chunks of [[`\n${notice}\n`], split(`\n${notice}\n`)]) {
+      const f = new AgentNoticeFilter()
+      let output = ""
+      for (const chunk of chunks) output += f.push(chunk)
+      output += f.flush({ holdTerminal: true })
+      assert.equal(output.trim(), "")
+      assert.equal(f.failureCandidate, true)
+      assert.equal(f.refusedDetail, notice)
+    }
+    assert.equal(run([`quoted ${notice}\n`]).text, `quoted ${notice}\n`)
+    assert.equal(run([`\`\`\`\n${notice}\n\`\`\`\n`]).text, `\`\`\`\n${notice}\n\`\`\`\n`)
+  }
+  const recovered = run([`\n${bare}\n`, "Recovered."])
+  assert.equal(recovered.failureCandidate, false)
+  assert.equal(recovered.text, "Recovered.")
+})

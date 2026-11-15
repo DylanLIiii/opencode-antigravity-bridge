@@ -19,7 +19,11 @@ const TERMINAL_LINES = [NETWORK_LINE, CREDITS_LINE]
 const INTERRUPT_LINE = "⚠ The stream was interrupted. Please continue the task you were working on."
 const API_HEAD = "⚠ API error (attempt "
 const API_FULL = /^⚠ API error \(attempt \d+\): /
+const EXHAUSTED_HEAD = "⚠ RESOURCE_EXHAUSTED (code "
+const EXHAUSTED_FULL = /^⚠ RESOURCE_EXHAUSTED \(code \d+\): /
 const API_PARTIAL = /^\d*(?:\)(?::(?: )?)?)?$/
+export const isRefused429 = (detail) =>
+  /code 429\b/i.test(String(detail ?? "")) && /resource has been exhausted/i.test(String(detail ?? ""))
 
 export class AgentNoticeFilter {
   constructor(isDiagnostic = () => false) {
@@ -34,6 +38,7 @@ export class AgentNoticeFilter {
     this.dropped = 0
     this.terminalDetail = ""
     this.apiDetail = ""
+    this.refusedDetail = ""
   }
 
   #classify(line, complete) {
@@ -49,10 +54,11 @@ export class AgentNoticeFilter {
       (line.length <= value.length + 16 && line.trimEnd() === value))) return "hold"
     if (line.startsWith("⚠") || "⚠".startsWith(line)) {
       if (complete ? [INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) : false) return "notice"
-      if (API_FULL.test(line)) return "api"
+      if (API_FULL.test(line) || EXHAUSTED_FULL.test(line)) return "api"
       if (!complete) {
-        if (ERROR_LINE.startsWith(line) || INTERRUPT_LINE.startsWith(line) || INVALID_LINE.startsWith(line) || API_HEAD.startsWith(line)) return "hold"
+        if (ERROR_LINE.startsWith(line) || INTERRUPT_LINE.startsWith(line) || INVALID_LINE.startsWith(line) || API_HEAD.startsWith(line) || EXHAUSTED_HEAD.startsWith(line)) return "hold"
         if (line.startsWith(API_HEAD) && line.length <= API_HEAD.length + 16 && API_PARTIAL.test(line.slice(API_HEAD.length))) return "hold"
+        if (line.startsWith(EXHAUSTED_HEAD) && line.length <= EXHAUSTED_HEAD.length + 16 && API_PARTIAL.test(line.slice(EXHAUSTED_HEAD.length))) return "hold"
         if (line.length <= INTERRUPT_LINE.length + 16 && (line.trimEnd() === ERROR_LINE || line.trimEnd() === INTERRUPT_LINE || line.trimEnd() === INVALID_LINE)) return "hold"
       }
     } else if (!complete && /^ {0,3}(?:`{1,2}|~{1,2})$/.test(line)) return "hold"
@@ -66,7 +72,10 @@ export class AgentNoticeFilter {
     if (this.terminal && rest) { out = this.isDiagnostic() || this.apiDetail || this.terminalDetail ? "" : this.terminal; this.terminal = "" }
     while (rest) {
       if (this.dropLine || this.midLine) {
-        if (this.captureApi) this.apiDetail = (this.apiDetail + rest.split("\n", 1)[0]).slice(0, 2000)
+        if (this.captureApi) {
+          this.apiDetail = (this.apiDetail + rest.split("\n", 1)[0]).slice(0, 2000)
+          if (isRefused429(this.apiDetail)) this.refusedDetail = this.apiDetail
+        }
         const end = rest.indexOf("\n")
         if (!this.dropLine && (end < 0 ? rest : rest.slice(0, end)).trim()) this.#recovered()
         if (end < 0) return out + (this.dropLine ? "" : rest)
@@ -101,7 +110,10 @@ export class AgentNoticeFilter {
         return out
       }
       if (kind === "notice" || kind === "api") {
-        if (kind === "api") this.apiDetail = line.slice(0, 2000)
+        if (kind === "api") {
+          this.apiDetail = line.slice(0, 2000)
+          if (isRefused429(this.apiDetail)) this.refusedDetail = this.apiDetail
+        }
         this.dropped++
         this.failureCandidate = true
         if (end < 0) { this.dropLine = true; this.captureApi = kind === "api"; return out }
@@ -124,6 +136,7 @@ export class AgentNoticeFilter {
     this.failureCandidate = false
     this.terminalDetail = ""
     this.apiDetail = ""
+    this.refusedDetail = ""
   }
 
   // Releases held text at the end of a model step. A banner held without its

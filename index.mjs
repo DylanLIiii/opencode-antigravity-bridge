@@ -1324,7 +1324,8 @@ function isRecoverableResumeError(error) {
 // agy states that the prompt never entered the session, so the same logical
 // request is safe to send again.
 function isPromptNotAdded(error) {
-  return /can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(String(error?.acpError?.message || ""))
+  return Number.isInteger(error?.acpError?.code) && error.acpError.code < 0 &&
+    /^\s*can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(String(error.acpError.message || ""))
 }
 
 // Only an explicit rejection of concurrent prompts proves the steer was not
@@ -1981,7 +1982,8 @@ class Proc {
           if (this.compaction) throw new AgentTurnError("agy bridge: upstream refused the compaction request; no summary was produced")
         }
         if (!turn.notices.failureCandidate && result?.stopReason !== "refusal") {
-          const hasContent = turn.hasDeliveredOutput()
+          const hasContent = this.compaction && !turn.hiddenCompactionOutput
+            ? turn.deliveredTextChars > 0 : turn.hasDeliveredOutput()
           if (!hasContent) {
             const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
             const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
@@ -2016,6 +2018,10 @@ class Proc {
           }
           promptParts = turn.compactionStages.shift()
           turn.hiddenCompactionOutput = turn.compactionStages.length > 0
+          // ACKs from earlier ingestion prompts cannot prove that the current
+          // fragment or final summary produced output.
+          turn.deliveredTextChars = 0
+          turn.deliveredThinkingChars = 0
           turn.notices = new AgentNoticeFilter(() => !!lastAgentErrorSync(this.logPath, turn.logOffset))
           turn.outputLimit = new OutputLimitFilter()
           lateCalls = null
@@ -2085,7 +2091,10 @@ class Proc {
         turn.fail(error)
         return
       }
-      if (turn.promptAttempt && isPromptNotAdded(error)) turn.promptAttempt.submitted = false
+      if (turn.promptAttempt && isPromptNotAdded(error) && turn.promptCount === 1 &&
+        !turn.cancelContinuation && !turn.calls.length && !turn.steeringAttempts.length && !turn.hasDeliveredOutput()) {
+        turn.promptAttempt.submitted = false
+      }
       turn.fail(error)
       dropFromPool(this)
       await this.stop().catch(() => {})

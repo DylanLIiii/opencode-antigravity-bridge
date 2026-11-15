@@ -71,17 +71,27 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     log({ kind: "prompt", append, model, effort, prompt: p.prompt })
     const text = p.prompt.map(part => part.text || "").join("")
     const chunk = text => send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })
+    const notAdded = () => send({ id: msg.id, error: { code: -32603, message: "Can't add this prompt to session: waiting for a permission" } })
+    if (text.includes("PROMPT_NOT_ADDED_FIRST")) return notAdded()
+    if (text.includes("PROMPT_NOT_ADDED_LATE")) {
+      chunk("Accepted original prompt")
+      return reply({ stopReason: "max_tokens" })
+    }
+    if (mode === "late-prompt-rejected" && text.startsWith("Continue exactly")) return notAdded()
     if (text.startsWith("CANCEL_RETRY original")) {
       cancelPrompt = reply
       if (mode !== "cancel-before-text") chunk("Partial answer")
       return
     }
     if (text === "[The previous reply was interrupted before it finished. Answer my last message again, in full.]") {
+      if (mode === "cancel-nudge-rejected") return notAdded()
       chunk("Complete replacement answer")
       return reply({ stopReason: "end_turn" })
     }
     if (text.includes("[Bridge compaction fragment ")) {
       fragments++
+      if (mode === "compaction-prompt-rejected" && fragments === 2) return notAdded()
+      if (mode === "compaction-empty-fragment" && fragments === 2) return reply({ stopReason: "end_turn" })
       if (mode === "compaction-failure" && fragments === 2) {
         chunk("\n⚠ Your AI credits balance is too low to continue.\n")
         return reply({ stopReason: "end_turn" })
@@ -93,6 +103,11 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       return reply({ stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 2 } })
     }
     if (text.startsWith("All conversation fragments") || text.includes("\n\nAll conversation fragments")) {
+      if (mode === "compaction-empty-final") return reply({ stopReason: "end_turn" })
+      if (mode === "compaction-thought-only-final") {
+        send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Planning the summary" } } } })
+        return reply({ stopReason: "end_turn" })
+      }
       chunk("## Objective\nKeep LATEST-INSTRUCTION pending.\n## Next Move\nContinue from the summary.")
       return reply({ stopReason: "end_turn", usage: { inputTokens: 30, outputTokens: 12 } })
     }
@@ -146,6 +161,49 @@ const summaryMessages = (kind = "flattened") => kind === "flattened"
     { role: "assistant", content: [{ type: "tool_use", id: "already-executed", name: "Read", input: { path: "report" } }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "already-executed", content: largeHistory }] },
     { role: "user", content: compactionPrompt }]
+
+for (const mode of ["first-prompt-rejected", "late-prompt-rejected", "compaction-prompt-rejected", "compaction-empty-fragment", "compaction-empty-final", "compaction-thought-only-final"]) {
+  test(`PR75 rejected or empty follow-ups preserve logical attempt state: ${mode}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const messages = mode.startsWith("compaction-") ? summaryMessages()
+      : [{ role: "user", content: mode === "first-prompt-rejected" ? "PROMPT_NOT_ADDED_FIRST" : "PROMPT_NOT_ADDED_LATE" }]
+    const before = logs().length
+    const first = await request(client, messages)
+    assert.equal(first.status, 502, await first.text())
+    const submitted = logs().slice(before).filter(event => event.kind === "prompt").length
+    const retry = await request(client, messages)
+    const retryBody = await retry.json()
+    if (mode === "first-prompt-rejected") {
+      assert.equal(retry.status, 502, JSON.stringify(retryBody))
+      assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, submitted + 1)
+    } else {
+      assert.equal(retry.status, 409, JSON.stringify(retryBody))
+      assert.equal(retryBody.error.code, "prompt_outcome_unknown")
+      assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, submitted,
+        "rejecting a later prompt cannot authorize replay of already accepted input")
+    }
+  })
+}
+
+test("PR75 rejected cancel nudge cannot release the already submitted original prompt", async () => {
+  process.env.COMPAT_MODE = "cancel-nudge-rejected"
+  const client = await loader()
+  const messages = [{ role: "user", content: "CANCEL_RETRY original nudge rejected" }]
+  const abort = new AbortController()
+  const before = logs().length
+  const response = await request(client, messages, { stream: true }, abort.signal)
+  const read = response.text().catch(() => {})
+  await waitFor(() => logs().slice(before).some(event => event.kind === "prompt"))
+  abort.abort()
+  await read
+  const rejected = await request(client, messages)
+  assert.equal(rejected.status, 502, await rejected.text())
+  const replay = await request(client, messages, { stream: true })
+  if (replay.status === 200) await replay.body.cancel()
+  assert.equal(replay.status, 409)
+  assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, 2)
+})
 
 for (const mode of ["response-first", "no-append"]) for (const stream of [false, true]) {
   test(`oversized OpenCode compaction stages the full history, ${mode}, stream=${stream}`, async () => {

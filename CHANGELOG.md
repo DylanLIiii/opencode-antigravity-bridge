@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.9
+
+- Rewrite the Pi-Bolt opening identity to a neutral equivalent before sending system instructions to agy, preserving the surrounding persona, documentation paths, user/tool text and client-text session identities (#73).
+
 ## 0.8.8
 
 - Recover oversized stock OpenCode compaction requests by sending ordered, UTF-8-safe history fragments within agy's per-prompt limit, then returning only the final summary (#65). Use a temporary tool-free session so pending tools keep their original owner; prevalidate the full bounded plan, suppress ingestion acknowledgements, and stop on cancellation or upstream failure. Ordinary oversized input is still rejected without truncation. Multi-fragment compaction uses additional model calls and remains subject to the configured total text budget and model context window.

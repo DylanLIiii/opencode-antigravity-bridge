@@ -12,6 +12,7 @@ const fakeAgyBin = path.join(tmpRoot, process.platform === "win32" ? "agy.cmd" :
 const logFile = path.join(tmpRoot, "events.jsonl")
 const stateDir = path.join(tmpRoot, "state")
 fs.mkdirSync(stateDir, { recursive: true })
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
 
 // A PID is not a process identity: Windows quickly reuses IDs from earlier
 // OAuth retries for other test workers. Track a unique connection held by each
@@ -356,9 +357,12 @@ for (const stream of [false, true]) for (const scenario of [
     const error = stream ? frames.find(frame => frame.type === 'error')?.error : json.error
     const output = stream ? frames.filter(frame => frame.delta?.type === 'text_delta').map(frame => frame.delta.text).join('')
       : (json.content || []).map(block => block.text || '').join('')
-    if (['CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'CHAIN_CREDITS', 'CHAIN_NETWORK'].includes(scenario)) {
+    if (['CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'CHAIN_CREDITS', 'CHAIN_NETWORK', 'INVALID_ONLY'].includes(scenario)) {
       assert.ok(error, body)
-      if (scenario.endsWith('NETWORK')) {
+      if (scenario === 'INVALID_ONLY') {
+        assert.equal(res.status, stream ? 200 : 502)
+        assert.match(error.message, /without producing a model response/)
+      } else if (scenario.endsWith('NETWORK')) {
         assert.equal(res.status, stream ? 200 : 502)
         assert.match(error.message, /network issue/)
       } else {

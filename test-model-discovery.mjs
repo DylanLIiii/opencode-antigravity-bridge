@@ -2,6 +2,7 @@
 // speaks ACP. Each test uses its own account so cache scopes never overlap.
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { after, test } from "node:test"
@@ -13,6 +14,20 @@ const configPath = path.join(root, "config.json")
 const logPath = path.join(root, "events.jsonl")
 const script = path.join(root, "fake-agy.mjs")
 const executable = path.join(root, process.platform === "win32" ? "agy.cmd" : "agy")
+// Historical PIDs can be reused by unrelated CI workers, especially Windows.
+// Each ACP fixture holds a dedicated connection identifying its own lifetime.
+const lifetimes = new Map()
+const lifecycle = net.createServer(socket => {
+  socket.setEncoding("utf8")
+  let id = ""
+  socket.on("data", data => {
+    id += data
+    if (id.endsWith("\n")) lifetimes.set(id.trim(), socket)
+  })
+  socket.on("error", () => {})
+  socket.on("close", () => lifetimes.delete(id.trim()))
+})
+await new Promise(resolve => lifecycle.listen(0, "127.0.0.1", resolve))
 
 const CLI = [
   ["gemini-4-argon-low", "Gemini 4 Argon (Low)"], ["gemini-4-argon-medium", "Gemini 4 Argon (Medium)"], ["gemini-4-argon-high", "Gemini 4 Argon (High)"],
@@ -28,6 +43,9 @@ fs.writeFileSync(script, String.raw`
 import fs from "node:fs"
 import path from "node:path"
 import readline from "node:readline"
+import net from "node:net"
+import { once } from "node:events"
+import { randomUUID } from "node:crypto"
 const args = process.argv.slice(2)
 const dir = args.find(arg => arg.startsWith("--gemini_dir="))?.slice("--gemini_dir=".length)
 const scope = dir ? path.basename(dir) : "default"
@@ -43,7 +61,13 @@ if (args.includes("models")) {
   process.exit(0)
 }
 const live = args.includes("--agent")
-log({ type: "acp-start", live, cwd: process.cwd() })
+const instance = randomUUID()
+const lifetime = net.connect(Number(process.env.FAKE_LIFECYCLE_PORT), "127.0.0.1")
+await once(lifetime, "connect")
+await new Promise((resolve, reject) => lifetime.write(instance + "\n", error => error ? reject(error) : resolve()))
+lifetime.on("data", () => process.exit(0))
+lifetime.unref()
+log({ type: "acp-start", live, instance, cwd: process.cwd() })
 if (!live && cfg.acpMode === "fail") { log({ type: "acp-exit" }); process.exit(1) }
 const send = value => process.stdout.write(JSON.stringify(value) + "\n")
 const quit = () => { log({ type: "acp-exit" }); process.exit(0) }
@@ -82,8 +106,9 @@ const configure = (scope, value) => {
 configure("default", { acp: FULL })
 Object.assign(process.env, {
   AGY_PATH: executable, AGY_BRIDGE_ACCOUNTS_DIR: accountsDir, AGY_BRIDGE_STATE_FILE: path.join(root, "state.json"),
-  AGY_BRIDGE_CONVERSATIONS_DIR: root, AGY_BRIDGE_STEP_USAGE: "0", FAKE_CONFIG: configPath, FAKE_LOG: logPath,
+  AGY_BRIDGE_CONVERSATIONS_DIR: root, AGY_BRIDGE_STEP_USAGE: "0", AGY_BRIDGE_STORED_SIGNIN: "skip", FAKE_CONFIG: configPath, FAKE_LOG: logPath,
   FAKE_CLI: JSON.stringify(CLI),
+  FAKE_LIFECYCLE_PORT: String(lifecycle.address().port), AGY_BRIDGE_CLOUDCODE_METADATA: "0", AGY_CLI_DISABLE_AUTO_UPDATE: "1",
 })
 delete process.env.AGY_BRIDGE_WSL_DISTRO
 
@@ -91,7 +116,6 @@ const { AntigravityBridgePlugin } = await import("./index.mjs")
 const plugin = await AntigravityBridgePlugin({ magpie: {}, client: { auth: { set: async () => {} } } })
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const events = () => fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []
-const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 
 function account(name, value) {
   fs.mkdirSync(path.join(accountsDir, name, "antigravity-cli"), { recursive: true })
@@ -107,14 +131,17 @@ async function probesSettled(scope, expected = 1) {
   for (let i = 0; i < 100; i++) {
     const started = probes(scope)
     if (started.length < expected) { await sleep(100); continue }
-    if (started.every(e => !alive(e.pid) && !fs.existsSync(e.cwd))) return started
+    if (started.every(e => !lifetimes.has(e.instance) && !fs.existsSync(e.cwd))) return started
     await sleep(100)
   }
   throw new Error(`probe processes for ${scope} were not cleaned up`)
 }
 
-after(() => {
-  for (const e of events().filter(e => e.type === "acp-start")) try { process.kill(e.pid, "SIGKILL") } catch {}
+after(async () => {
+  for (const socket of lifetimes.values()) socket.write("stop\n")
+  for (let i = 0; i < 100 && lifetimes.size; i++) await sleep(20)
+  assert.equal(lifetimes.size, 0, "all owned ACP fixtures exited")
+  await new Promise(resolve => lifecycle.close(resolve))
   fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
 })
 

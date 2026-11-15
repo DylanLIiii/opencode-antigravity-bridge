@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.0
+
+- Register hook-defined providers in the OpenCode 2.x adapter and contain failed sign-in callbacks. Bound and cancel installer version checks, route archive/file errors to the caller, and preserve the working Windows binary on replacement or rollback failure.
+- Isolate fake-ACP and timeout fixtures from host sign-in/keychain state and background metadata/update requests on every platform.
+- Give native Windows sign-in fixtures their required OS environment, verify auth failures after version probing, and track model-probe lifetimes independently of reused process IDs. Increase only the fixture handshake deadline for busy CI runners.
+- Preserve latest main's Pi-Bolt/Claude Code prompt rewrites and client-cancel recovery. Review fixes keep original submission guards after later prompt rejections and require output from each compaction fragment and the final summary.
+- Treat retry-notice-only output as an empty failed response, while preserving uncorroborated terminal quotations and successful recovery output.
+- Isolate optional CloudCode credential reads from WSL and test/mock default profiles, add `AGY_BRIDGE_CLOUDCODE_METADATA=0`, honor metadata cache TTL and preserve successful metadata after transient refresh failures. Account resets invalidate in-flight cache writes.
+- Query CloudCode model metadata (`loadCodeAssist` / `fetchAvailableModels`) and known Antigravity limits so models report accurate `limit.context`, `limit.output`, image capabilities, and `reasoning` flags (`gemini-pro-orchestrator*`, `claude-opus-4-6-thinking`, 1M Gemini/Claude 5.5, 250K Claude 4.6, 65K image model).
+- Prevent silent empty or failed `agy` turns from falsely returning HTTP 200 by checking `agy-acp.log`, notice state, delivered content, and SQLite step completion (`step_type=15`) before settling a turn.
+- Remove bogus `1`-token floor in `responseUsage` for zero-output non-final steps and zero-estimate inputs.
+- Add client tool-budget capping (`tool-budget.mjs`) to protect small-window OpenCode / IDE callers from oversized `tools[]` definitions and map `ideToolOf` tool call names cleanly.
+- Incorporate `agy-cli` 0.1.55–0.1.64 parity updates: `cloak.mjs` DeepSeek Harness / Claude Code CLI rules, pre-spawn stored sign-in health & `storedEmail` naming (`signin.mjs`), `Symbol.for("magpie.fellBack")` fallback signaling, explicit `status: 400` in `streamErrorOf` (`plugins#1151`), managed fallback CLI installer & `auth.cli` (`install.mjs`, `ownAgyPath`, `X_OK` cache re-validation), `run_command` `toolSummary` deduplication (`plugins#1174`), and glog startup diagnostic stripping / `invalid_grant` & structured failure handling in `usage.mjs` (`plugins#1177`).
+- Deliver client system instructions in first-turn `<external_system_instructions>` by default (`AGY_BRIDGE_SYSTEM_APPEND=1` opt-in for `session/new` `systemPrompt.append`), track `systemAppend` in parked session compatibility, suppress `agy` 1.5.9 `⚠ RESOURCE_EXHAUSTED (code 429)` / attempt-1 refusal banners and fast-fail via `refuseTurn`, and avoid mislabeling sanitized 429 errors as `AGY_ERROR_PROMPT_GUARD_MATCHED`.
+- Split the OpenCode 1.x / 2.x plugin entrypoint (`opencode.mjs` / `opencode2.mjs`) and expose `"."` -> `"./opencode2.mjs"` in `package.json` while keeping `main` as `"./index.mjs"`.
+
 ## 0.8.9
 
 - Say interactive Claude Code's system prompt another way so Antigravity no longer answers it with `RESOURCE_EXHAUSTED (code 429)` whatever quota is left. Three passages are turned away on their own: the identity line `You are Claude Code, Anthropic's official CLI for Claude.` (now `You're …`, as the Agent SDK variants were already handled by prompt-guard), the `IMPORTANT: Assist with authorized security testing…` policy, and the `<pasted_content>` guidance. Small edits to the two passages are still turned away, so each is sent as an equivalent rewording that keeps every instruction; matching folds whitespace and invisible characters as before.

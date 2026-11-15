@@ -1,9 +1,12 @@
 {
   "name": "@magpie-community/opencode-antigravity-bridge",
-  "version": "0.8.9",
+  "version": "0.9.0",
   "description": "Connect to Antigravity via the official agy CLI with lean prompts and session reuse. Native Magpie accounts share model IDs and use the host account router; OpenCode supports account-prefixed models.",
   "type": "module",
   "main": "./index.mjs",
+  "exports": {
+    ".": "./opencode2.mjs"
+  },
   "bin": {
     "agy-bridge": "./bin/agy-bridge.mjs"
   },
@@ -20,9 +23,14 @@
     "vendor/agy-context-unlock/LICENSE",
     "vendor/agy-context-unlock/PROVENANCE.md",
     "platform.mjs",
+    "install.mjs",
     "mcp-server.mjs",
     "prompt-guard.mjs",
     "tool-schema.mjs",
+    "tool-budget.mjs",
+    "signin.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
     "re2-pattern.mjs",
     "cloak.mjs",
     "compaction.mjs",
@@ -33,6 +41,7 @@
     "agent-notice.mjs",
     "thought-filter.mjs",
     "step-usage.mjs",
+    "model-metadata.mjs",
     "NOTICE-upstream-license.txt",
     "NOTICE.md",
     "CHANGELOG.md",
@@ -43,7 +52,7 @@
     "ui/"
   ],
   "scripts": {
-    "test": "node --test test-acp-compat.mjs test-compaction.mjs test-context-ui.mjs test-native-accounts.mjs test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-model-discovery.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
+    "test": "node --test test-acp-compat.mjs test-compaction.mjs test-context-ui.mjs test-install.mjs test-opencode2.mjs test-native-accounts.mjs test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-model-discovery.mjs test-model-metadata.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-tool-budget.mjs test-signin.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs test-bridge-fixes.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [

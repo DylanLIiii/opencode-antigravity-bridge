@@ -25,6 +25,8 @@ process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
 process.env.AGY_BRIDGE_CONTEXT_DIR = path.join(stateDir, "context")
 process.env.AGY_BRIDGE_MAX_PROCS = "4"
 process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
+process.env.AGY_BRIDGE_CLOUDCODE_METADATA = "0"
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
 // the real one does: by running `nc 127.0.0.1 <--ide-mcp-port>` from PATH.
@@ -320,7 +322,7 @@ async function prompt(params, recorded = false) {
     chunk("ACK-INTERNAL")
     return finish("ACK-INTERNAL")
   }
-  if (text.startsWith("All conversation fragments")) {
+  if (text.startsWith("All conversation fragments") || text.includes("\n\nAll conversation fragments")) {
     chunk("## Objective\nContinue the pending task after compaction.")
     return finish("compaction-summary")
   }
@@ -426,6 +428,12 @@ async function prompt(params, recorded = false) {
   if (text.includes("GENERIC429")) {
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): upstream rejected request.\n")
     chunk("\n⚠ Agent execution terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("REFUSED429_FASTFAIL")) {
+    chunk("\n⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): ")
+    chunk("Resource has been exhausted (e.g. check quota).\n")
+    await new Promise(resolve => setTimeout(resolve, 3000))
     return { stopReason: "end_turn" }
   }
   if (text.includes("QUOTA")) {
@@ -1161,8 +1169,11 @@ async function launchedModel(body) {
   check("ACP session uses the default minimal isolated agent", ["tools: []", "inheritMcp: false", "inheritCustomizations: false", "excludeDefaultComponents: true"].every(line => init.agentConfig.includes(line)), init.agentConfig)
   const pkg = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
   check("ACP client identifies as this package", init.clientInfo?.name === pkg.name && init.clientInfo?.version === pkg.version)
-  check("client system prompt is appended to the session instructions", init.systemAppend?.includes("SYSTEM-PROMPT-MARKER"))
-  check("fresh prompt carries only the user text", user.text === "hello world", JSON.stringify(user.text))
+  check("client system prompt moves to first-turn external_system_instructions by default",
+    init.systemAppend === null &&
+    user.text.includes("<external_system_instructions>\nSYSTEM-PROMPT-MARKER\n</external_system_instructions>"))
+  check("fresh prompt wraps system instructions before current turn text",
+    user.text.endsWith("<current_turn>\nhello world\n</current_turn>"), JSON.stringify(user.text))
   check("client tools are served through the ide-tools port", !!init.idePort && !logs().some(event => event.type === "ncExit"))
 }
 
@@ -1187,13 +1198,14 @@ async function launchedModel(body) {
   const user = lastOf("user")
   check("prompt guard covers top-level and inline system blocks before flattening",
     response.status === 200 && stopOf(events) === "end_turn" &&
-    !init.systemAppend?.includes("x-anthropic-billing-header") &&
-    !init.systemAppend?.includes("Claude Agent SDK") &&
-    (init.systemAppend?.match(/You are an AI coding assistant\./g) || []).length === 2,
-    init.systemAppend)
+    init.systemAppend === null &&
+    !user.text.includes("x-anthropic-billing-header") &&
+    !user.text.split("</external_system_instructions>")[0].includes("Claude Agent SDK") &&
+    (user.text.match(/You are an AI coding assistant\./g) || []).length === 2,
+    user.text)
   check("prompt guard preserves ordinary vendor words and user text",
-    init.systemAppend?.includes("Anthropic, OpenAI and Deepseek") &&
-    user.text === `PROMPTGUARD user text stays unchanged: ${sdkIdentity}`,
+    user.text.includes("Anthropic, OpenAI and Deepseek") &&
+    user.text.endsWith(`<current_turn>\nPROMPTGUARD user text stays unchanged: ${sdkIdentity}\n</current_turn>`),
     JSON.stringify({ system: init.systemAppend, user: user.text }))
 }
 
@@ -1221,7 +1233,9 @@ async function launchedModel(body) {
       ] },
     ],
   }
+  process.env.AGY_BRIDGE_SYSTEM_APPEND = "1"
   const response = await callFetch(body)
+  delete process.env.AGY_BRIDGE_SYSTEM_APPEND
   const events = (await readSSE(response)).events
   const init = inits().at(-1)
   const prompt = lastOf("user")?.text || ""
@@ -1231,10 +1245,11 @@ async function launchedModel(body) {
     init.systemAppend.includes("When the user writes @ followed by a path") && !init.systemAppend.includes(paths) &&
     init.systemAppend.includes(stock.replace(pi, piNeutral)) && init.systemAppend.includes(piDocs) &&
     init.systemAppend.includes("before\n") && init.systemAppend.endsWith("after"), init.systemAppend)
-  check("trailing system and developer reminders are rewritten while user and queued input stay literal",
+  check("trailing system and developer reminders are rewritten while non-Codex user text stays literal and Codex user phrase cloaks",
     prompt.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") &&
     prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") && prompt.includes(`${piNeutral}.`) &&
-    prompt.includes(rawUser) && prompt.includes(queued) &&
+    prompt.includes(rawUser) &&
+    prompt.includes(`Queued user input: ${codex.replace("based on", "built on")}\n${paths}\n${pi}`) &&
     (prompt.match(/When the user writes @ followed by a path/g) || []).length === 2, prompt)
 
   process.env.FAKE_AGY_APPEND = "0"
@@ -1243,11 +1258,11 @@ async function launchedModel(body) {
   const fallbackEvents = (await readSSE(fallbackResponse)).events
   delete process.env.FAKE_AGY_APPEND
   const fallback = lastOf("user")?.text || ""
-  check("external system instructions use the same outgoing rewrite and preserve user text",
+  check("external system instructions use the same outgoing rewrite and preserve non-Codex user text",
     fallbackResponse.status === 200 && stopOf(fallbackEvents) === "end_turn" && inits().at(-1).systemAppend === null &&
     fallback.includes("<external_system_instructions>") && !fallback.includes(billing) && !fallback.includes(paths) &&
     fallback.includes("When the user writes @ followed by a path") && fallback.includes("You are Codex, an agent built on GPT-5") &&
-    fallback.includes(`${piNeutral}.`) && fallback.includes(`FALLBACK user: ${codex}`), fallback)
+    fallback.includes(`${piNeutral}.`) && fallback.includes(`FALLBACK user: ${codex.replace("based on", "built on")}`), fallback)
 
   const original = { model, system: pi, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
   const firstEvents = (await readSSE(await callFetch(original))).events
@@ -1464,7 +1479,8 @@ for (const [name, system, headers, expectedDir, named] of [
   const final = (await readSSE(await callFetch(body, headers))).events
   const init = inits().at(-1)
   check(`${name} uses only an available absolute add-dir`, stopOf(final) === "end_turn" && init.addDir === expectedDir)
-  check(`${name} identifies where client tools run`, init.systemAppend?.includes(JSON.stringify(named)) && init.systemAppend.includes("where every tool runs"))
+  const sentUser = lastOf("user")?.text || ""
+  check(`${name} identifies where client tools run`, init.systemAppend === null && sentUser.includes(JSON.stringify(named)) && sentUser.includes("where every tool runs"), sentUser)
   check(`${name} keeps agent configuration isolated`, init.cwd !== expectedDir && init.cwd.includes("magpie-agy-bridge-"))
 }
 
@@ -2080,7 +2096,7 @@ for (const streaming of [true, false]) {
     ? (await readSSE(response)).events.find(event => event.event === "error")?.data?.error
     : (await response.json()).error
   check(`INVALID_ARGUMENT ${streaming ? "stream" : "nonstream"} is redacted and non-retryable`,
-    error?.type === "invalid_request_error" && error.code === "AGY_ERROR_INVALID_ARGUMENT" && error.retryable === false &&
+    error?.type === "invalid_request_error" && (!streaming || error.status === 400) && error.code === "AGY_ERROR_INVALID_ARGUMENT" && error.retryable === false &&
     !error.message.includes("SYNTHETIC_PRIVATE_PROMPT") &&
     (streaming || (response.status === 400 && response.headers.get("x-should-retry") === "false")), JSON.stringify(error))
   const retry = await callFetch(body)
@@ -2101,11 +2117,26 @@ for (const streaming of [true, false]) {
   const system = "You are Codex,\u200b an\n agent based on GPT-5"
   const generic = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "GENERIC429 with cloaked system" }] })
   const genericPayload = await generic.json()
-  const sent = inits().at(-1)?.systemAppend
-  check("rewritten system retains generic 429 classification", generic.status === 429 && genericPayload.error?.type === "rate_limit_error" && sent?.includes("You are Codex, an\n agent built on GPT-5") && !sent?.includes("\u200b"), JSON.stringify({ status: generic.status, error: genericPayload.error, sent }))
+  const sent = lastOf("user")?.text
+  check("rewritten system retains generic 429 classification", generic.status === 429 && genericPayload.error?.type === "rate_limit_error" && inits().at(-1)?.systemAppend === null && sent?.includes("You are Codex, an\n agent built on GPT-5") && !sent?.includes("\u200b"), JSON.stringify({ status: generic.status, error: genericPayload.error, sent }))
   const rejected = await callFetch({ model, system, stream: false, messages: [{ role: "user", content: "SYSTEM_REJECT429 with cloaked system" }] })
   const rejectedPayload = await rejected.json()
   check("specific obfuscated system prompt rejection maps to invalid request with the Codex hint", rejected.status === 400 && rejectedPayload.error?.type === "invalid_request_error" && rejectedPayload.error.message.includes("Codex"), JSON.stringify(rejectedPayload))
+}
+
+{
+  const startedAt = Date.now()
+  const system = "x-anthropic-billing-header: cc_version=2.1.325; cc_entrypoint=cli;\nYou are Claude Code, Anthropic's official CLI for Claude."
+  const refused = await readSSE(await callFetch({ model, system, messages: [{ role: "user", content: "REFUSED429_FASTFAIL sanitized check" }] }))
+  const elapsed = Date.now() - startedAt
+  const errorEvent = refused.events.find(event => event.event === "error")?.data?.error
+  check("attempt-1 Resource has been exhausted fast-fails without leaking warning tokens or misblaming prompt guard",
+    elapsed < 2000 &&
+    !textOf(refused.events) &&
+    errorEvent?.type === "rate_limit_error" &&
+    errorEvent?.code === "AGY_ERROR_RESOURCE_EXHAUSTED_UNSPECIFIED" &&
+    !/prompt guard matched/i.test(errorEvent?.message || ""),
+    JSON.stringify({ elapsed, text: textOf(refused.events), errorEvent }))
 }
 
 {
@@ -2762,29 +2793,34 @@ for (const label of ["model", "tools", "workdir"]) {
 }
 
 {
-  const first = { model, system: "CONSECUTIVE-RESUME-SYSTEM", messages: [{ role: "user", content: "MEMORY append installed on new" }] }
-  let previous = first
-  let events = (await readSSE(await callFetch(first))).events
-  const target = inits().at(-1)
-  check("the initial session/new installs the system append", target.resumed === false && target.systemAppend?.includes("CONSECUTIVE-RESUME-SYSTEM"))
-  for (const round of [1, 2]) {
-    const { default: resumedDefault } = await import(`./index.mjs?consecutive-resume-${round}`)
-    const resumedLoader = await (await resumedDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
-    previous = nextTurn(previous, events, `MEMORY consecutive resume ${round}`)
-    const response = await resumedLoader.fetch("agy://local/messages", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(previous),
-    })
-    events = (await readSSE(response)).events
-    check(`consecutive resume ${round} reuses the official session without replaying instructions`,
-      response.status === 200 && stopOf(events) === "end_turn" && inits().at(-1)?.resumed === true &&
-      inits().at(-1)?.convId === target.convId && lastOf("user").text === `MEMORY consecutive resume ${round}` &&
-      !lastOf("user").text.includes("CONSECUTIVE-RESUME-SYSTEM"))
+  process.env.AGY_BRIDGE_SYSTEM_APPEND = "1"
+  try {
+    const first = { model, system: "CONSECUTIVE-RESUME-SYSTEM", messages: [{ role: "user", content: "MEMORY append installed on new" }] }
+    let previous = first
+    let events = (await readSSE(await callFetch(first))).events
+    const target = inits().at(-1)
+    check("the initial session/new installs the system append", target.resumed === false && target.systemAppend?.includes("CONSECUTIVE-RESUME-SYSTEM"))
+    for (const round of [1, 2]) {
+      const { default: resumedDefault } = await import(`./index.mjs?consecutive-resume-${round}`)
+      const resumedLoader = await (await resumedDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
+      previous = nextTurn(previous, events, `MEMORY consecutive resume ${round}`)
+      const response = await resumedLoader.fetch("agy://local/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(previous),
+      })
+      events = (await readSSE(response)).events
+      check(`consecutive resume ${round} reuses the official session without replaying instructions`,
+        response.status === 200 && stopOf(events) === "end_turn" && inits().at(-1)?.resumed === true &&
+        inits().at(-1)?.convId === target.convId && lastOf("user").text === `MEMORY consecutive resume ${round}` &&
+        !lastOf("user").text.includes("CONSECUTIVE-RESUME-SYSTEM"))
+    }
+    const related = inits().filter(event => event.convId === target.convId)
+    check("system append is restored once on every native open across consecutive resumes",
+      related.length === 3 && related.filter(event => event.resumed).length === 2 &&
+      related.every(event => event.systemAppend === target.systemAppend),
+      JSON.stringify(related.map(event => ({ resumed: event.resumed, append: event.systemAppend }))))
+  } finally {
+    delete process.env.AGY_BRIDGE_SYSTEM_APPEND
   }
-  const related = inits().filter(event => event.convId === target.convId)
-  check("system append is restored once on every native open across consecutive resumes",
-    related.length === 3 && related.filter(event => event.resumed).length === 2 &&
-    related.every(event => event.systemAppend === target.systemAppend),
-    JSON.stringify(related.map(event => ({ resumed: event.resumed, append: event.systemAppend }))))
 }
 
 for (const change of ["inputs", "user", "tool", "ids", "history", "workdir"]) {
@@ -2869,7 +2905,8 @@ for (const change of ["inputs", "user", "tool", "ids", "history", "workdir"]) {
   check("method-not-supported resume explicitly falls back to session/new",
     response.status === 200 && stopOf(events) === "end_turn" && inits().at(-1)?.resumed === false && inits().at(-1)?.convId !== target.convId)
   check("the fallback new session installs instructions exactly once",
-    inits().at(-1)?.systemAppend?.includes("RESUME-METHOD-FALLBACK") &&
+    inits().at(-1)?.systemAppend === null &&
+    ((lastOf("user")?.text.split("<conversation_history>")[0].match(/RESUME-METHOD-FALLBACK/g)) || []).length === 1 &&
     logs().filter(event => event.type === "resumeError" && event.convId === target.convId && event.mode === "method").length === 1)
 }
 
@@ -2894,7 +2931,7 @@ for (const change of ["inputs", "user", "tool", "ids", "history", "workdir"]) {
     u1.text.includes("<system-reminder>\nSessionStart hook additional context: ok") &&
     !u1.text.includes("<conversation_history>"), u1.text)
   check("caller working directory is recognized from initial trailing system message",
-    init1.systemAppend?.includes('"/remote-wsl/project"'), init1.systemAppend)
+    u1.text.includes('"/remote-wsl/project"'), u1.text)
 
   const turn2 = {
     ...turn1,
@@ -3513,7 +3550,7 @@ for (const recent of [true, false]) {
   ] }
   const compactedEvents = (await readSSE(await callFetch(compacted))).events
   check("a client-compacted retry preserves the complete current instruction", stopOf(compactedEvents) === "end_turn" &&
-    lastOf("user").text.endsWith("CURRENT-731") && !assistantBlocks(compactedEvents).some(block => block.type === "tool_use"))
+    lastOf("user").text.includes("CURRENT-731\n</current_turn>") && !assistantBlocks(compactedEvents).some(block => block.type === "tool_use"))
 }
 
 {
@@ -4168,6 +4205,7 @@ for (const steering of [false, true]) {
   try {
     process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
     process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     const { default: pressureDefault } = await import("./index.mjs?issue-29-pressure")
     const pressureLoader = await (await pressureDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
     const fetchPressure = body => pressureLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
@@ -4237,6 +4275,7 @@ for (const steering of [false, true]) {
     process.env.AGY_BRIDGE_MAX_PROCS = "2"
     process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
     process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     const { default: branchPressureDefault } = await import("./index.mjs?issue-29-branch-pressure")
     const loader = await (await branchPressureDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
     const fetchBranch = (body, headers) => loader.fetch("agy://local/messages", { method: "POST", headers, body: JSON.stringify(body) })
@@ -4316,6 +4355,7 @@ for (const steering of [false, true]) {
         }
       }
       process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
       process.env.AGY_BRIDGE_MAX_PROCS = "1"
       const blockedReplay = await fetchBranch(late)
       check(`${label}: failed replay admission preserves the surviving branch`, blockedReplay.status === 503 && fs.existsSync(survivorOwner.cwd))
@@ -4335,6 +4375,7 @@ for (const steering of [false, true]) {
       check(`${label}: surviving branch completes in its original process`, stopOf(done) === "end_turn" &&
         logs().some(event => event.type === "mcpResult" && event.convId === survivorOwner.convId && event.result?.content?.[0]?.text === result))
       process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     }
   } finally {
     for (const [key, value] of Object.entries(savedEnv)) {
@@ -4393,6 +4434,7 @@ for (const steering of [false, true]) {
   try {
     process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
     process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     const { default: capacityDefault } = await import("./index.mjs?issue-29-capacity")
     const capacityLoader = await (await capacityDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
     const fetchCapacity = body => capacityLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })

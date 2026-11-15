@@ -19,11 +19,15 @@ import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
-import { AgentNoticeFilter } from "./agent-notice.mjs"
+import { AgentNoticeFilter, isRefused429 } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
-import { outgoing, hint, turnsAway } from "./cloak.mjs"
+import { cloakUser, outgoing, hint, turnsAway } from "./cloak.mjs"
+import { fitTools } from "./tool-budget.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
+import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
+import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
 export const MIN_AGY_VERSION = "1.4.12"
@@ -42,6 +46,23 @@ const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
+
+export function ideToolOf(call) {
+  for (const value of [call?.name, call?.title, call?.toolName]) {
+    if (typeof value !== "string") continue
+    const text = value.trim().replace(/\?$/, "")
+    const match = /^(?:mcp\(ide-tools\/([^()\s]+)\)|(?:mcp\s+)?"?ide-tools\/([^()\s"]+)"?|mcp_ide-tools_(\S+))$/.exec(text)
+    if (match) return match[1] || match[2] || match[3]
+  }
+  return null
+}
+
+export function userTurnParts(parts) {
+  if (!Array.isArray(parts)) return parts
+  return parts.map((part) => (part?.type === "text" && typeof part.text === "string"
+    ? { ...part, text: cloakUser(part.text) }
+    : part))
+}
 const IDLE_MS = positiveTimeout(process.env.AGY_BRIDGE_IDLE_MS, 10 * 60 * 1000)
 function maxProcs() {
   const value = Number(process.env.AGY_BRIDGE_MAX_PROCS)
@@ -54,6 +75,8 @@ function detachedEvictMs() {
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
+const systemAppend = () => /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_SYSTEM_APPEND || "")
+const promptGuardEnabled = () => process.env.AGY_BRIDGE_PROMPT_GUARD !== "0"
 // Bound silence without meaningful agy output. agy emits nothing while it
 // generates tool-call arguments, so a large Write can be silent for minutes;
 // the default allows that at the cost of slower stall detection. This is not
@@ -68,6 +91,7 @@ function ideCallDeadline() {
   return positiveTimeout(process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS, 150_000)
 }
 const CANCEL_SETTLE_MS = 15_000
+const STEER_WAIT_RETRY_MS = [50, 150, 400]
 const RECLAIM_STOP_TIMEOUT_MS = 10_000
 const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the client conversation continued without it; stop this turn"
 const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
@@ -168,10 +192,16 @@ function configuredTimeout(name, fallback) {
     : fallback
 }
 
-function contextWindow(model) {
+function contextWindow(model, liveContext = null) {
   const requested = Number(process.env.AGY_BRIDGE_CONTEXT_WINDOW)
-  const window = Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576
-    ? requested : (agyUnlocked() ? UNLOCKED_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW)
+  if (Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576) {
+    const cap = Number.isSafeInteger(liveContext) && liveContext > 0 ? Math.min(requested, liveContext) : requested
+    return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(cap, 131_072) : cap
+  }
+  if (Number.isSafeInteger(liveContext) && liveContext > 0) {
+    return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(liveContext, 131_072) : liveContext
+  }
+  const window = agyUnlocked() ? UNLOCKED_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW
   return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(window, 131_072) : window
 }
 
@@ -181,21 +211,42 @@ function contextWindow(model) {
 // process pool and its sessions never switch context mode mid-conversation.
 let cachedAgyUnlocked = false
 let cachedAgyError = null
+let cachedAgySearchKey = null
 
 function findAgy() {
-  if (cachedAgyPath) return cachedAgyPath
+  const env = process.env
+  if (cachedAgyPath && cachedAgySearchKey === "__wsl__" && wslDistro(env)) return cachedAgyPath
+  cachedAgyError = null
   try {
-    const wslPath = wslAgyPath(process.env)
-    if (wslPath) return cachedAgyPath = wslPath
+    const wslPath = wslAgyPath(env)
+    if (wslPath) {
+      cachedAgySearchKey = "__wsl__"
+      cachedAgyUnlocked = false
+      return cachedAgyPath = wslPath
+    }
   } catch (error) {
+    cachedAgyPath = null
+    cachedAgySearchKey = null
+    cachedAgyUnlocked = false
     cachedAgyError = error.message
     return null
   }
-  const candidates = agyCandidates(process.env, os.homedir())
+  const home = os.homedir()
+  const searchKey = JSON.stringify([env.AGY_PATH, env.PATH, env.Path, env.LOCALAPPDATA, env.XDG_DATA_HOME, home])
+  if (cachedAgyPath && cachedAgySearchKey === searchKey) {
+    try {
+      fs.accessSync(cachedAgyPath, fs.constants.X_OK)
+      return cachedAgyPath
+    } catch {}
+  }
+  cachedAgyPath = null
+  cachedAgyUnlocked = false
+  cachedAgySearchKey = searchKey
+  const candidates = agyCandidates(env, home)
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
-      const selected = selectAgy(candidate, process.env)
+      const selected = selectAgy(candidate, env)
       cachedAgyUnlocked = selected.unlocked
       cachedAgyPath = selected.path
       return cachedAgyPath
@@ -259,7 +310,7 @@ async function listAgyModels(agyPath, extraArgs = []) {
     env: accountEnv(process.env, geminiDir),
   })
   if (wslDistro() && (err || code !== 0 || !stdout.trim())) throw new Error(`WSL agy models failed: ${err?.message || stderr?.trim() || "empty model response"}. Check wsl.exe, the configured distro and AGY_PATH; run agy in that same distro to sign in.`)
-  if (err || code !== 0) return FALLBACK_MODELS
+  if (err || code !== 0) return { models: FALLBACK_MODELS, isFallback: true }
   const out = []
   for (const raw of stdout.split("\n")) {
     const line = raw.trim()
@@ -272,12 +323,17 @@ async function listAgyModels(agyPath, extraArgs = []) {
     out.push({ id, name, effort })
   }
   if (wslDistro() && !out.length) throw new Error("WSL agy returned no models. Run agy in the configured distro to sign in.")
-  return out.length ? out : FALLBACK_MODELS
+  return out.length ? { models: out, isFallback: false } : { models: FALLBACK_MODELS, isFallback: true }
 }
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const catalogCache = new Map()
 const offeredProbes = new Map()
+
+function catalogWarming() {
+  const pending = [...offeredProbes.values()].map(entry => entry.promise).filter(Boolean)
+  return pending.length ? Promise.allSettled(pending).then(() => undefined) : null
+}
 
 function offeredKey(agyPath, account) {
   return `${wslDistro() || "native"}|${agyPath}|${account.key}`
@@ -386,6 +442,7 @@ async function getAccounts(agy, { refresh = false } = {}) {
   const usable = [DEFAULT_ACCOUNT]
   await Promise.all(accounts.slice(1).map(async account => {
     if (!agy) return
+    if (await backgroundBlocked({ dir: account.dir })) return
     const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "--version"], {
       timeoutMs: 3_000,
       env: accountEnv(process.env, account.dir),
@@ -401,7 +458,7 @@ function modelFamilyId(model) {
   return model.id.slice(0, -(model.effort.length + 1))
 }
 
-function buildModelCatalog(list) {
+function buildModelCatalog(list, isFallback = false) {
   const rawIds = new Set(list.map(model => model.id))
   const families = new Map()
   for (const model of list) {
@@ -443,14 +500,18 @@ function buildModelCatalog(list) {
     })
     routes.set(id, { byEffort, efforts, defaultEffort })
   }
-  return { models, routes, rawIds }
+  return { models, routes, rawIds, isFallback }
 }
 
 async function loadModelCatalog(agyPath, refresh = false, account = DEFAULT_ACCOUNT) {
   const key = `${agyPath}|${account.key}`
   if (!refresh && catalogCache.has(key)) return catalogCache.get(key)
+  if (refresh && !wslDistro() && (await backgroundBlocked({ dir: account.dir }))) {
+    return buildModelCatalog(FALLBACK_MODELS, true)
+  }
   const extraArgs = account.dir ? [`--gemini_dir=${account.dir}`] : []
-  const catalog = buildModelCatalog(await listAgyModels(agyPath, extraArgs))
+  const listed = await listAgyModels(agyPath, extraArgs)
+  const catalog = buildModelCatalog(listed.models, listed.isFallback)
   catalogCache.set(key, catalog)
   return catalog
 }
@@ -705,6 +766,19 @@ class PromptOutcomeUnknownError extends Error {
 
 // An upstream failure inside a healthy agy session. The process keeps its
 // conversation, so a different follow-up continues without replaying history.
+export function streamErrorOf(error) {
+  const type = error?.kind || "api_error"
+  return {
+    type,
+    message: String(error?.message ?? error),
+    // Declare status explicitly so clients do not classify quoted upstream text (e.g. "code 429") as 429.
+    ...(type === "invalid_request_error" ? { status: 400 } : {}),
+    ...(error?.code ? { code: error.code } : {}),
+    ...(typeof error?.retryable === "boolean" ? { retryable: error.retryable } : {}),
+    ...(Number.isSafeInteger(error?.retryAfterMs) ? { retry_after_ms: error.retryAfterMs } : {}),
+  }
+}
+
 class AgentTurnError extends Error {
   constructor(message, kind = "api_error", classification = null) {
     super(message)
@@ -908,6 +982,8 @@ class Turn {
     this.cancelContinuation = false
     this.cancelledExpectedHash = null
     this.agentError = false
+    this.deliveredTextChars = 0
+    this.deliveredThinkingChars = 0
     this.notices = new AgentNoticeFilter(() => !!lastAgentErrorSync(this.proc.logPath, this.logOffset))
     this.outputLimit = new OutputLimitFilter()
     // agy's title summarizer shares this session's thought stream (#39).
@@ -1084,7 +1160,10 @@ class Turn {
   pushThought(chunk) {
     if (this.done || this.finalized) return
     const text = this.summaryThoughts ? this.summaryThoughts.push(chunk) : chunk
-    if (text) this.push({ type: "thinking", text })
+    if (text) {
+      if (text.trim()) this.deliveredThinkingChars += text.length
+      this.push({ type: "thinking", text })
+    }
   }
 
   // Any held thought prefix is real reasoning only when it never completed the
@@ -1092,14 +1171,23 @@ class Turn {
   flushThoughts() {
     if (!this.summaryThoughts) return
     const text = this.summaryThoughts.flush()
-    if (text && !this.done && !this.finalized) this.push({ type: "thinking", text })
+    if (text && !this.done && !this.finalized) {
+      if (text.trim()) this.deliveredThinkingChars += text.length
+      this.push({ type: "thinking", text })
+    }
   }
 
   // agy reports an upstream failure as an ordinary message chunk followed by
   // end_turn, and its retry notices the same way. Only standalone lines count.
   #pushVisible(chunk) {
     const text = this.notices.push(chunk)
-    if (text) this.push({ type: "text", text })
+    if (text) {
+      if (text.trim()) this.deliveredTextChars += text.length
+      this.push({ type: "text", text })
+    }
+    if (this.notices.refusedDetail && !this.done && !this.finalized) {
+      this.proc.refuseTurn(this, this.notices.refusedDetail)
+    }
   }
 
   flushText(holdTerminal = false) {
@@ -1111,7 +1199,14 @@ class Turn {
     if (rest) this.#pushVisible(rest)
     if (this.agentError) return
     const text = this.notices.flush({ holdTerminal })
-    if (text) this.push({ type: "text", text })
+    if (text) {
+      if (text.trim()) this.deliveredTextChars += text.length
+      this.push({ type: "text", text })
+    }
+  }
+
+  hasDeliveredOutput() {
+    return this.deliveredTextChars > 0 || this.deliveredThinkingChars > 0 || this.calls.length > 0
   }
 
   complete(result) {
@@ -1226,13 +1321,25 @@ function isRecoverableResumeError(error) {
   return /\b(?:session[ /]resume|resume\s+capability|resuming\s+sessions)\b[\s\S]{0,80}\b(?:not\s+supported|unsupported)\b/i.test(message)
 }
 
+// agy states that the prompt never entered the session, so the same logical
+// request is safe to send again.
+function isPromptNotAdded(error) {
+  return Number.isInteger(error?.acpError?.code) && error.acpError.code < 0 &&
+    /^\s*can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(String(error.acpError.message || ""))
+}
+
 // Only an explicit rejection of concurrent prompts proves the steer was not
 // accepted. Auth, transport and generic upstream failures must not resend it.
 function isUnsupportedSteering(error) {
-  if (![-32600, -32601, -32602, -32000].includes(error?.acpError?.code)) return false
+  const code = error?.acpError?.code
+  if (!Number.isInteger(code) || code >= 0) return false
   const message = String(error.acpError.message || "")
-  return /(?:steer(?:ing)?|concurrent\s+prompts?|another\s+prompt|session\s+is\s+busy|(?:prompt|turn)\s+(?:is\s+)?already)/i.test(message) &&
-    /(?:not\s+supported|unsupported|busy|already|in\s+progress)/i.test(message)
+  if (/(?:steer(?:ing)?|concurrent\s+prompts?|another\s+prompt|session\s+is\s+busy|(?:prompt|turn)\s+(?:is\s+)?already)/i.test(message) &&
+    /(?:not\s+supported|unsupported|busy|already|in\s+progress)/i.test(message)) {
+    return true
+  }
+  return /can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(message) &&
+    /(?:waiting\s+for\s+a\s+permission|question\s+answer|send\s+session\/cancel|running\s+prompt|busy|already|in\s+progress|not\s+supported|unsupported)/i.test(message)
 }
 
 // Native CLI 1.5 introduced replacement-style resume append and configuration
@@ -1241,6 +1348,14 @@ function isUnsupportedSteering(error) {
 function nativeSessionSettings(version) {
   const parsed = /^v?(\d+)\.(\d+)\.(\d+)(?:$|[-+])/.exec(version || "")
   return !!parsed && (Number(parsed[1]) > 1 || (Number(parsed[1]) === 1 && Number(parsed[2]) >= 5))
+}
+
+function fitProcTools(tools) {
+  const marked = (tools || []).map((tool) => ({
+    ...tool,
+    _meta: { ...(tool._meta && typeof tool._meta === "object" ? tool._meta : {}), "antigravity/alwaysLoad": true },
+  }))
+  return fitTools(marked)
 }
 
 class Proc {
@@ -1257,6 +1372,7 @@ class Proc {
     this.model = opts.model
     this.selection = opts.selection
     this.tools = opts.tools
+    this.fittedTools = fitProcTools(opts.tools)
     this.toolsSignature = JSON.stringify(opts.tools)
     this.workDir = opts.workDir
     this.instructions = opts.instructions || ""
@@ -1407,7 +1523,7 @@ class Proc {
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
-    const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
+    const appendable = systemAppend() && capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
@@ -1557,7 +1673,7 @@ class Proc {
       waiter.resolve()
     }
     this.listWaiters = this.listWaiters.filter((item) => item.version > this.listedVersion)
-    return this.tools
+    return this.fittedTools
   }
 
   addWatcher(socket) {
@@ -1580,6 +1696,7 @@ class Proc {
       return
     }
     this.tools = tools
+    this.fittedTools = fitProcTools(tools)
     this.toolsSignature = signature
     await this.#announceTools()
   }
@@ -1611,11 +1728,8 @@ class Proc {
     if (method === "session/request_permission") {
       // Only approve explicitly identified, currently advertised client MCP tools.
       // Their execution is still delegated to the client through the MCP adapter.
-      const call = params?.toolCall
-      const isClientTool = this.tools.some(tool =>
-        call?.name === IDE_TOOL_PREFIX + tool.name
-        || call?.title === IDE_TOOL_PREFIX + tool.name
-        || call?.title === `mcp(ide-tools/${tool.name})`)
+      const toolName = ideToolOf(params?.toolCall)
+      const isClientTool = !!toolName && this.tools.some(tool => tool.name === toolName)
       const allow = isClientTool && (params?.options || []).find(option => option?.kind === "allow_once")
       if (allow) return { outcome: { outcome: "selected", optionId: allow.optionId } }
       this.deniedPermissions++
@@ -1795,13 +1909,14 @@ class Proc {
       turn.stepCursor = modelUsageCursor(turn.stepsFile)
       if (turn.stepsFile && turn.stepCursor === null) this.stepUsageTrusted = false
       // Content a cancelled turn never delivered still belongs to the session.
-      let promptParts = mergePromptParts(this.unsentPrompt, toPromptParts(content))
+      let promptParts = userTurnParts(mergePromptParts(this.unsentPrompt, toPromptParts(content)))
       this.unsentPrompt = null
       let usage = null
       let lateCalls = null
       for (;;) {
         turn.logOffset = await fileSize(this.logPath)
         // A cancel that arrived before the prompt would be ignored by agy.
+        if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
           if (this.hasSentFirstTurn && !turn.cancelContinuation) this.unsentPrompt = promptParts
           turn.complete({ stopReason: "cancelled" })
@@ -1839,6 +1954,7 @@ class Proc {
           lateCalls = null
           continue
         }
+        if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
           turn.flushText(true)
           turn.cancelAcknowledged = ["cancelled", "end_turn"].includes(result?.stopReason) &&
@@ -1865,6 +1981,37 @@ class Proc {
           if (detail) throw this.#formatAgentError(detail, turn.promptGuardMatched)
           if (this.compaction) throw new AgentTurnError("agy bridge: upstream refused the compaction request; no summary was produced")
         }
+        // A dropped retry-only notice is not an answer. An uncorroborated
+        // legacy terminal quotation is different: flushText below releases it
+        // as ordinary model text, preserving the existing quote boundary.
+        if ((!turn.notices.failureCandidate || !turn.notices.terminal) && result?.stopReason !== "refusal") {
+          const hasContent = this.compaction && !turn.hiddenCompactionOutput
+            ? turn.deliveredTextChars > 0 : turn.hasDeliveredOutput()
+          if (!hasContent) {
+            const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
+            const detail = turn.notices.terminalDetail || loggedDetail || turn.notices.apiDetail
+            if (detail) {
+              turn.agentError = true
+              throw this.#formatAgentError(detail, turn.promptGuardMatched)
+            }
+            if (this.compaction) {
+              throw new AgentTurnError("agy bridge: upstream returned an empty compaction response; no summary was produced")
+            }
+            if (result?.stopReason === "end_turn") {
+              turn.agentError = true
+              throw new AgentTurnError("agy bridge: upstream ended the turn without producing a model response", "api_error")
+            }
+          } else if (!turn.calls.length && turn.stepsFile && turn.stepCursor != null && fs.existsSync(turn.stepsFile)) {
+            const loggedDetail = await lastAgentError(this.logPath, turn.logOffset)
+            if (loggedDetail) {
+              const batch = modelUsageAfter(turn.stepsFile, turn.stepCursor)
+              if (!batch || batch.pending || (batch.steps?.length || 0) === 0) {
+                turn.agentError = true
+                throw this.#formatAgentError(loggedDetail, turn.promptGuardMatched)
+              }
+            }
+          }
+        }
         turn.flushText()
         if (turn.compactionStages.length) {
           // Never advance past a failed/cancelled/incomplete ingestion prompt.
@@ -1874,6 +2021,10 @@ class Proc {
           }
           promptParts = turn.compactionStages.shift()
           turn.hiddenCompactionOutput = turn.compactionStages.length > 0
+          // ACKs from earlier ingestion prompts cannot prove that the current
+          // fragment or final summary produced output.
+          turn.deliveredTextChars = 0
+          turn.deliveredThinkingChars = 0
           turn.notices = new AgentNoticeFilter(() => !!lastAgentErrorSync(this.logPath, turn.logOffset))
           turn.outputLimit = new OutputLimitFilter()
           lateCalls = null
@@ -1907,6 +2058,7 @@ class Proc {
         if (turn.agentError) throw await this.#agentError(turn)
         // Steering has already put these results in its next user prompt. Do
         // not queue a second late-results prompt (or retain it as unsent input).
+        if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
           turn.complete({ stopReason: "cancelled" })
           return
@@ -1942,6 +2094,10 @@ class Proc {
         turn.fail(error)
         return
       }
+      if (turn.promptAttempt && isPromptNotAdded(error) && turn.promptCount === 1 &&
+        !turn.cancelContinuation && !turn.calls.length && !turn.steeringAttempts.length && !turn.hasDeliveredOutput()) {
+        turn.promptAttempt.submitted = false
+      }
       turn.fail(error)
       dropFromPool(this)
       await this.stop().catch(() => {})
@@ -1971,6 +2127,9 @@ class Proc {
   #formatAgentError(detail, promptGuardMatched = false) {
     if (/code 429\b/i.test(detail) && /(?:system\s+prompt|system\s+instructions).{0,80}(?:reject|invalid|block|denied)/i.test(detail) && turnsAway(this.instructions)) {
       return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "invalid_request_error")
+    }
+    if (isRefused429(detail) && turnsAway(this.instructions) && (!promptGuardEnabled() || turnsAway(outgoingSystemText(this.instructions)))) {
+      return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "rate_limit_error")
     }
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
     const kind = classification.category === "forbidden" ? "permission_error"
@@ -2030,15 +2189,44 @@ class Proc {
     if (!turn.calls.length) this.finalizeTurn(turn)
   }
 
+  refuseTurn(turn, detail) {
+    if (turn.refusedDetail || turn.done || turn.finalized) return
+    turn.refusedDetail = detail
+    turn.agentError = true
+    const error = this.#formatAgentError(detail, turn.promptGuardMatched)
+    error.keepProcess = false
+    this.expectedMessages = turn.baseHistory
+    turn.fail(error)
+    for (const call of turn.calls) clearTimeout(call.deadline)
+    for (const waiter of turn.awaitCalls.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.reply({ content: [{ type: "text", text: error.message }], isError: true })
+    }
+    this.conn?.notify("session/cancel", { sessionId: this.sessionId })
+    const timer = setTimeout(() => {
+      if (this.turn === turn && !turn.finalized && !this.dead) {
+        dropFromPool(this)
+        this.stop().catch(() => {})
+      }
+    }, CANCEL_SETTLE_MS)
+    timer.unref?.()
+    turn.settled.then(() => clearTimeout(timer))
+  }
+
   acceptMcpCall(message, socket) {
     const turn = this.turn
-    if (!turn || turn.done || turn.finalized || turn.cancelRequested) {
+    if (!turn || turn.done || turn.finalized || turn.cancelRequested || turn.steeringFallback) {
       throw new Error("agy bridge: no active turn for MCP call")
     }
     const name = message.name
-    const args = message.arguments ?? {}
+    let args = message.arguments ?? {}
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
-    if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
+    const tool = this.tools.find((item) => item.name === name)
+    if (!tool) throw new Error(`agy bridge: undeclared tool ${name}`)
+    // agy reserves toolSummary internally on run_command and strips it from forwarded args.
+    if (name === "run_command" && tool.inputSchema?.properties?.toolSummary && !Object.hasOwn(args, "toolSummary")) {
+      args = { ...args, toolSummary: "Run command" }
+    }
     const signature = stableJSON(args)
     const running = turn.calls.find((call) => call.deferred && !call.lateDelivered &&
       call.name === name && stableJSON(call.arguments) === signature)
@@ -2214,7 +2402,10 @@ class Proc {
       }
       if (signal?.aborted) throw signal.reason || new Error("request aborted before user steering")
       const running = !turn.done && !turn.cancelRequested && !turn.finalized
-      if (running && this.canSteerNatively(model, selection)) {
+      // A call the client never saw keeps agy waiting, and agy refuses a
+      // concurrent prompt then. Cancel instead of provoking that rejection.
+      const unseen = running ? this.#unseenCalls(turn, results) : []
+      if (running && !unseen.length && this.canSteerNatively(model, selection)) {
         // Live results (including repeat-call waiters) go only through MCP.
         // Results AGY stopped waiting for must accompany the new instruction.
         const late = turn.calls.filter(call => call.deferred && !call.lateDelivered &&
@@ -2225,8 +2416,8 @@ class Proc {
           content: Array.isArray(message.content)
             ? message.content.filter(block => block?.type !== "tool_result") : message.content,
         }))
-        const parts = mergePromptParts(late.length ? renderLateResultParts(late, this.supportsImages) : [],
-          mergePromptParts(renderContinuedTurnParts(messages), outputFormatReminder(body)))
+        const parts = userTurnParts(mergePromptParts(late.length ? renderLateResultParts(late, this.supportsImages) : [],
+          mergePromptParts(renderContinuedTurnParts(messages), outputFormatReminder(body))))
         validateAcpPromptBudget(parts, this.instructions, body)
         validatePromptBudget(results.flatMap(item => item.result.content), this.instructions, body)
         if (promptHasImage(parts) && !this.supportsImages) throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
@@ -2243,7 +2434,7 @@ class Proc {
         // summarizer probe no longer continues from what was held.
         turn.summaryThoughts?.flush()
         const number = turn.beginPrompt(parts, late)
-        pending.promise = this.conn.request("session/prompt", {
+        const sendSteer = (retry) => this.conn.request("session/prompt", {
           sessionId: this.sessionId,
           prompt: parts.length ? parts : [{ type: "text", text: "" }],
         }, 0, "", () => {
@@ -2255,20 +2446,51 @@ class Proc {
           turn.lastPromptResult = result
           turn.recordPromptUsage(number, result?.usage)
         }, error => {
-          if (!isUnsupportedSteering(error) || turn.cancelRequested || turn.done || this.dead) throw error
-          validateAcpPromptBudget(content, this.instructions, body)
-          this.nativeSteeringRejected = true
+          const rejectMsg = String(error?.acpError?.message || "")
+          if (!isUnsupportedSteering(error) || turn.cancelRequested || turn.done || this.dead) {
+            if (promptAttempt && isPromptNotAdded(error)) {
+              promptAttempt.submitted = false
+            }
+            throw error
+          }
+          const waitingForAnswer = /(?:waiting\s+for\s+a\s+permission|question\s+answer|send\s+session\/cancel)/i.test(rejectMsg)
+          // Releasing tool results lets agy start a queued parallel call, whose
+          // permission request can reach agy's state before this prompt does.
+          // The bridge answers permissions at once, so the same steer succeeds
+          // when resent; cancelling would discard the model's queued calls.
+          if (waitingForAnswer && retry < STEER_WAIT_RETRY_MS.length) {
+            return new Promise(resolve => setTimeout(resolve, STEER_WAIT_RETRY_MS[retry])).then(() => {
+              if (turn.cancelRequested || turn.done || this.dead) throw error
+              logBridgeEvent(this, turn, "continued", "user_steering", {}, { steering_method: "native_prompt_retry", steering_retry: retry + 1 })
+              return sendSteer(retry + 1)
+            })
+          }
+          const fallbackParts = userTurnParts(content)
+          validateAcpPromptBudget(fallbackParts, this.instructions, body)
+          if (!waitingForAnswer) this.nativeSteeringRejected = true
           if (turn.stepsFile) this.stepUsageTrusted = false
           turn.stepCursor = null
-          turn.steeringFallback = content
+          turn.steeringFallback = fallbackParts
           // Repeat this batch's results in the follow-up: cancellation can cause
           // AGY to store a cancellation in place of an already delivered result.
           for (const call of turn.calls) {
             if (call.deferred && call.result) call.lateDelivered = true
+            if (!call.clientSeen && call.mcpSeen && !call.mcpResponded && !results.some(item => item.call === call)) {
+              clearTimeout(call.deadline)
+              this.#respondMcp(call, {
+                result: { content: [{ type: "text", text: "agy bridge: cancelled pending tool call for user steering" }], isError: true },
+              })
+            }
           }
+          turn.events = turn.events.filter(event =>
+            event.type !== "tool" || event.call.clientSeen || results.some(item => item.call === event.call))
           if (turn.promptInFlight) this.conn.notify("session/cancel", { sessionId: this.sessionId })
-          logBridgeEvent(this, turn, "continued", "user_steering", {}, { steering_method: "cancel_then_prompt", fallback_reason: "native_steering_unsupported" })
-        }).catch(error => {
+          logBridgeEvent(this, turn, "continued", "user_steering", {}, {
+            steering_method: "cancel_then_prompt",
+            fallback_reason: waitingForAnswer ? "running_prompt_waiting" : "native_steering_unsupported",
+          })
+        })
+        pending.promise = sendSteer(0).catch(error => {
           pending.error = error
           turn.fail(error)
           dropFromPool(this)
@@ -2287,6 +2509,7 @@ class Proc {
       validateAcpPromptBudget(mergePromptParts(this.unsentPrompt, content), this.instructions, body)
       validatePromptBudget(results.flatMap(item => item.result.content), this.instructions, body)
       if (running) {
+        this.#closeUnseenCalls(unseen)
         this.continueWith(results)
         this.recordToolResults(turn, body.messages)
         this.cancelTurn(turn, [])
@@ -2304,6 +2527,20 @@ class Proc {
       return this.startTurn(content, body.messages, model, selection, promptAttempt, promptGuardMatched)
     } finally {
       this.steering = false
+    }
+  }
+
+  #unseenCalls(turn, results) {
+    return turn.calls.filter(call => !call.clientSeen && call.mcpSeen && !call.mcpResponded &&
+      !results.some(item => item.call === call))
+  }
+
+  #closeUnseenCalls(calls) {
+    for (const call of calls) {
+      clearTimeout(call.deadline)
+      this.#respondMcp(call, {
+        result: { content: [{ type: "text", text: "agy bridge: cancelled pending tool call for user steering" }], isError: true },
+      })
     }
   }
 
@@ -2675,6 +2912,8 @@ function unpark(convKey) {
   saveParked()
 }
 
+const USER_CLOAK = 1
+
 // Remember a session so a later request, or a restarted bridge, resumes it
 // instead of replaying history. Called after every completed turn and on retire.
 function park(proc) {
@@ -2689,7 +2928,9 @@ function park(proc) {
     historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
     toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
     instructionsHash: digest(instructionsIdentity(proc.instructions)),
+    systemAppend: systemAppend(),
     workDir: proc.workDir,
+    userCloak: USER_CLOAK,
     at: Date.now(),
   })
   while (parked.size > MAX_PARKED) parked.delete(parked.keys().next().value)
@@ -2700,7 +2941,9 @@ function peekParked(convKey, opts) {
   loadParked()
   const entry = parked.get(convKey)
   if (!entry || Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions))) return null
+    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions)) ||
+    entry.systemAppend !== systemAppend() ||
+    entry.userCloak !== USER_CLOAK) return null
   if (entry.historyHash === digest(historyKey(opts.history))) return entry
   const ids = toolUseIdentitiesKey(opts.history)
   if (ids == null || entry.toolUseIdentitiesHash !== digest(ids) ||
@@ -3782,7 +4025,7 @@ function matchToolResults(body, blocks, accountName = null) {
 // boundaries. User, assistant, tool and mid-session content never pass through
 // this guard.
 function guardRequestSystem(body) {
-  if (process.env.AGY_BRIDGE_PROMPT_GUARD === "0") return { body, diagnostics: [] }
+  if (!promptGuardEnabled()) return { body, diagnostics: [] }
   const diagnostics = []
   const apply = (value) => {
     if (typeof value !== "string" && !Array.isArray(value)) return value
@@ -4013,6 +4256,9 @@ function normalizeTools(body) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
     const inputSchema = sanitizeInputSchema(rawSchema)
+    if (tool.name === "run_command" && Array.isArray(inputSchema.required)) {
+      inputSchema.required = inputSchema.required.filter((key) => key !== "toolSummary")
+    }
     tools.push({
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
@@ -4977,7 +5223,7 @@ function responseUsage(proc, turn, step, content, result) {
   const estimate = turn.stepInputEstimates[step.estimateIndex] || step.inputEstimate
   const scale = Number.isFinite(proc.inputTokenScale) ? Math.max(0.5, Math.min(1.5, proc.inputTokenScale)) : 1
   let cacheRatio = Number.isFinite(proc.lastCacheRatio) ? Math.max(0, Math.min(1, proc.lastCacheRatio)) : 0
-  let input = Math.max(1, tokenCount(estimate * scale))
+  let input = estimate > 0 ? Math.max(1, tokenCount(estimate * scale)) : 0
   let write = 0
   if (final) {
     const sum = turn.stepInputEstimates.reduce((total, value) => total + value, 0)
@@ -5009,7 +5255,7 @@ function responseUsage(proc, turn, step, content, result) {
   const emitted = responseOutputEstimate(content)
   const output = final
     ? Math.max(emitted.output, tokenCount((translated?.output_tokens || 0) - turn.emittedOutputTokens))
-    : Math.max(1, emitted.output)
+    : emitted.output
   const thinking = Math.min(output, emitted.thinking)
   return {
     input_tokens: input - read,
@@ -5121,7 +5367,10 @@ async function measuredUsage(turn, step, content, result) {
     output_tokens: output, thinking_tokens: thinking,
     context_tokens: last.input + last.read + last.write,
     local_context_estimate: last.context,
-    declared_context_window: contextWindow(turn.proc.currentModel),
+    declared_context_window: contextWindow(
+      turn.proc.currentModel,
+      resolveModelMetadata(turn.proc.currentModel, getCachedCloudCodeModels({ key: turn.proc.accountKey }))?.context,
+    ),
   })
   return {
     input_tokens: last.input,
@@ -5368,16 +5617,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             closeBlock()
             clearInterval(pingTimer)
             pingTimer = null
-            send("error", {
-              type: "error",
-              error: {
-                type: event.error?.kind || "api_error",
-                message: String(event.error?.message ?? event.error),
-                ...(event.error?.code ? { code: event.error.code } : {}),
-                ...(typeof event.error?.retryable === "boolean" ? { retryable: event.error.retryable } : {}),
-                ...(Number.isSafeInteger(event.error?.retryAfterMs) ? { retry_after_ms: event.error.retryAfterMs } : {}),
-              },
-            })
+            send("error", { type: "error", error: streamErrorOf(event.error) })
             if (!event.error?.keepProcess) {
               dropFromPool(proc)
               await proc.stop().catch(() => {})
@@ -5459,7 +5699,7 @@ function estimateInputTokens(body) {
   if (Array.isArray(body.tools) && body.tools.length) {
     total += estimateTextTokens(JSON.stringify(body.tools))
   }
-  return Math.max(1, total + images * 1600)
+  return total + images * 1600
 }
 
 async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
@@ -5533,7 +5773,9 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.code === "upstream_idle_timeout" ? 504
+    const status = Number.isInteger(streamError.status)
+      ? streamError.status
+      : streamError.code === "upstream_idle_timeout" ? 504
       : streamError.type === "rate_limit_error" ? 429
       : streamError.type === "permission_error" ? 403 : streamError.type === "invalid_request_error" ? 400 : 502
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
@@ -5662,6 +5904,7 @@ function expandHome(value) {
 
 export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
   const magpie = !!input.magpie
+  keepAgyCurrent(findAgy)
   if (magpie) void startContextService({
     port: options?.contextPort,
     unavailableReason: wslDistro() ? "wsl" : null,
@@ -5705,6 +5948,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
     accountsCache = null
     invalidateAccounts()
     catalogCache.clear()
+    offeredProbes.clear()
+    forgetStoredSignIn({ dead: true })
+    invalidateModelMetadataCache()
   } })
   return {
     auth: {
@@ -5712,6 +5958,16 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
       // Each native account has its own local profile reference. WSL exposes
       // only the distro's existing CLI account.
       single: !!wslDistro(),
+      cli: {
+        name: "Antigravity CLI",
+        manual: AGY_MANUAL,
+        installed: async () => findAgy() !== null,
+        install: async ({ signal } = {}) => {
+          if (findAgy()) return
+          await installAgy({ signal })
+          if (!findAgy()) throw new Error("agy was installed, but the plugin can't run it")
+        },
+      },
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
       usage: async getAuth => {
         if (!magpie) return readUsage()
@@ -5734,7 +5990,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             if (!agy) {
               return {
                 type: "failed",
-                error: cachedAgyError || "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
+                error: cachedAgyError || `agy CLI not found. Update magpie and try again to have it installed, or install Antigravity CLI yourself: ${AGY_MANUAL} — then run \`agy\` once to sign in.`,
               }
             }
             const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
@@ -5747,7 +6003,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 error: wslDistro() ? `WSL agy failed (${why}). Check wsl.exe, distro ${wslDistro()} and AGY_PATH, then run agy in that same distro to sign in.` : `agy at ${agy} is not signed in (${why}). Run \`agy\` in a terminal once to sign in to your Google account, then try again.`,
               }
             }
-            return { type: "success", key: "agy" }
+            forgetStoredSignIn({ dead: true })
+            offeredProbes.clear()
+            const email = wslDistro() ? "" : await storedEmail()
+            return { type: "success", key: "agy", ...(email ? { metadata: { email } } : {}) }
           },
         },
         ...(wslDistro() ? [] : [...accountImportMethods(importEntries), accountLogin]),
@@ -5768,6 +6027,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               const probe = await execOnce(agy, [`--gemini_dir=${account.dir}`, "models"], { timeoutMs: 15_000, env: accountEnv(process.env, account.dir), signal })
               if (signal?.aborted) return { type: "failed", error: "Account registration was cancelled." }
               if (probe.err || probe.code !== 0 || !probe.stdout.trim()) return { type: "failed", error: "agy could not verify this saved account. Check its login before registering it." }
+              forgetStoredSignIn({ dead: true })
+              offeredProbes.clear()
               return result
             } catch (error) {
               return { type: "failed", error: error instanceof NativeAccountError || error instanceof ImportError ? error.message : "Could not register the saved Bridge account." }
@@ -5816,7 +6077,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
 
             const guarded = guardRequestSystem(body)
             body = guarded.body
-            const promptGuardMatched = guarded.diagnostics.length > 0
+            // guardRequestSystem already neutralized matched lines before agy sees the prompt; don't blame subsequent 429s on it.
+            const promptGuardMatched = false
             const rawModel = body.model || ""
             if (wslDistro() && rawModel.replace(/^antigravity-bridge\//, "").includes("/")) return jsonError(400, "Named account profiles are unavailable in WSL mode; use the distro default account")
             let account, modelId
@@ -5832,6 +6094,17 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               }
             } catch (error) {
               return jsonError(error.statusCode ?? 503, error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", error.code, true)
+            }
+            if (!account.dir && !wslDistro()) {
+              const notSignedIn = cannotSignIn(storedSignInNow())
+              if (notSignedIn) {
+                return jsonError(
+                  401,
+                  `${notSignedIn}: sign in again in magpie, or run \`agy\` in a terminal`,
+                  "unauthenticated",
+                  { headers: { "X-Magpie-Sign-In": "expired" } },
+                )
+              }
             }
             const requestedModel = modelId.replace(/\[1m\]$/i, "")
             const layout = canonicalBody(body) === body ? "hoisted" : "inline"
@@ -5913,7 +6186,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 messages: body.messages, layout, nonstream: body.stream === false,
                 account: account.name, accountKey: account.key, geminiDir: account.dir, userId: body.metadata?.user_id || "",
                 validateReplay: () => validateAcpPromptBudget(
-                  renderReplayPromptParts(body, callerWorkDir, true, instructions), instructions, body) }
+                  renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
+                  systemAppend() ? instructions : "", body) }
               const claim = (continuationOpts = null) => {
                 if (!promptAttempt) {
                   const key = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)
@@ -6146,6 +6420,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
     provider: {
       id: PROVIDER_ID,
       npm: NPM_ANTHROPIC,
+      warming: () => catalogWarming(),
       models: async (_provider, context = {}) => {
         const agy = findAgy()
         if (cachedAgyError) throw new Error(cachedAgyError)
@@ -6153,12 +6428,14 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
         const accounts = magpie ? [boundAccount(context.auth, { allowMissing: true })]
           : agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
         const out = {}
-        await Promise.all(accounts.map(async account => {
-          const catalogPromise = agy ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS))
-          const offeredPromise = agy
+        const accountFallbacks = await Promise.all(accounts.map(async account => {
+          const blocked = agy && !wslDistro() ? await backgroundBlocked({ dir: account.dir }) : ""
+          const catalogPromise = agy && !blocked ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS, true))
+          const offeredPromise = agy && !blocked
             ? probeOfferedModels(agy, account, configuredTimeout("AGY_BRIDGE_MODEL_PROBE_WAIT_MS", MODEL_PROBE_WAIT_MS))
             : Promise.resolve(null)
-          const [catalog, offered] = await Promise.all([catalogPromise, offeredPromise])
+          const cloudPromise = blocked ? Promise.resolve(null) : fetchCloudCodeModels(account, agy)
+          const [catalog, offered, cloudData] = await Promise.all([catalogPromise, offeredPromise, cloudPromise])
           const offeredIds = new Set((offered || []).map(item => item.id))
           // ACP is an optional confirmation. Unknown/empty/failed probes must
           // never narrow the CLI catalog (notably Claude, Sonnet and GPT-OSS).
@@ -6170,24 +6447,39 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             // Named accounts expose the same catalog under "<account>/<model>".
             const id = !native && account.name ? `${account.name}/${model.id}` : model.id
             const name = !native && account.name ? `[${account.name}] ${model.name}` : model.name
-            const imageModel = /^(?:gemini-|claude-)/.test(model.id)
+            const variantIds = [...(catalog.routes.get(model.id)?.byEffort?.values() || [])]
+            const meta = resolveModelMetadata(model.id, cloudData, variantIds)
+            const context = contextWindow(model.id, meta?.context)
+            const output = meta?.output > 0 ? meta.output : 0
+            const hasReasoning = isReasoningModel(model.id, model.variants)
+            const imageModel = typeof meta?.supportsImages === "boolean"
+              ? meta.supportsImages
+              : /^(?:gemini-|claude-)/.test(model.id)
             out[id] = {
               id,
               name,
               npm: NPM_ANTHROPIC,
               api: { id, url: "agy://local", npm: NPM_ANTHROPIC },
-              limit: { context: contextWindow(model.id) },
+              limit: {
+                context,
+                ...(output > 0 ? { output } : {}),
+              },
               capabilities: {
                 ...(imageModel ? { attachment: true, input: { text: true, image: true }, output: { text: true } } : {}),
-                ...(model.variants ? { reasoning: true } : {}),
+                ...(hasReasoning ? { reasoning: true } : {}),
               },
+              ...(hasReasoning ? { reasoning: true } : {}),
               ...(model.variants ? {
-                reasoning: true,
                 variants: Object.fromEntries(model.variants.map(effort => [effort, {}])),
               } : {}),
             }
           }
+          return !agy || !!blocked || !!catalog.isFallback
         }))
+        // Signal fallback lists to Magpie so user-selected models are preserved while agy cannot list them.
+        if (!agy || (accountFallbacks.length > 0 && accountFallbacks.every(Boolean))) {
+          out[Symbol.for("magpie.fellBack")] = true
+        }
         return out
       },
     },
@@ -6196,7 +6488,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
 
 // Permanent tool-history errors and already-submitted prompts opt out of retries.
 // Magpie header forwarding has not been verified; other 409s retain their semantics.
-function jsonError(status, message, code, noRetry = false) {
+function jsonError(status, message, code, optionsOrNoRetry = false) {
+  const opts = typeof optionsOrNoRetry === "object" && optionsOrNoRetry !== null
+    ? optionsOrNoRetry
+    : { noRetry: Boolean(optionsOrNoRetry) }
   return new Response(
     JSON.stringify({
       type: "error",
@@ -6204,7 +6499,8 @@ function jsonError(status, message, code, noRetry = false) {
         ...(code ? { code } : {}), message: String(message || "unknown error") },
     }),
     { status, headers: { "Content-Type": "application/json",
-      ...(noRetry ? { "x-should-retry": "false" } : {}) } },
+      ...(opts.noRetry ? { "x-should-retry": "false" } : {}),
+      ...(opts.headers || {}) } },
   )
 }
 

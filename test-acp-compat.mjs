@@ -71,17 +71,27 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     log({ kind: "prompt", append, model, effort, prompt: p.prompt })
     const text = p.prompt.map(part => part.text || "").join("")
     const chunk = text => send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })
+    const notAdded = () => send({ id: msg.id, error: { code: -32603, message: "Can't add this prompt to session: waiting for a permission" } })
+    if (text.includes("PROMPT_NOT_ADDED_FIRST")) return notAdded()
+    if (text.includes("PROMPT_NOT_ADDED_LATE")) {
+      chunk("Accepted original prompt")
+      return reply({ stopReason: "max_tokens" })
+    }
+    if (mode === "late-prompt-rejected" && text.startsWith("Continue exactly")) return notAdded()
     if (text.startsWith("CANCEL_RETRY original")) {
       cancelPrompt = reply
       if (mode !== "cancel-before-text") chunk("Partial answer")
       return
     }
     if (text === "[The previous reply was interrupted before it finished. Answer my last message again, in full.]") {
+      if (mode === "cancel-nudge-rejected") return notAdded()
       chunk("Complete replacement answer")
       return reply({ stopReason: "end_turn" })
     }
     if (text.includes("[Bridge compaction fragment ")) {
       fragments++
+      if (mode === "compaction-prompt-rejected" && fragments === 2) return notAdded()
+      if (mode === "compaction-empty-fragment" && fragments === 2) return reply({ stopReason: "end_turn" })
       if (mode === "compaction-failure" && fragments === 2) {
         chunk("\n⚠ Your AI credits balance is too low to continue.\n")
         return reply({ stopReason: "end_turn" })
@@ -93,6 +103,11 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       return reply({ stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 2 } })
     }
     if (text.startsWith("All conversation fragments") || text.includes("\n\nAll conversation fragments")) {
+      if (mode === "compaction-empty-final") return reply({ stopReason: "end_turn" })
+      if (mode === "compaction-thought-only-final") {
+        send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Planning the summary" } } } })
+        return reply({ stopReason: "end_turn" })
+      }
       chunk("## Objective\nKeep LATEST-INSTRUCTION pending.\n## Next Move\nContinue from the summary.")
       return reply({ stopReason: "end_turn", usage: { inputTokens: 30, outputTokens: 12 } })
     }
@@ -108,9 +123,12 @@ fs.writeFileSync(executable, process.platform === "win32"
   : `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(source)} "$@"\n`, { mode: 0o755 })
 Object.assign(process.env, {
   AGY_PATH: executable, COMPAT_LOG: logFile, COMPAT_STOP: path.join(root, "stop"),
+  // The fake ACP owns authentication outcomes. Host keychain state must never
+  // reject a fixture request or provide credentials to background discovery.
+  AGY_BRIDGE_STORED_SIGNIN: "skip", AGY_BRIDGE_CLOUDCODE_METADATA: "0", AGY_CLI_DISABLE_AUTO_UPDATE: "1",
   AGY_BRIDGE_STATE_FILE: path.join(root, "sessions.json"), AGY_BRIDGE_CONVERSATIONS_DIR: path.join(root, "conversations"),
   AGY_BRIDGE_ACCOUNTS_DIR: path.join(root, "accounts"), AGY_BRIDGE_CONTEXT_DIR: path.join(root, "context"),
-  AGY_BRIDGE_CONFIG_TIMEOUT_MS: "500", AGY_BRIDGE_START_TIMEOUT_MS: "3000",
+  AGY_BRIDGE_CONFIG_TIMEOUT_MS: "1500", AGY_BRIDGE_START_TIMEOUT_MS: "5000",
 })
 delete process.env.AGY_BRIDGE_WSL_DISTRO
 const logs = () => fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []
@@ -146,6 +164,49 @@ const summaryMessages = (kind = "flattened") => kind === "flattened"
     { role: "assistant", content: [{ type: "tool_use", id: "already-executed", name: "Read", input: { path: "report" } }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "already-executed", content: largeHistory }] },
     { role: "user", content: compactionPrompt }]
+
+for (const mode of ["first-prompt-rejected", "late-prompt-rejected", "compaction-prompt-rejected", "compaction-empty-fragment", "compaction-empty-final", "compaction-thought-only-final"]) {
+  test(`PR75 rejected or empty follow-ups preserve logical attempt state: ${mode}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const messages = mode.startsWith("compaction-") ? summaryMessages()
+      : [{ role: "user", content: mode === "first-prompt-rejected" ? "PROMPT_NOT_ADDED_FIRST" : "PROMPT_NOT_ADDED_LATE" }]
+    const before = logs().length
+    const first = await request(client, messages)
+    assert.equal(first.status, 502, await first.text())
+    const submitted = logs().slice(before).filter(event => event.kind === "prompt").length
+    const retry = await request(client, messages)
+    const retryBody = await retry.json()
+    if (mode === "first-prompt-rejected") {
+      assert.equal(retry.status, 502, JSON.stringify(retryBody))
+      assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, submitted + 1)
+    } else {
+      assert.equal(retry.status, 409, JSON.stringify(retryBody))
+      assert.equal(retryBody.error.code, "prompt_outcome_unknown")
+      assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, submitted,
+        "rejecting a later prompt cannot authorize replay of already accepted input")
+    }
+  })
+}
+
+test("PR75 rejected cancel nudge cannot release the already submitted original prompt", async () => {
+  process.env.COMPAT_MODE = "cancel-nudge-rejected"
+  const client = await loader()
+  const messages = [{ role: "user", content: "CANCEL_RETRY original nudge rejected" }]
+  const abort = new AbortController()
+  const before = logs().length
+  const response = await request(client, messages, { stream: true }, abort.signal)
+  const read = response.text().catch(() => {})
+  await waitFor(() => logs().slice(before).some(event => event.kind === "prompt"))
+  abort.abort()
+  await read
+  const rejected = await request(client, messages)
+  assert.equal(rejected.status, 502, await rejected.text())
+  const replay = await request(client, messages, { stream: true })
+  if (replay.status === 200) await replay.body.cancel()
+  assert.equal(replay.status, 409)
+  assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, 2)
+})
 
 for (const mode of ["response-first", "no-append"]) for (const stream of [false, true]) {
   test(`oversized OpenCode compaction stages the full history, ${mode}, stream=${stream}`, async () => {
@@ -203,7 +264,7 @@ for (const mode of ["compaction-failure", "compaction-refusal"]) {
     assert.equal(response.status, mode === "compaction-failure" ? 429 : 502, JSON.stringify(payload))
     const sent = logs().slice(before).filter(event => event.kind === "prompt")
     assert.equal(sent.length, mode === "compaction-failure" ? 2 : 1)
-    assert.ok(sent.every(event => event.prompt.some(part => part.text?.startsWith("[Bridge compaction fragment "))))
+    assert.ok(sent.every(event => event.prompt.some(part => part.text?.includes("[Bridge compaction fragment "))))
     assert.ok(!JSON.stringify(payload).includes("ACK-INTERNAL"))
     const retry = await request(client, messages)
     assert.notEqual(retry.status, 200)
@@ -240,9 +301,11 @@ test("a customized compaction-looking prompt keeps the ordinary request and inst
   assert.equal(response.status, 200, await response.text())
   const sent = logs().slice(before).filter(event => event.kind === "prompt")
   assert.equal(sent.length, 1)
-  assert.match(sent[0].append, /Keep the user's instructions/)
-  assert.ok(!sent[0].append.includes("You are summarizing an existing conversation"))
-  assert.ok(sent[0].prompt.some(part => part.text?.includes(latest)))
+  const promptText = sent[0].prompt.map(part => part.text || "").join("")
+  assert.equal(sent[0].append, "")
+  assert.match(promptText, /Keep the user's instructions/)
+  assert.ok(!promptText.includes("You are summarizing an existing conversation"))
+  assert.ok(promptText.includes(latest))
 })
 
 test("cancelling an ingestion prompt prevents remaining fragments from being submitted and blocks retry", async () => {
@@ -279,12 +342,13 @@ for (const mode of ["cancel-before-text", "cancel-partial"]) for (const stream o
     const messages = [{ role: "user", content: `CANCEL_RETRY original ${mode} ${stream}` }]
     const abort = new AbortController()
     const response = await request(client, messages, { stream: true }, abort.signal)
+    assert.equal(response.status, 200, response.status === 200 ? undefined : await response.text())
     const reader = response.body.getReader()
     if (mode === "cancel-partial") {
       let text = ""
       while (!text.includes("Partial answer")) {
         const chunk = await reader.read()
-        assert.equal(chunk.done, false)
+        assert.equal(chunk.done, false, `response ended before partial answer: ${text}`)
         text += new TextDecoder().decode(chunk.value)
       }
       await reader.cancel()
@@ -345,29 +409,62 @@ for (const mode of ["response-first", "notification-first", "legacy", "legacy-ha
   })
 }
 
+test("default first-turn external system instructions do not send systemPrompt.append on new or resume", async () => {
+  process.env.COMPAT_MODE = "response-first"
+  delete process.env.AGY_BRIDGE_SYSTEM_APPEND
+  const start = logs().length
+  let messages = [{ role: "user", content: "default external opening" }]
+  for (let round = 0; round < 3; round++) {
+    const response = await request(await loader(), messages, { system: "DEFAULT_EXTERNAL_MARKER" })
+    const body = await response.json()
+    assert.equal(response.status, 200, JSON.stringify(body))
+    messages = [...messages, { role: "assistant", content: body.content }, { role: "user", content: `next default ${round}` }]
+  }
+  const events = logs().slice(start)
+  const opens = events.filter(e => e.kind === "request" && ["session/new", "session/resume"].includes(e.method))
+  assert.equal(opens.length, 3)
+  assert.deepEqual(opens.map(e => e.method), ["session/new", "session/resume", "session/resume"])
+  for (const event of opens) {
+    assert.equal(event.params._meta?.antigravity?.systemPrompt?.append, undefined)
+  }
+  const prompts = events.filter(e => e.kind === "prompt")
+  assert.equal(prompts.length, 3)
+  assert.match(prompts[0].prompt.map(p => p.text || "").join(""), /<external_system_instructions>[\s\S]*DEFAULT_EXTERNAL_MARKER[\s\S]*<\/external_system_instructions>/)
+  for (let i = 1; i < prompts.length; i++) {
+    assert.equal(prompts[i].prompt.map(p => p.text || "").join(""), `next default ${i - 1}`)
+  }
+})
+
 for (const mode of ["response-first", "legacy-resume", "no-append"]) {
   test(`resume append: ${mode}`, async () => {
+    const prevAppend = process.env.AGY_BRIDGE_SYSTEM_APPEND
+    process.env.AGY_BRIDGE_SYSTEM_APPEND = "1"
     process.env.COMPAT_MODE = mode
-    const start = logs().length
-    let messages = [{ role: "user", content: `resume opening ${mode}` }]
-    for (let round = 0; round < 3; round++) {
-      const response = await request(await loader(), messages, { system: "APPEND_COMPAT_MARKER" })
-      const body = await response.json()
-      assert.equal(response.status, 200, JSON.stringify(body))
-      messages = [...messages, { role: "assistant", content: body.content }, { role: "user", content: `next ${mode} ${round}` }]
-    }
-    const events = logs().slice(start)
-    const opens = events.filter(e => e.kind === "request" && ["session/new", "session/resume"].includes(e.method))
-    assert.equal(opens.length, 3)
-    assert.deepEqual(opens.map(e => e.method), ["session/new", "session/resume", "session/resume"])
-    for (const [i, event] of opens.entries()) {
-      const append = event.params._meta?.antigravity?.systemPrompt?.append || ""
-      assert.equal(append.split("APPEND_COMPAT_MARKER").length - 1, mode === "no-append" || (mode === "legacy-resume" && i > 0) ? 0 : 1)
-    }
-    const prompts = events.filter(e => e.kind === "prompt")
-    assert.equal(prompts.length, 3)
-    for (let i = 1; i < prompts.length; i++) {
-      assert.equal(prompts[i].prompt.map(p => p.text || "").join(""), `next ${mode} ${i - 1}`, "resume submits only the new user turn")
+    try {
+      const start = logs().length
+      let messages = [{ role: "user", content: `resume opening ${mode}` }]
+      for (let round = 0; round < 3; round++) {
+        const response = await request(await loader(), messages, { system: "APPEND_COMPAT_MARKER" })
+        const body = await response.json()
+        assert.equal(response.status, 200, JSON.stringify(body))
+        messages = [...messages, { role: "assistant", content: body.content }, { role: "user", content: `next ${mode} ${round}` }]
+      }
+      const events = logs().slice(start)
+      const opens = events.filter(e => e.kind === "request" && ["session/new", "session/resume"].includes(e.method))
+      assert.equal(opens.length, 3)
+      assert.deepEqual(opens.map(e => e.method), ["session/new", "session/resume", "session/resume"])
+      for (const [i, event] of opens.entries()) {
+        const append = event.params._meta?.antigravity?.systemPrompt?.append || ""
+        assert.equal(append.split("APPEND_COMPAT_MARKER").length - 1, mode === "no-append" || (mode === "legacy-resume" && i > 0) ? 0 : 1)
+      }
+      const prompts = events.filter(e => e.kind === "prompt")
+      assert.equal(prompts.length, 3)
+      for (let i = 1; i < prompts.length; i++) {
+        assert.equal(prompts[i].prompt.map(p => p.text || "").join(""), `next ${mode} ${i - 1}`, "resume submits only the new user turn")
+      }
+    } finally {
+      if (prevAppend === undefined) delete process.env.AGY_BRIDGE_SYSTEM_APPEND
+      else process.env.AGY_BRIDGE_SYSTEM_APPEND = prevAppend
     }
   })
 }

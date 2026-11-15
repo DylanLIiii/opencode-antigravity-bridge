@@ -14,6 +14,7 @@ import { v2 as openCodeCompactionPrompt } from "./test/fixtures/opencode-compact
 // The smoke suite covers the fetch/ACP/MCP path; these cases cover batched
 // client payloads that the sequential fake ACP server cannot emit itself.
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "agy-compat-test-"))
+process.env.AGY_BRIDGE_CONTEXT_DIR = path.join(workspace, "context")
 const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)

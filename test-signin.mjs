@@ -146,3 +146,11 @@ test("emailOf and storedEmail extract id_token_email without leaking missing or 
     exec: async () => { throw new Error("should not call security") },
   }), "")
 })
+
+test("stored keyring reads honor AGY_BRIDGE_DISABLE_KEYCHAIN and never touch Windows credentials in WSL mode", async () => {
+  let spawned = 0
+  const exec = async () => { spawned++; return { code: 0, stdout: "" } }
+  assert.deepEqual(await readStoredSignIn({ platform: "darwin", exec, env: { AGY_BRIDGE_DISABLE_KEYCHAIN: "1" } }), { state: "unknown" })
+  assert.deepEqual(await readStoredSignIn({ platform: "win32", exec, env: { AGY_BRIDGE_WSL_DISTRO: "Ubuntu" } }), { state: "unknown" })
+  assert.equal(spawned, 0)
+})

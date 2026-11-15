@@ -5,6 +5,7 @@ import { execFile } from "node:child_process"
 import { createHash } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
+import { wslDistro } from "./platform.mjs"
 
 const SERVICE = "gemini"
 const USER = "antigravity"
@@ -97,6 +98,10 @@ export async function readAccountSignIn(geminiDir, { now = Date.now(), env = pro
 async function readStoredValue({ platform = process.platform, exec = run, env = process.env } = {}) {
   if (env.AGY_BRIDGE_STORED_SIGNIN === "skip") return { state: "unknown" }
   if (ENV_SIGN_INS.some((name) => env[name])) return { state: "unknown" }
+  // Windows-to-WSL mode signs in inside the distro; the Windows Credential
+  // Manager entry belongs to a different (host) account.
+  if (wslDistro(env, platform)) return { state: "unknown" }
+  if (env.AGY_BRIDGE_DISABLE_KEYCHAIN) return { state: "unknown" }
   if (platform === "darwin") {
     const r = await exec("/usr/bin/security", ["find-generic-password", "-s", SERVICE, "-a", USER, "-w"])
     if (r.code === 44) return { state: "missing" }

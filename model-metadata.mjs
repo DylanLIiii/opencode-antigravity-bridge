@@ -3,6 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { promisify } from "node:util"
+import { wslDistro } from "./platform.mjs"
 
 const execFileAsync = promisify(execFile)
 
@@ -41,6 +42,9 @@ export const KNOWN_MODEL_LIMITS = Object.freeze({
 
 const cache = new Map()
 const inflight = new Map()
+// Bumped by invalidateModelMetadataCache: a fetch started for an earlier
+// account state must not repopulate the cache after a sign-in/account change.
+let generation = 0
 
 function isPathInside(targetPath, parentDir) {
   if (!targetPath || !parentDir) return false
@@ -74,6 +78,8 @@ function parseOAuthToken(raw) {
   let text = raw.trim()
   if (text.startsWith("go-keyring-base64:")) {
     text = Buffer.from(text.slice("go-keyring-base64:".length), "base64").toString("utf8")
+  } else if (text.startsWith("go-keyring-encoded:")) {
+    text = Buffer.from(text.slice("go-keyring-encoded:".length), "hex").toString("utf8")
   }
   let parsed
   try { parsed = JSON.parse(text) } catch { return null }
@@ -90,8 +96,15 @@ function parseOAuthToken(raw) {
 }
 
 async function readAccountToken(account, agyPath) {
-  const customEndpoint = Boolean(String(process.env.AGY_BRIDGE_CLOUDCODE_URL || "").trim())
-  const allowHostCredentials = customEndpoint || !isMockAgyPath(agyPath)
+  // Windows-to-WSL mode signs in inside the distro. The Windows host's file
+  // token and Credential Manager belong to a different account: never read them.
+  if (wslDistro()) return null
+  // Explicit opt-out: no credential is read and nothing is sent to CloudCode.
+  if (/^(?:0|false|off|no|disabled)$/i.test(String(process.env.AGY_BRIDGE_CLOUDCODE_METADATA ?? "").trim())) return null
+  // The host default sign-in is read only for a real agy install. A custom
+  // CloudCode endpoint (tests, proxies) must never unlock it, or a mock run
+  // would send the user's real token to that endpoint.
+  const allowHostCredentials = !isMockAgyPath(agyPath) && process.env.AGY_BRIDGE_STORED_SIGNIN !== "skip"
   const filePath = account?.dir
     ? path.join(account.dir, "antigravity-cli", "antigravity-oauth-token")
     : allowHostCredentials
@@ -138,6 +151,7 @@ export async function fetchCloudCodeModels(account, agyPath, refresh = false) {
   const cached = cache.get(key)
   if (!refresh && cached && cached.expiresAt > Date.now()) return cached
   if (inflight.has(key)) return await inflight.get(key)
+  const startedAt = generation
   const pending = (async () => {
     const token = await readAccountToken(account, agyPath)
     if (!token) return null
@@ -145,6 +159,7 @@ export async function fetchCloudCodeModels(account, agyPath, refresh = false) {
     const prodBase = baseOverride || PROD_BASE_URL
     const dailyBase = baseOverride || DAILY_BASE_URL
     const models = new Map()
+    let fetched = false
     if (!token.expired || baseOverride) {
       try {
         const load = await postCloudCode(prodBase, "loadCodeAssist", token.accessToken, {
@@ -163,6 +178,7 @@ export async function fetchCloudCodeModels(account, agyPath, refresh = false) {
         )
         const rawModels = available?.models
         if (rawModels && typeof rawModels === "object") {
+          fetched = true
           for (const [id, info] of Object.entries(rawModels)) {
             if (!info || typeof info !== "object") continue
             const context = Number(info.maxTokens)
@@ -177,12 +193,15 @@ export async function fetchCloudCodeModels(account, agyPath, refresh = false) {
         }
       } catch {}
     }
+    // A transient CloudCode failure (timeout, 5xx, expired token) must not
+    // erase limits learned by an earlier successful fetch for this account.
+    const previous = cache.get(key)
     const result = {
       hasCredentials: true,
-      models,
+      models: fetched || !previous?.models?.size ? models : previous.models,
       expiresAt: Date.now() + METADATA_TTL_MS,
     }
-    cache.set(key, result)
+    if (startedAt === generation) cache.set(key, result)
     return result
   })()
   inflight.set(key, pending)
@@ -196,7 +215,9 @@ export function getCachedCloudCodeModels(account) {
 }
 
 export function invalidateModelMetadataCache() {
+  generation++
   cache.clear()
+  inflight.clear()
 }
 
 function candidateLookupIds(id, variantIds = []) {

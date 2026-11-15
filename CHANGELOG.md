@@ -2,6 +2,7 @@
 
 ## 0.9.0
 
+- Register hook-defined providers in the OpenCode 2.x adapter and contain failed sign-in callbacks. Bound and cancel installer version checks, route archive/file errors to the caller, and preserve the working Windows binary on replacement or rollback failure.
 - Preserve latest main's Pi-Bolt/Claude Code prompt rewrites and client-cancel recovery. Review fixes keep original submission guards after later prompt rejections and require output from each compaction fragment and the final summary.
 - Isolate optional CloudCode credential reads from WSL and test/mock default profiles, add `AGY_BRIDGE_CLOUDCODE_METADATA=0`, honor metadata cache TTL and preserve successful metadata after transient refresh failures. Account resets invalidate in-flight cache writes.
 - Query CloudCode model metadata (`loadCodeAssist` / `fetchAvailableModels`) and known Antigravity limits so models report accurate `limit.context`, `limit.output`, image capabilities, and `reasoning` flags (`gemini-pro-orchestrator*`, `claude-opus-4-6-thinking`, 1M Gemini/Claude 5.5, 250K Claude 4.6, 65K image model).

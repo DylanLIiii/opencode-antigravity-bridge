@@ -226,6 +226,14 @@ test("an archive that can't be written out rejects instead of crashing the host"
   assert.equal(uncaught, null)
 })
 
+test("missing and corrupt archives reject through the extraction promise", async () => {
+  await assert.rejects(untarMember(path.join(root, "missing.tar.gz"), "antigravity", path.join(root, "out")), { code: "ENOENT" })
+  const bad = path.join(root, "bad.tar.gz")
+  fs.writeFileSync(bad, "not a gzip stream")
+  await assert.rejects(untarMember(bad, "antigravity", path.join(root, "out")), /header|gzip|data/i)
+  assert.equal(fs.existsSync(path.join(root, "out")), false)
+})
+
 test("a download that can't be written leaves nothing and doesn't crash", { skip: !unix }, async () => {
   release("1.5.9")
   const bin = path.join(root, "agy")
@@ -281,4 +289,24 @@ test("on Windows a replacement that fails puts the working agy back", { skip: !u
   assert.equal(fs.readFileSync(bin, "utf8"), "old working agy")
   assert.equal(installedVersion(bin), "1.5.9")
   assert.deepEqual(fs.readdirSync(root).sort(), ["agy.exe", "agy.exe.version"])
+})
+
+test("a failed Windows rollback retains the only working binary backup", { skip: !unix }, async () => {
+  const bin = path.join(root, "agy.exe")
+  fs.writeFileSync(bin, "old working agy")
+  release("1.6.0")
+  const realRename = fs.renameSync
+  fs.renameSync = (from, to) => {
+    if (to === bin) throw Object.assign(new Error("EBUSY: locked destination"), { code: "EBUSY" })
+    return realRename(from, to)
+  }
+  try {
+    await assert.rejects(installAgy({ bin, platform: "windows_amd64" }), { code: "EBUSY" })
+  } finally { fs.renameSync = realRename }
+  const backups = fs.readdirSync(root).filter(name => name.startsWith(".old-"))
+  assert.equal(backups.length, 1)
+  assert.equal(fs.readFileSync(path.join(root, backups[0]), "utf8"), "old working agy")
+  manifest.sha512 = sha(Buffer.from("invalid checksum"))
+  await assert.rejects(installAgy({ bin, platform: "windows_amd64" }), /checksum/)
+  assert.equal(fs.readFileSync(path.join(root, backups[0]), "utf8"), "old working agy")
 })

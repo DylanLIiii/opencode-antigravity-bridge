@@ -52,7 +52,7 @@
     "ui/"
   ],
   "scripts": {
-    "test": "node --test test-acp-compat.mjs test-compaction.mjs test-context-ui.mjs test-install.mjs test-native-accounts.mjs test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-model-discovery.mjs test-model-metadata.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-tool-budget.mjs test-signin.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs test-bridge-fixes.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
+    "test": "node --test test-acp-compat.mjs test-compaction.mjs test-context-ui.mjs test-install.mjs test-opencode2.mjs test-native-accounts.mjs test-turn-timeout.mjs test-agent-notice.mjs test-step-usage.mjs test-step-usage-extra.mjs test-usage.mjs test-compat.mjs test-model-discovery.mjs test-model-metadata.mjs test-platform.mjs test-prompt-guard.mjs test-tool-schema.mjs test-tool-budget.mjs test-signin.mjs test-schema-parity.mjs test-upstream-error.mjs test-auth-retry.mjs test-thought-filter.mjs test-mcp-server.mjs test-accounts-import.mjs test-accounts-login.mjs test-wsl.mjs test-context-unlock.mjs test-bridge-fixes.mjs && node test/array-items-unit.mjs && node test-smoke.mjs",
     "test:integration": "node test-integration.mjs"
   },
   "keywords": [

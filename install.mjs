@@ -137,6 +137,9 @@ export async function untarMember(archive, name, file) {
   const src = fs.createReadStream(archive)
   const srcClosed = new Promise((resolve) => src.once("close", resolve))
   const gz = src.pipe(createGunzip())
+  // pipe() does not forward a missing/unreadable source's error to gunzip.
+  // The async iterator must reject instead of emitting an unhandled error.
+  src.on("error", error => gz.destroy(error))
   const it = gz[Symbol.asyncIterator]()
   let buf = Buffer.alloc(0)
   const fill = async (n) => {
@@ -282,6 +285,7 @@ export async function installAgy({ signal, bin = ownPath(), platform = agyPlatfo
   const tag = randomBytes(6).toString("hex")
   const payload = path.join(dir, `.download-${tag}`)
   const staged = path.join(dir, `.agy-${tag}${windows ? ".exe" : ""}`)
+  let preservedBackup = null
   try {
     const sum = await download(m.url, payload, signal)
     if (sum !== m.sha512) throw new Error("the agy download doesn't match the checksum Antigravity's manifest gives; nothing was installed")
@@ -307,7 +311,7 @@ export async function installAgy({ signal, bin = ownPath(), platform = agyPlatfo
       fs.renameSync(staged, bin)
     } catch (error) {
       // put the working copy back rather than leave no agy at all
-      if (old) try { fs.renameSync(old, bin) } catch {}
+      if (old) try { fs.renameSync(old, bin) } catch { preservedBackup = old }
       throw error
     }
     try { fs.writeFileSync(versionFile(bin), m.version + "\n") } catch {}
@@ -316,14 +320,17 @@ export async function installAgy({ signal, bin = ownPath(), platform = agyPlatfo
     for (const f of [payload, staged]) {
       try { fs.rmSync(f, { force: true }) } catch {}
     }
-    sweepOld(dir)
+    // Retain rescue copies across later failed attempts too, until a working
+    // destination exists again.
+    if (fs.existsSync(bin)) sweepOld(dir, preservedBackup)
   }
 }
 
-function sweepOld(dir) {
+function sweepOld(dir, preservedBackup = null) {
   try {
     for (const name of fs.readdirSync(dir)) {
       if (/^\.old-[0-9a-f]+\.exe$/.test(name)) {
+        if (path.join(dir, name) === preservedBackup) continue
         try { fs.rmSync(path.join(dir, name), { force: true }) } catch {}
       }
     }

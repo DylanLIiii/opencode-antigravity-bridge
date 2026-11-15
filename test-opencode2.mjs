@@ -6,12 +6,13 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { after, test } from "node:test"
-import { pathToFileURL } from "node:url"
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-opencode2-"))
+const homedir = os.homedir
+os.homedir = () => root
 const saved = {}
 const isolate = {
-  HOME: root, USERPROFILE: root, PATH: path.join(root, "bin"), Path: path.join(root, "bin"),
+  PATH: path.join(root, "bin"), Path: path.join(root, "bin"),
   AGY_PATH: path.join(root, "no-agy"), XDG_DATA_HOME: path.join(root, "data"), LOCALAPPDATA: path.join(root, "local"),
   AGY_CLI_DISABLE_AUTO_UPDATE: "1", AGY_BRIDGE_STORED_SIGNIN: "skip", AGY_BRIDGE_ACCOUNTS_DIR: path.join(root, "accounts"),
 }
@@ -21,6 +22,7 @@ const realFetch = globalThis.fetch
 globalThis.fetch = async (input) => { throw new Error(`no network in tests: ${input?.url ?? input}`) }
 after(() => {
   globalThis.fetch = realFetch
+  os.homedir = homedir
   for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v)
   fs.rmSync(root, { recursive: true, force: true })
   // the bridge's own timers are unref'd but its pools may linger
@@ -174,6 +176,6 @@ test("a hook-only provider is not invented when the plugin has a config provider
 })
 
 test("the entry file is importable by its file URL as 2.x resolves it", async () => {
-  const mod = await import(pathToFileURL(path.join(path.dirname(new URL(import.meta.url).pathname), "opencode2.mjs")).href)
+  const mod = await import(new URL("./opencode2.mjs", import.meta.url).href)
   assert.equal(typeof mod.setup, "function")
 })

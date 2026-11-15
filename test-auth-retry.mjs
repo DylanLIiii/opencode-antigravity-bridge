@@ -357,9 +357,12 @@ for (const stream of [false, true]) for (const scenario of [
     const error = stream ? frames.find(frame => frame.type === 'error')?.error : json.error
     const output = stream ? frames.filter(frame => frame.delta?.type === 'text_delta').map(frame => frame.delta.text).join('')
       : (json.content || []).map(block => block.text || '').join('')
-    if (['CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'CHAIN_CREDITS', 'CHAIN_NETWORK'].includes(scenario)) {
+    if (['CREDITS', 'NETWORK', 'API_ONLY', 'RETRY_LOG', 'CHAIN_CREDITS', 'CHAIN_NETWORK', 'INVALID_ONLY'].includes(scenario)) {
       assert.ok(error, body)
-      if (scenario.endsWith('NETWORK')) {
+      if (scenario === 'INVALID_ONLY') {
+        assert.equal(res.status, stream ? 200 : 502)
+        assert.match(error.message, /without producing a model response/)
+      } else if (scenario.endsWith('NETWORK')) {
         assert.equal(res.status, stream ? 200 : 502)
         assert.match(error.message, /network issue/)
       } else {

@@ -1981,7 +1981,10 @@ class Proc {
           if (detail) throw this.#formatAgentError(detail, turn.promptGuardMatched)
           if (this.compaction) throw new AgentTurnError("agy bridge: upstream refused the compaction request; no summary was produced")
         }
-        if (!turn.notices.failureCandidate && result?.stopReason !== "refusal") {
+        // A dropped retry-only notice is not an answer. An uncorroborated
+        // legacy terminal quotation is different: flushText below releases it
+        // as ordinary model text, preserving the existing quote boundary.
+        if ((!turn.notices.failureCandidate || !turn.notices.terminal) && result?.stopReason !== "refusal") {
           const hasContent = this.compaction && !turn.hiddenCompactionOutput
             ? turn.deliveredTextChars > 0 : turn.hasDeliveredOutput()
           if (!hasContent) {

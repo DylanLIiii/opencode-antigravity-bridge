@@ -18,12 +18,94 @@ const entry = new URL("./index.mjs", import.meta.url)
 let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
 source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(fileURLToPath(new URL("./package.json", entry))))
-source += "\nexport { Turn, Proc, estimateInputTokens, responseUsage, streamResponse, maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts };\n"
+source += "\nexport { Turn, Proc, estimateInputTokens, responseUsage, streamResponse, maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts, promptAttempts, claimPromptAttempt, settlePromptAttempt, releasePromptAttempt, retire, acquireProcLocked, stableJSON, digest };\n"
 fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync };\n")
 const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const { Turn, Proc, estimateInputTokens, responseUsage, streamResponse, maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+const { promptAttempts, claimPromptAttempt, settlePromptAttempt, releasePromptAttempt, retire, acquireProcLocked, stableJSON, digest } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+
+function cancelledFixture(key) {
+  const messages = [{ role: "user", content: "original request " + "x".repeat(1_000_000) }]
+  const opts = { messages, history: [], tools: [], model: "test-model", selection: { model: "test-model", effort: "high" },
+    instructions: "test instructions", workDir: workspace, account: null, userId: "cancel-test" }
+  const proc = new Proc("fake-agy", key, opts)
+  proc.hasSentFirstTurn = true
+  proc.sessionId = key + "-session"
+  proc.currentModel = opts.model
+  proc.currentSelectionKey = stableJSON({ model: opts.model, selection: opts.selection })
+  proc.expectedMessages = [...messages, { role: "assistant", content: "partial" }]
+  proc.stepUsageTrusted = false
+  proc.canPark = () => false
+  const attempt = claimPromptAttempt(key)
+  attempt.submitted = true
+  settlePromptAttempt(attempt, null, { clientCancelled: true, proc })
+  proc.cancelledTurn = { attempt, requestMessagesHash: digest(stableJSON(messages)),
+    expectedMessagesHash: digest(stableJSON(proc.expectedMessages)) }
+  pool.set(key, proc)
+  return { proc, attempt, opts, async cleanup() {
+    pool.delete(key)
+    releasePromptAttempt(attempt)
+    if (proc.turn) proc.finalizeTurn(proc.turn)
+    await proc.stop()
+  } }
+}
+
+test("terminal cancellation records release their process when retired or moved on", async () => {
+  const previous = process.env.AGY_BRIDGE_STATE_FILE
+  process.env.AGY_BRIDGE_STATE_FILE = path.join(workspace, "cancel-state.json")
+  try {
+    for (const action of ["retire", "stop", "move-on"]) {
+      const f = cancelledFixture("cancel-retention-" + action)
+      try {
+        if (action === "retire") await retire(f.proc.convKey, f.proc)
+        else if (action === "stop") await f.proc.stop()
+        else {
+          // Exercise real startTurn and finalization without an ACP child.
+          f.proc.conn = { notify() {}, close() {}, request: async () => ({ stopReason: "end_turn" }) }
+          const turn = f.proc.startTurn([{ type: "text", text: "next task" }],
+            [...f.proc.expectedMessages, { role: "user", content: "next task" }], null, null)
+          await turn.settled
+          f.proc.finalizeTurn(turn)
+        }
+        assert.equal(promptAttempts.get(f.attempt.key), f.attempt, "terminal dedup protection remains")
+        assert.equal(f.attempt.terminal, true)
+        assert.equal(f.attempt.proc, null, "attempt cache no longer owns the process/history graph")
+        assert.equal(f.attempt.clientCancelled, false)
+        assert.equal(f.proc.cancelledTurn, null)
+        assert.throws(() => claimPromptAttempt(f.attempt.key), error => error.code === "prompt_outcome_unknown")
+      } finally { await f.cleanup() }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.AGY_BRIDGE_STATE_FILE
+    else process.env.AGY_BRIDGE_STATE_FILE = previous
+  }
+})
+
+test("a claimed cancellation continuation prevents competing acquisition from mutating its process", async () => {
+  const f = cancelledFixture("cancel-acquire-race")
+  let updates = 0
+  f.proc.updateTools = async tools => { updates++; f.proc.toolsSignature = JSON.stringify(tools) }
+  try {
+    const retryOpts = { ...f.opts }
+    assert.equal(claimPromptAttempt(f.attempt.key, "fake-agy", retryOpts), f.attempt)
+    assert.equal(f.proc.continuingCancel, true)
+    for (const changed of [{ tools: [{ name: "changed" }] }, { instructions: "changed" }]) {
+      await assert.rejects(() => acquireProcLocked("fake-agy", f.proc.convKey,
+        { ...f.opts, ...changed, ownerKey: f.proc.convKey, history: f.proc.expectedMessages }, false),
+      /continuing a cancelled response/)
+      assert.equal(updates, 0)
+      assert.equal(f.proc.toolsSignature, "[]")
+      assert.equal(f.proc.retiring, false)
+      assert.equal(f.proc.dead, false)
+      assert.equal(f.proc.cancelledTurn.attempt, f.attempt)
+    }
+    const acquired = await acquireProcLocked("fake-agy", f.proc.convKey, retryOpts, false)
+    assert.equal(acquired.proc, f.proc)
+    assert.equal(updates, 1)
+  } finally { await f.cleanup() }
+})
 
 function responseFixture(body) {
   const proc = new Proc("unused-test-agy", "response-retention-test", { tools: body.tools || [], messages: body.messages })
@@ -360,7 +442,7 @@ test("pool pressure protects attached responses, accepted results, cancellation,
 
 test("pool pressure evicts the least recently used idle process before detached turns", async () => {
   const stopped = []
-  const idle = (key, lastUsed) => ({ lastUsed, canPark: () => false,
+  const idle = (key, lastUsed) => ({ lastUsed, canPark: () => false, invalidateCancelledTurn: Proc.prototype.invalidateCancelledTurn,
     stop: async () => { stopped.push(key) } })
   try {
     pool.set("detached", { turn: { clientProgressAt: 0, hasPendingMcp: () => true } })

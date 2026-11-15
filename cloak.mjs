@@ -24,6 +24,7 @@ export const TURNED_AWAY = [
   "you are claude code, anthropic's official cli for claude",
   CLAUDE_CODE_SECURITY.toLowerCase(),
   CLAUDE_CODE_PASTED.toLowerCase(),
+  "you are a coding assistant running inside pi-bolt",
 ]
 
 const INVISIBLE_RE = /[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]/g
@@ -73,6 +74,7 @@ const SAID_AS = [
   (line) => line.replace(/^(you)\s+are/i, "$1're"),
   () => CLAUDE_CODE_SECURITY_SAID,
   () => CLAUDE_CODE_PASTED_SAID,
+  (line) => line.replace(/pi-bolt$/i, "a tool"),
 ]
 
 function isBillingFields(text) {

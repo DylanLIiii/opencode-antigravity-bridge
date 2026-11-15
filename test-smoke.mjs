@@ -309,6 +309,13 @@ async function prompt(params, recorded = false) {
   const text = params.prompt.map(block => block.text || "").join("")
   const images = params.prompt.filter(block => block.type === "image").length
   if (!recorded) recordPrompt(params)
+  if (text.includes("SLOW_NUDGE_FAIL")) session.nudgeFails = true
+  if (text.includes("SLOW_NUDGE_WAIT")) session.slowNudge = true
+  if (session.nudgeFails && text.includes("previous reply was interrupted")) {
+    fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: FAILED_PRECONDITION (code 400): fake nudge upstream failure.\n")
+    chunk("\n⚠ Agent execution terminated due to error.\n")
+    return { stopReason: "end_turn" }
+  }
   if (text.includes("[Bridge compaction fragment ")) {
     chunk("ACK-INTERNAL")
     return finish("ACK-INTERNAL")
@@ -359,9 +366,26 @@ async function prompt(params, recorded = false) {
     chunk("before death")
     process.exit(2)
   }
-  if (text.includes("SLOW")) {
+  if (text.includes("SLOW_PENDING_TOOL")) {
+    await invoke("echo", { text: "pending" }).catch(() => {})
+    for (;;) await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  if (text.includes("TOOL_THEN_SLOW")) {
+    await invoke("echo", { text: "probe" })
     chunk("partial slow answer")
     await new Promise(resolve => { cancelWaiter = resolve })
+    cancelWaiter = null
+    log({ type: "cancelled", convId: session.id })
+    return { stopReason: "cancelled" }
+  }
+  if (text.includes("SLOW") || (session.slowNudge && text.includes("previous reply was interrupted"))) {
+    if (text.includes("previous reply was interrupted")) session.slowNudge = false
+    if (text.includes("SLOW_NO_TEXT")) thought("thinking before text")
+    else chunk("partial slow answer")
+    log({ type: "slowWaiting", convId: session.id })
+    await new Promise(resolve => { cancelWaiter = resolve })
+    cancelWaiter = null
+    if (text.includes("CANCEL_SETTLE_DELAY")) await new Promise(resolve => setTimeout(resolve, 80))
     log({ type: "cancelled", convId: session.id })
     if (text.includes("LATE_STORE_CANCEL")) setTimeout(() => { recordModelCall({ input: 99000, output: 900 }); log({ type: "lateStoreWrite", convId: session.id, sqlite: !!sqliteOpen }) }, 350)
     return text.includes("RATIO_CANCEL") ? { stopReason: "cancelled", usage: { inputTokens: 10000, cachedReadTokens: 5000, outputTokens: 10, totalTokens: 15010 } } : { stopReason: "cancelled" }
@@ -1180,15 +1204,19 @@ async function launchedModel(body) {
   const rfc = "RFC 2119 keywords: MUST, REQUIRED,\nSHOULD, RECOMMENDED, MAY, OPTIONAL."
   const codex = "You are Codex, an agent based on GPT-5"
   const hermes = "Hermes Agent, an intelligent AI assistant created by Nous Research"
-  const rawUser = `User text remains literal: ${sdk}\n${paths}`
-  const queued = `Queued user input: ${codex}\n${paths}`
+  const pi = "You are a coding assistant running inside Pi-Bolt"
+  const piNeutral = "You are a coding assistant running inside a tool"
+  const piDocs = "<docs>Read ~/.pi/agent/Pi-Bolt/README.md and run Pi-Bolt tools.</docs>"
+  const stock = `${pi}, a build of pi (a coding agent harness) compiled ahead of time. Help users inspect files, run commands, and modify code.\n${piDocs}`
+  const rawUser = `User text remains literal: ${sdk}\n${paths}\n${pi}`
+  const queued = `Queued user input: ${codex}\n${paths}\n${pi}`
   const body = {
-    model, system: `before\n${billing}\n${sdk}\n${paths}\nafter`,
+    model, system: `before\n${billing}\n${sdk}\n${paths}\n${stock}\nafter`,
     messages: [
       { role: "user", content: rawUser },
       { role: "system", content: `${rfc}\n${paths}` },
       { role: "developer", content: [
-        { type: "text", text: `${hermes}\n${paths}` },
+        { type: "text", text: `${hermes}\n${paths}\n${pi}.` },
         { type: "text", text: `The user sent a new message while you were working:\n${queued}` },
       ] },
     ],
@@ -1201,15 +1229,16 @@ async function launchedModel(body) {
     response.status === 200 && stopOf(events) === "end_turn" &&
     !init.systemAppend.includes(billing) && init.systemAppend.includes("Custom agent built on the Claude Agent SDK by Anthropic.") &&
     init.systemAppend.includes("When the user writes @ followed by a path") && !init.systemAppend.includes(paths) &&
+    init.systemAppend.includes(stock.replace(pi, piNeutral)) && init.systemAppend.includes(piDocs) &&
     init.systemAppend.includes("before\n") && init.systemAppend.endsWith("after"), init.systemAppend)
   check("trailing system and developer reminders are rewritten while user and queued input stay literal",
     prompt.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") &&
-    prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") &&
+    prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") && prompt.includes(`${piNeutral}.`) &&
     prompt.includes(rawUser) && prompt.includes(queued) &&
     (prompt.match(/When the user writes @ followed by a path/g) || []).length === 2, prompt)
 
   process.env.FAKE_AGY_APPEND = "0"
-  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}`, messages: [{ role: "user", content: `FALLBACK user: ${codex}` }] }
+  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}\n${pi}.`, messages: [{ role: "user", content: `FALLBACK user: ${codex}` }] }
   const fallbackResponse = await callFetch(fallbackBody)
   const fallbackEvents = (await readSSE(fallbackResponse)).events
   delete process.env.FAKE_AGY_APPEND
@@ -1218,15 +1247,15 @@ async function launchedModel(body) {
     fallbackResponse.status === 200 && stopOf(fallbackEvents) === "end_turn" && inits().at(-1).systemAppend === null &&
     fallback.includes("<external_system_instructions>") && !fallback.includes(billing) && !fallback.includes(paths) &&
     fallback.includes("When the user writes @ followed by a path") && fallback.includes("You are Codex, an agent built on GPT-5") &&
-    fallback.includes(`FALLBACK user: ${codex}`), fallback)
+    fallback.includes(`${piNeutral}.`) && fallback.includes(`FALLBACK user: ${codex}`), fallback)
 
-  const original = { model, system: codex, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
+  const original = { model, system: pi, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
   const firstEvents = (await readSSE(await callFetch(original))).events
   const firstInit = inits().at(-1)
   const second = nextTurn(original, firstEvents, "MEMORY identity unchanged")
   const secondEvents = (await readSSE(await callFetch(second))).events
   check("unchanged client instructions reuse the same session", lastOf("user").convId === firstInit.convId && stopOf(secondEvents) === "end_turn")
-  const third = { ...nextTurn(second, secondEvents, "MEMORY identity changed"), system: codex.replace("based on", "built on") }
+  const third = { ...nextTurn(second, secondEvents, "MEMORY identity changed"), system: piNeutral }
   const thirdEvents = (await readSSE(await callFetch(third))).events
   const thirdInit = inits().at(-1)
   check("distinct client instructions do not share identity even when outgoing text is the same",
@@ -1237,9 +1266,9 @@ async function launchedModel(body) {
     const first = { model, messages: [{ role: "user", content: `TOOL rewrite notices ${location}` }], tools: [echoTool] }
     const firstEvents = (await readSSE(await callFetch(first))).events
     const convId = inits().at(-1).convId
-    const toolText = `Literal tool payload: ${codex}\n${paths}\n${billing}`
+    const toolText = `Literal tool payload: ${codex}\n${paths}\n${billing}\n${pi}`
     const second = continuation(first, firstEvents, toolText)
-    const notice = { type: "text", text: `<system-reminder>${rfc}\n${paths}</system-reminder>` }
+    const notice = { type: "text", text: `<system-reminder>${rfc}\n${paths}\n${pi}</system-reminder>` }
     const update = { type: "text", text: `<system-update>${billing}</system-update>` }
     if (location === "inline") second.messages.at(-1).content.push(notice, update)
     else second.messages.push({ role: location, content: [notice, update] })
@@ -1249,7 +1278,7 @@ async function launchedModel(body) {
     const text = delivered?.result?.content?.map(part => part.text).join("\n") || ""
     check(`${location} tool-side reminders are rewritten without changing tool payload`,
       response.status === 200 && stopOf(final) === "end_turn" && text.startsWith(toolText) &&
-      text.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") && text.includes("When the user writes @ followed by a path") &&
+      text.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") && text.includes("When the user writes @ followed by a path") && text.includes(piNeutral) &&
       !text.slice(toolText.length).includes(paths) && !text.slice(toolText.length).includes(billing), text)
   }
 }
@@ -2379,16 +2408,238 @@ for (const location of ["inline", "system", "developer", "user"]) {
   await new Promise(resolve => setTimeout(resolve, 200))
   check("cancellation sends session/cancel instead of killing agy", lastOf("cancel")?.convId === init.convId && lastOf("cancelled")?.convId === init.convId && fs.existsSync(init.cwd))
   const cancelledRetry = await callFetch(body)
-  const cancelledError = await cancelledRetry.json()
+  const cancelledEvents = cancelledRetry.status === 200 ? (await readSSE(cancelledRetry)).events : []
+  if (cancelledRetry.status !== 200) await cancelledRetry.text()
+  const nudge = lastOf("user")
+  const originalPrompts = () => logs().filter(event => event.type === "user" && event.text === "SLOW cancellation").length
   check("retrying a cancelled submitted prompt does not send it again",
-    cancelledRetry.status === 409 && cancelledError.error?.code === "prompt_outcome_unknown" &&
-    logs().filter(event => event.type === "user" && event.text === "SLOW cancellation").length === 1)
-  const next = {
-    ...body,
-    messages: [...body.messages, { role: "assistant", content: [{ type: "text", text: "partial slow answer" }] }, { role: "user", content: "after cancel" }],
-  }
+    cancelledRetry.status === 200 && originalPrompts() === 1 && nudge?.convId === init.convId &&
+    /previous reply was interrupted/i.test(nudge?.text || "") && fs.existsSync(init.cwd),
+    JSON.stringify({ status: cancelledRetry.status, prompts: originalPrompts(), nudge: nudge?.text }))
+  check("a cancelled prompt retry answers in its original session without a new process",
+    stopOf(cancelledEvents) === "end_turn" && !cancelledEvents.some(event => event.event === "error") &&
+    textOf(cancelledEvents).includes("You said:") && inits().length === before + 1)
+  const next = nextTurn(body, cancelledEvents, "after cancel")
   const { events } = await readSSE(await callFetch(next))
   check("conversation continues in the cancelled session", stopOf(events) === "end_turn" && lastOf("user").convId === init.convId && lastOf("user").text === "after cancel" && inits().length === before + 1)
+}
+
+// Once the cancelled conversation has moved on, the stale original request is
+// no longer continuable and must not be replayed into the live session.
+{
+  const body = { model, messages: [{ role: "user", content: "SLOW stale after moving on" }] }
+  const response = await callFetch(body)
+  const init = inits().at(-1)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  const prompts = () => logs().filter(event => event.type === "user" && event.text === "SLOW stale after moving on").length
+  const movedOn = { ...body, messages: [...body.messages, { role: "assistant", content: [{ type: "text", text: "partial slow answer" }] }, { role: "user", content: "a different follow-up" }] }
+  const shared = (await readSSE(await callFetch(movedOn))).events
+  check("a cancelled turn still yields to an ordinary follow-up", stopOf(shared) === "end_turn" &&
+    lastOf("user")?.convId === init.convId && prompts() === 1)
+  const stale = await callFetch(body)
+  const staleError = await stale.json()
+  check("a stale retry after the conversation moved on stays blocked",
+    stale.status === 409 && staleError.error?.code === "prompt_outcome_unknown" &&
+    stale.headers.get("x-should-retry") === "false" && prompts() === 1 && fs.existsSync(init.cwd),
+    JSON.stringify({ status: stale.status, prompts: prompts() }))
+}
+
+// A client that cancels before any text still settles the same logical prompt:
+// the retry continues in the live session, a concurrent duplicate cannot attach
+// twice, repeated cancels still continue, and an upstream failure blocks it.
+{
+  const before = inits().length
+  const body = { model, messages: [{ role: "user", content: "SLOW_NO_TEXT CANCEL_SETTLE_DELAY settle race" }] }
+  const response = await callFetch(body)
+  const init = inits().at(-1)
+  const reader = response.body.getReader()
+  for (let attempt = 0; attempt < 200 && !logs().some(event => event.type === "slowWaiting" && event.convId === init.convId); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  await reader.cancel()
+  // Retry immediately: session/cancel has not settled in agy yet.
+  const [first, second] = await Promise.all([callFetch(body), callFetch(body)])
+  const winner = [first, second].find(item => item.status === 200)
+  const loser = [first, second].find(item => item !== winner)
+  await loser.text()
+  const wonEvents = (await readSSE(winner)).events
+  const prompts = () => logs().filter(event => event.type === "user" && event.text === "SLOW_NO_TEXT CANCEL_SETTLE_DELAY settle race").length
+  check("cancelling before text settles and the identical retry is accepted in place",
+    winner.status === 200 && loser.status === 503 && prompts() === 1 &&
+    stopOf(wonEvents) === "end_turn", JSON.stringify({ winner: winner.status, loser: loser.status, prompts: prompts() }))
+  check("the pre-text retry sends one nudge in the same session",
+    lastOf("user")?.convId === init.convId && /previous reply was interrupted/i.test(lastOf("user")?.text || "") &&
+    inits().length === before + 1)
+  const afterFirst = (await readSSE(await callFetch(nextTurn(body, wonEvents, "after a pre-text cancel")))).events
+  check("a turn after the pre-text continuation reuses the session", stopOf(afterFirst) === "end_turn" &&
+    lastOf("user")?.convId === init.convId && lastOf("user")?.text === "after a pre-text cancel" && inits().length === before + 1)
+}
+
+// A cancelled retry, cancelled again, still continues in the same session.
+{
+  const before = inits().length
+  const body = { model, messages: [{ role: "user", content: "SLOW_NUDGE_WAIT repeated cancellation" }] }
+  const firstResponse = await callFetch(body)
+  const init = inits().at(-1)
+  const firstReader = firstResponse.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await firstReader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await firstReader.cancel()
+  const retry = await callFetch(body)
+  for (let attempt = 0; attempt < 200 && !logs().some(event => event.type === "slowWaiting" &&
+    event.convId === init.convId && logs().filter(item => item.type === "slowWaiting" && item.convId === init.convId).length > 1); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  await retry.body.cancel()
+  await new Promise(resolve => setTimeout(resolve, 250))
+  const prompts = () => logs().filter(event => event.type === "user" && event.text === "SLOW_NUDGE_WAIT repeated cancellation").length
+  const second = (await readSSE(await callFetch(body))).events
+  check("repeated cancellation of the cancelled prompt still continues in the same session",
+    stopOf(second) === "end_turn" && prompts() === 1 && lastOf("user")?.convId === init.convId &&
+    /previous reply was interrupted/i.test(lastOf("user")?.text || "") &&
+    textOf(second).includes("You said:") && inits().length === before + 1,
+    JSON.stringify({ prompts: prompts(), last: lastOf("user")?.text, inits: inits().length, before }))
+}
+
+// An upstream failure while answering the cancelled prompt blocks its retry.
+{
+  const body = { model, messages: [{ role: "user", content: "SLOW_NUDGE_FAIL nudge must not be replayed" }] }
+  const response = await callFetch(body)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  const promptText = "SLOW_NUDGE_FAIL nudge must not be replayed"
+  const prompts = () => logs().filter(event => event.type === "user" && event.text === promptText).length
+  const failedResponse = await callFetch(body)
+  const failedBody = await failedResponse.text()
+  const failedStream = failedResponse.headers.get("content-type")?.includes("text/event-stream") === true
+  check("a failed cancelled-prompt continuation reports its upstream error",
+    failedStream ? failedBody.includes("event: error") : /"type":"error"/.test(failedBody), failedBody.slice(0, 200))
+  const blocked = await callFetch(body)
+  const blockedError = await blocked.json()
+  check("a failed cancelled-prompt continuation cannot be retried again",
+    blocked.status === 409 && blockedError.error?.code === "prompt_outcome_unknown" &&
+    blocked.headers.get("x-should-retry") === "false" && prompts() === 1,
+    JSON.stringify({ status: blocked.status, prompts: prompts() }))
+}
+
+// Only the exact cancelled request continues: a changed model, tool catalog,
+// effort or working directory stays blocked and leaves the session usable.
+for (const label of ["model", "tools", "workdir"]) {
+  const before = inits().length
+  const body = { model, metadata: { user_id: `cancel-changed-${label}` }, tools: [echoTool],
+    messages: [{ role: "user", content: `SLOW changed request ${label}` }] }
+  const response = await callFetch(body)
+  const init = inits().at(-1)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  const changed = { ...body }
+  let headers = {}
+  if (label === "model") changed.model = legacyModel
+  if (label === "tools") changed.tools = [echoTool, { name: "other_tool", description: "Extra", input_schema: { type: "object", properties: {} } }]
+  if (label === "workdir") headers = { "x-magpie-work-dir": encodeURIComponent(os.tmpdir()) }
+  const prompts = () => logs().filter(event => event.type === "user" && event.text === `SLOW changed request ${label}`).length
+  const rejected = await callFetch(changed, headers)
+  const error = await rejected.json()
+  check(`a cancelled request retried with a changed ${label} stays blocked`,
+    rejected.status === 409 && error?.error?.code === "prompt_outcome_unknown" &&
+    prompts() === 1 && fs.existsSync(init.cwd),
+    JSON.stringify({ status: rejected.status, error: error?.error, prompts: prompts() }))
+  const resumed = (await readSSE(await callFetch(body))).events
+  check(`a matching retry still continues after a changed ${label} was refused`,
+    stopOf(resumed) === "end_turn" && prompts() === 1 && lastOf("user")?.convId === init.convId)
+  const follow = (await readSSE(await callFetch(nextTurn(body, resumed, `after changed ${label} refusal`)))).events
+  check(`the session still continues after a changed ${label} refusal`, stopOf(follow) === "end_turn" &&
+    lastOf("user")?.convId === init.convId && inits().length === before + 1)
+}
+
+// A cancelled prompt whose live process died is not replayed in a new session.
+{
+  const body = { model, messages: [{ role: "user", content: "SLOW dead session cancel" }] }
+  const response = await callFetch(body)
+  const init = inits().at(-1)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  try { process.kill(-init.pid, "SIGKILL") } catch {}
+  await new Promise(resolve => setTimeout(resolve, 200))
+  const retry = await callFetch(body)
+  const error = await retry.json()
+  const prompts = logs().filter(event => event.type === "user" && event.text === "SLOW dead session cancel").length
+  check("a cancelled prompt behind a dead process stays blocked instead of replaying",
+    retry.status === 409 && error?.error?.code === "prompt_outcome_unknown" && prompts === 1)
+}
+
+// A client tool call that is still pending is never continued by the nudge: the
+// identical request stays refused and its prompt is not sent again.
+{
+  const text = "SLOW_PENDING_TOOL waiting on a client result"
+  const body = { model, tools: [echoTool], metadata: { user_id: "cancel-pending-tool" },
+    messages: [{ role: "user", content: text }] }
+  const pending = (await readSSE(await callFetch(body))).events
+  await new Promise(resolve => setTimeout(resolve, 100))
+  const retry = await callFetch(body)
+  await retry.text()
+  check("an identical retry while a client tool call is pending is never continued",
+    stopOf(pending) === "tool_use" && retry.status !== 200 &&
+    logs().filter(event => event.type === "user" && event.text === text).length === 1, `status=${retry.status}`)
+}
+
+// Tool work inside the cancelled turn also disqualifies the nudge: the original
+// request keeps the submitted-prompt rejection instead of being re-answered.
+{
+  const text = "TOOL_THEN_SLOW cancel after tool work"
+  const body = { model, tools: [echoTool], metadata: { user_id: "cancel-after-tool-work" },
+    messages: [{ role: "user", content: text }] }
+  const pending = (await readSSE(await callFetch(body))).events
+  const worked = continuation(body, pending, "tool already ran")
+  const response = await callFetch(worked)
+  const reader = response.body.getReader()
+  let seen = ""
+  while (!seen.includes("partial slow answer")) {
+    const { value, done } = await reader.read()
+    if (done) break
+    seen += new TextDecoder().decode(value)
+  }
+  await reader.cancel()
+  await new Promise(resolve => setTimeout(resolve, 250))
+  const retry = await callFetch(body)
+  const error = await retry.json()
+  check("a cancelled turn that already ran a tool keeps the original request blocked",
+    retry.status === 409 && error?.error?.code === "prompt_outcome_unknown" &&
+    logs().filter(event => event.type === "user" && event.text === text).length === 1,
+    JSON.stringify({ status: retry.status, error: error?.error?.code }))
 }
 
 {

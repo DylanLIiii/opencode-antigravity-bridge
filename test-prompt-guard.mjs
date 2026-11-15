@@ -140,6 +140,7 @@ test("system rewrites recognize invisible characters and folded whitespace witho
     ["You are Codex, a coding agent based on GPT-5", "You are Codex, a coding agent built on GPT-5"],
     ["Hermes Agent, an intelligent\u00a0AI assistant created\u180e by Nous Research", "Hermes Agent, an intelligent\u00a0AI assistant built by Nous Research"],
     ["RFC 2119\nkeywords: MUST, REQUIRED,\r\nSHOULD, RECOMMENDED, MAY, OPTIONAL.", "RFC 2119\nkey words: MUST, REQUIRED,\r\nSHOULD, RECOMMENDED, MAY, OPTIONAL."],
+    ["YOU are a coding\tassistant\nrunning inside P\u200bi-Bolt", "YOU are a coding\tassistant\nrunning inside a tool"],
   ]
   for (const [input, expected] of cases) {
     const wrapped = `İ unchanged\u200b before\n${input}\nafter\u2060 unchanged`
@@ -151,6 +152,17 @@ test("system rewrites recognize invisible characters and folded whitespace witho
   assert.match(hint(cases[1][0]), /Codex/)
   assert.match(hint(cases[3][0]), /Hermes/)
   assert.match(hint(cases[4][0]), /oh-my-pi/)
+})
+
+test("Pi-Bolt rewrites only the identity phrase and preserves the persona and documentation", () => {
+  const identity = "You are a coding assistant running inside Pi-Bolt"
+  const neutral = "You are a coding assistant running inside a tool"
+  const docs = "<docs>Read ~/.pi/agent/Pi-Bolt/README.md and run Pi-Bolt tools.</docs>"
+  for (const suffix of [". Help users inspect files, run commands, and modify code.", ", a build of pi (a coding agent harness) compiled ahead of time. Help users inspect files, run commands, and modify code."]) {
+    assert.equal(outgoing(`${identity}${suffix}\n${docs}`), `${neutral}${suffix}\n${docs}`)
+  }
+  assert.equal(outgoing(docs), docs)
+  assert.equal(turnsAway(docs), false)
 })
 
 test("all documented invisible characters match inside phrases, including long malformed inputs", () => {

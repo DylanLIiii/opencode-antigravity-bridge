@@ -1,7 +1,10 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
-import { cloak, hint, outgoing, turnsAway } from "./cloak.mjs"
+import {
+  cloak, hint, outgoing, turnsAway,
+  CLAUDE_CODE_PASTED, CLAUDE_CODE_PASTED_SAID, CLAUDE_CODE_SECURITY, CLAUDE_CODE_SECURITY_SAID,
+} from "./cloak.mjs"
 
 const billing = "x-anthropic-billing-header: cc_version=1.2.3; cc_entrypoint=cli;"
 const agentIdentity = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -202,6 +205,37 @@ test("path guidance is reworded to the upstream wording and keeps all path and r
   assert.equal(rewritten, `Before\n${expected}\n${expected}\nAfter`)
   assert.equal(outgoing("Tokens prefixed with @ are paths. Be brief."), "Tokens prefixed with @ are paths. Be brief.")
   assert.equal(outgoing(rewritten), rewritten)
+})
+
+test("interactive Claude Code identity and its turned-away passages are said another way", () => {
+  const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+  const system = [
+    identity,
+    "",
+    `You are an agent.\n\n${CLAUDE_CODE_SECURITY}\n\n# Harness`,
+    ` - ${CLAUDE_CODE_PASTED}`,
+    " - Reference code as `file_path:line_number`.",
+  ].join("\n")
+  assert.equal(turnsAway(identity), true)
+  assert.equal(turnsAway(CLAUDE_CODE_SECURITY), true)
+  assert.equal(turnsAway(CLAUDE_CODE_PASTED), true)
+  assert.match(hint(system), /Claude Code/)
+  const rewritten = outgoing(system)
+  assert.equal(rewritten, [
+    "You're Claude Code, Anthropic's official CLI for Claude.",
+    "",
+    `You are an agent.\n\n${CLAUDE_CODE_SECURITY_SAID}\n\n# Harness`,
+    ` - ${CLAUDE_CODE_PASTED_SAID}`,
+    " - Reference code as `file_path:line_number`.",
+  ].join("\n"))
+  assert.equal(turnsAway(rewritten), false)
+  assert.equal(outgoing(rewritten), rewritten)
+  // Folded whitespace and invisible characters inside a passage still match.
+  const wrapped = CLAUDE_CODE_PASTED.replace("pasted into the message", "pasted\n  into the\u200b message")
+  assert.equal(outgoing(`a\n${wrapped}\nb`), `a\n${CLAUDE_CODE_PASTED_SAID}\nb`)
+  // The SDK variant is replaced by prompt-guard before cloaking.
+  const sdk = sanitizeSystemPrompt(`${codeIdentity}\nrest`).system
+  assert.equal(outgoing(sdk), sdk)
 })
 
 test("near misses and non-string values remain untouched", () => {

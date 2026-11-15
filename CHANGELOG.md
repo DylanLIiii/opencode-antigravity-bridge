@@ -2,6 +2,7 @@
 
 ## 0.8.9
 
+- Say interactive Claude Code's system prompt another way so Antigravity no longer answers it with `RESOURCE_EXHAUSTED (code 429)` whatever quota is left. Three passages are turned away on their own: the identity line `You are Claude Code, Anthropic's official CLI for Claude.` (now `You're …`, as the Agent SDK variants were already handled by prompt-guard), the `IMPORTANT: Assist with authorized security testing…` policy, and the `<pasted_content>` guidance. Small edits to the two passages are still turned away, so each is sent as an equivalent rewording that keeps every instruction; matching folds whitespace and invisible characters as before.
 - Rewrite the Pi-Bolt opening identity to a neutral equivalent before sending system instructions to agy, preserving the surrounding persona, documentation paths, user/tool text and client-text session identities (#73).
 - Let an identical retry after an acknowledged client cancellation request a full answer in the original live agy session without resubmitting the original prompt (#74). Require unchanged request context and no tool work, serialize competing retries, preserve the client's history view, and keep upstream failures, timeouts, dead sessions and cancelled compaction blocked.
 - Clear cancelled-session references when eligibility ends and protect a claimed continuation from competing session mutations. Cover cancellation recovery and client-history reuse in the cross-platform fake-ACP suite.

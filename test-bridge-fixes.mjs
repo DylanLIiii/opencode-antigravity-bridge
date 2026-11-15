@@ -469,7 +469,7 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   }
 })
 
-for (const mode of ["rejected", "first-reject"]) test(`steering with an agy waiting prompt (${mode}) falls back cleanly without 409 lockup`, async () => {
+for (const mode of ["rejected", "first-reject", "retry"]) test(`steering with an agy waiting prompt (${mode}) falls back cleanly without 409 lockup`, async () => {
   const workRoot = path.join(root, `steer-wait-work-${mode}`)
   const accountsDir = path.join(root, `steer-wait-accounts-${mode}`)
   const stateFile = path.join(root, `steer-wait-state-${mode}.json`)
@@ -508,6 +508,7 @@ function connectControl(payload) {
 }
 let active = null;
 let unseenDone = null;
+let rejections = 0;
 readline.createInterface({ input: process.stdin }).on("line", async line => {
   const msg = JSON.parse(line);
   if (msg.method === "initialize") {
@@ -532,7 +533,17 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
       send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Can't add this prompt to session s-wait: the running prompt is waiting for a permission or question answer; answer it or send session/cancel, then send this prompt again" } });
       return;
     }
+    if (active && process.env.FAKE_WAIT_MODE === "retry" && fs.existsSync(logFile + ".steer-rejected")) {
+      record({ type: "nativeSteer" });
+      const id = active.id;
+      active = null;
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "RECOVERED_AFTER_WAIT" } } } });
+      send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+      return;
+    }
     if (active) {
+      fs.writeFileSync(logFile + ".steer-rejected", "1");
       send({
         jsonrpc: "2.0",
         id: msg.id,
@@ -541,7 +552,8 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
           message: "Can't add this prompt to session s-wait: the running prompt is waiting for a permission or question answer; answer it or send session/cancel, then send this prompt again",
         },
       });
-      if (!unseenDone) {
+      rejections++;
+      if (!unseenDone && process.env.FAKE_WAIT_MODE !== "retry" && rejections === 4) {
         unseenDone = new Promise(r => setTimeout(r, 15)).then(() =>
           connectControl({ kind: "call", name: "bash", arguments: { cmd: "pwd" } }).then(r => {
             record({ type: "unseen_bash_reply", r });
@@ -629,8 +641,14 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
 
     const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
     assert.equal(events.filter(e => e.type === "session/new").length, 1)
+    if (mode === "retry") {
+      assert.equal(events.filter(e => e.type === "session/cancel").length, 0)
+      assert.equal(events.filter(e => e.type === "nativeSteer").length, 1)
+      assert.equal(events.filter(e => e.type === "session/prompt").length, 3)
+      return
+    }
     assert.equal(events.filter(e => e.type === "session/cancel").length, 1)
-    assert.equal(events.filter(e => e.type === "session/prompt").length, 3)
+    assert.equal(events.filter(e => e.type === "session/prompt").length, 6)
     assert.ok(events.some(e => e.type === "unseen_bash_reply" && (e.r?.result?.isError === true || !!e.r?.error)), JSON.stringify(events))
   } finally {
     for (const [k, v] of Object.entries(prev)) {

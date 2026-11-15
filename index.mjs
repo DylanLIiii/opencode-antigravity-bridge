@@ -91,6 +91,7 @@ function ideCallDeadline() {
   return positiveTimeout(process.env.AGY_BRIDGE_IDE_CALL_DEADLINE_MS, 150_000)
 }
 const CANCEL_SETTLE_MS = 15_000
+const STEER_WAIT_RETRY_MS = [50, 150, 400]
 const RECLAIM_STOP_TIMEOUT_MS = 10_000
 const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the client conversation continued without it; stop this turn"
 const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
@@ -2421,7 +2422,7 @@ class Proc {
         // summarizer probe no longer continues from what was held.
         turn.summaryThoughts?.flush()
         const number = turn.beginPrompt(parts, late)
-        pending.promise = this.conn.request("session/prompt", {
+        const sendSteer = (retry) => this.conn.request("session/prompt", {
           sessionId: this.sessionId,
           prompt: parts.length ? parts : [{ type: "text", text: "" }],
         }, 0, "", () => {
@@ -2440,9 +2441,20 @@ class Proc {
             }
             throw error
           }
+          const waitingForAnswer = /(?:waiting\s+for\s+a\s+permission|question\s+answer|send\s+session\/cancel)/i.test(rejectMsg)
+          // Releasing tool results lets agy start a queued parallel call, whose
+          // permission request can reach agy's state before this prompt does.
+          // The bridge answers permissions at once, so the same steer succeeds
+          // when resent; cancelling would discard the model's queued calls.
+          if (waitingForAnswer && retry < STEER_WAIT_RETRY_MS.length) {
+            return new Promise(resolve => setTimeout(resolve, STEER_WAIT_RETRY_MS[retry])).then(() => {
+              if (turn.cancelRequested || turn.done || this.dead) throw error
+              logBridgeEvent(this, turn, "continued", "user_steering", {}, { steering_method: "native_prompt_retry", steering_retry: retry + 1 })
+              return sendSteer(retry + 1)
+            })
+          }
           const fallbackParts = userTurnParts(content)
           validateAcpPromptBudget(fallbackParts, this.instructions, body)
-          const waitingForAnswer = /(?:waiting\s+for\s+a\s+permission|question\s+answer|send\s+session\/cancel)/i.test(rejectMsg)
           if (!waitingForAnswer) this.nativeSteeringRejected = true
           if (turn.stepsFile) this.stepUsageTrusted = false
           turn.stepCursor = null
@@ -2465,7 +2477,8 @@ class Proc {
             steering_method: "cancel_then_prompt",
             fallback_reason: waitingForAnswer ? "running_prompt_waiting" : "native_steering_unsupported",
           })
-        }).catch(error => {
+        })
+        pending.promise = sendSteer(0).catch(error => {
           pending.error = error
           turn.fail(error)
           dropFromPool(this)

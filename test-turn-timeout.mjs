@@ -137,7 +137,36 @@ async function fixture(mode) {
       }
     }
     assert.equal(logs().filter(e => e.type === "user").length, 1)
-    if (mode !== "large") {
+    if (mode === "cancel") {
+      const init = logs().find(e => e.type === "init")
+      const retry = await fetchBody()
+      assert.equal(retry.status, 200)
+      const retryList = events(await retry.text())
+      assert.equal(retryList.find(e => e.event === "message_delta")?.data.delta.stop_reason, "end_turn")
+      assert(!retryList.some(e => e.event === "error"))
+      const retryAnswer = retryList.filter(e => e.data.delta?.type === "text_delta").map(e => e.data.delta.text).join("")
+      assert(retryAnswer.includes("You said:"))
+      const userPrompts = logs().filter(e => e.type === "user")
+      assert.equal(userPrompts.length, 2)
+      assert.equal(userPrompts.filter(e => e.text.includes("ISSUE49_DELAY_TOOL")).length, 1)
+      assert.equal(userPrompts[1].convId, init.convId)
+      assert.match(userPrompts[1].text, /previous reply was interrupted/i)
+      assert.equal(logs().filter(e => e.type === "init").length, 1)
+      const followUp = await fetchBody({
+        ...body,
+        messages: [
+          ...body.messages,
+          { role: "assistant", content: [{ type: "text", text: retryAnswer }] },
+          { role: "user", content: "follow-up after silent cancel retry" },
+        ],
+      })
+      assert.equal(followUp.status, 200)
+      const followList = events(await followUp.text())
+      assert.equal(followList.find(e => e.event === "message_delta")?.data.delta.stop_reason, "end_turn")
+      assert.equal(logs().filter(e => e.type === "init").length, 1)
+      assert.equal(logs().filter(e => e.type === "user").at(-1)?.convId, init.convId)
+      assert.equal(logs().filter(e => e.type === "user").at(-1)?.text, "follow-up after silent cancel retry")
+    } else if (mode !== "large") {
       const retry = await fetchBody()
       assert.equal(retry.status, 409)
       assert.equal((await retry.json()).error.code, "prompt_outcome_unknown")

@@ -9,7 +9,8 @@ const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
 const MAX_OUTPUT_BYTES = 1024 * 1024
 const CLEANUP_TIMEOUT_MS = 1000
-const SIGN_IN_TALK = /not (?:logged|signed) in|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again/i
+const AUTH_FAILURE = /not (?:logged|signed) in(?:to)?\b|unauthenticated|authentication required|login required|please (?:log|sign) in|sign in again|\binvalid_grant\b/i
+const SIGN_IN_TALK = /accounts\.google\.com|oauth|sign[ -]?in|log[ -]?in|authenticat|browser/i
 
 class UsageError extends Error {
   constructor(message, { kind, output } = {}) {
@@ -22,8 +23,15 @@ class UsageError extends Error {
 const text = value => typeof value === "string" ? value.trim() : ""
 const field = (value, camel, snake) => value?.[camel] ?? value?.[snake]
 
+// Strip glog startup diagnostic lines (which can mention unauthenticated cache probes before keyring load).
+function withoutDiagnostics(output) {
+  return String(output || "").split(/\r?\n/)
+    .filter(line => !/^\s*[IWEF]\d{4}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+[^\]]+\]/.test(line))
+    .join("\n")
+}
+
 function commandFailure(output) {
-  if (SIGN_IN_TALK.test(output)) {
+  if (AUTH_FAILURE.test(withoutDiagnostics(output))) {
     return new UsageError("agy usage needs authentication. Run `agy` in a terminal to sign in again.", { kind: "auth", output })
   }
   const eligibility = /eligibility check failed|not eligible|unsupported (?:country|region)|does not support google tos/i.test(output)
@@ -63,7 +71,7 @@ export function parseUsageReport(value) {
     throw new UsageError("agy returned an invalid usage report.")
   }
   if (report?.status !== "SUCCESS" || report?.command?.name !== "usage") {
-    throw commandFailure(`${text(report?.error)} ${text(report?.response)}`)
+    throw commandFailure(text(report?.error) || text(report?.response))
   }
   const groups = report.command.data?.groups
   const windows = []
@@ -313,11 +321,15 @@ export async function fetchUsage(agy, {
     // Probe the hidden profile flag within the version call. Older CLIs reject
     // it; only then fall back to the user's real Gemini directory. A fixed
     // account dir must never fall back: that would read the wrong account.
-    let version = await run(agy, [`--gemini_dir=${geminiDir}`, "--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
+    const stripVersionTimeout = error => {
+      if (error?.kind === "timeout") throw new UsageError(error.message)
+      throw error
+    }
+    let version = await run(agy, [`--gemini_dir=${geminiDir}`, "--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) }).catch(stripVersionTimeout)
     let isolated = version.code === 0
     if (!isolated && /flags? provided but not defined|unknown (?:flag|option)|unrecognized/i.test(version.stderr + version.stdout)) {
       if (fixedGeminiDir) throw new UsageError("this agy version does not support --gemini_dir; update the CLI to use named accounts.")
-      version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) })
+      version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) }).catch(stripVersionTimeout)
     }
     if (version.code !== 0) throw commandFailure(version.stderr)
     if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
@@ -326,7 +338,14 @@ export async function fetchUsage(agy, {
       "-p", "/usage", "--output-format", "json", "--agent", "magpie-usage", "--print-timeout", `${Math.max(1, Math.ceil((deadline - Date.now()) / 1000))}s`,
     ]
     const result = await run(agy, args, options)
-    if (result.code !== 0) throw commandFailure(result.stderr + "\n" + result.stdout)
+    if (result.code !== 0) {
+      let failure
+      try { failure = JSON.parse(result.stdout) } catch {}
+      if (failure?.status && failure.status !== "SUCCESS") {
+        throw commandFailure(text(failure.error) || text(failure.response))
+      }
+      throw commandFailure(result.stderr + "\n" + result.stdout)
+    }
     return parseUsageReport(result.stdout)
   } finally {
     const temporary = owned ? directory : workDir
@@ -381,7 +400,7 @@ export function createUsageReader(resolveAgy, options = {}) {
         } catch (error) {
           const authFailure = error instanceof UsageError && stored?.state === "present" && (
             error.kind === "auth" ||
-            (error.kind === "timeout" && stored.expired && (!error.output.trim() || SIGN_IN_TALK.test(error.output)))
+            (error.kind === "timeout" && stored.expired && (!error.output.trim() || SIGN_IN_TALK.test(withoutDiagnostics(error.output))))
           )
           if (authFailure) {
             noteDead(stored)

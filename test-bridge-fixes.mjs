@@ -332,3 +332,139 @@ test("responseUsage does not fabricate 1 token on empty output or zero estimate"
     allProcs.delete(proc)
   }
 })
+
+test("streamErrorOf marks invalid_request_error with status 400 and preserves metadata", async () => {
+  const { streamErrorOf } = await import(`./index.mjs?fixes-err=${Date.now()}`)
+  const invalid = streamErrorOf({ kind: "invalid_request_error", message: "code 429 turned away", code: "bad_prompt", retryable: false })
+  assert.deepEqual(invalid, { type: "invalid_request_error", message: "code 429 turned away", status: 400, code: "bad_prompt", retryable: false })
+  const quota = streamErrorOf({ kind: "rate_limit_error", message: "quota", code: "rate_limit", retryable: true, retryAfterMs: 3000 })
+  assert.equal(quota.status, undefined)
+  assert.equal(quota.retry_after_ms, 3000)
+})
+
+test("run_command avoids agy toolSummary collision, restores default argument, and preserves fellBack signal", async () => {
+  const workRoot = path.join(root, "tool-summary-work")
+  const accountsDir = path.join(root, "tool-summary-accounts")
+  const stateFile = path.join(root, "tool-summary-state.json")
+  const fakeDir = path.join(root, "fake-tool-summary-agy")
+  const logFile = path.join(root, "tool-summary.jsonl")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const logFile = process.env.FAKE_TS_LOG;
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) {
+  if (process.env.FAKE_MODELS_FAIL === "1") process.exit(1);
+  console.log("gemini-test  Gemini Test");
+  process.exit(0);
+}
+const sessionId = "s-ts";
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function connectControl(payload, onReply) {
+  return import("node:net").then((net) => new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, ...payload }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      const msg = JSON.parse(buf.slice(0, nl));
+      onReply?.(msg);
+      resolve(msg);
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  }));
+}
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    await connectControl({ kind: "list" }, (reply) => fs.appendFileSync(logFile, JSON.stringify({ step: "list", msg: reply }) + "\\n"));
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId, models: { currentModelId: "gemini-test", availableModels: [{ modelId: "gemini-test", name: "Gemini Test" }] } } });
+  } else if (msg.method === "session/prompt") {
+    const callArgs = JSON.parse(process.env.FAKE_CALL_ARGS || "{}");
+    void connectControl({ kind: "call", name: "run_command", arguments: callArgs }).catch(() => {});
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    FAKE_TS_LOG: process.env.FAKE_TS_LOG,
+    FAKE_CALL_ARGS: process.env.FAKE_CALL_ARGS,
+    FAKE_MODELS_FAIL: process.env.FAKE_MODELS_FAIL,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = workRoot
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.FAKE_TS_LOG = logFile
+  const schema = {
+    type: "object",
+    properties: { CommandLine: { type: "string" }, toolSummary: { type: "string" } },
+    required: ["CommandLine", "toolSummary"],
+  }
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-ts=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    assert.equal(await plugin.auth.cli.installed(), true)
+
+    process.env.FAKE_MODELS_FAIL = "1"
+    const fallbackModels = await plugin.provider.models()
+    assert.equal(fallbackModels[Symbol.for("magpie.fellBack")], true)
+
+    delete process.env.FAKE_MODELS_FAIL
+    const liveModels = await plugin.provider.models()
+    assert.equal(liveModels[Symbol.for("magpie.fellBack")], undefined)
+
+    const loader = await plugin.auth.loader()
+    process.env.FAKE_CALL_ARGS = JSON.stringify({ CommandLine: "pwd" })
+    const res1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        metadata: { user_id: "u-ts-1" },
+        tools: [{ name: "run_command", input_schema: schema }],
+        messages: [{ role: "user", content: "run pwd" }],
+      }),
+    })
+    const body1 = await res1.json()
+    assert.equal(res1.status, 200, JSON.stringify(body1))
+    assert.equal(body1.content.find(b => b.type === "tool_use")?.input?.toolSummary, "Run command")
+    assert.deepEqual(schema.required, ["CommandLine", "toolSummary"])
+    const listed = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse).find(e => e.step === "list")
+    assert.deepEqual(listed.msg.result.tools[0].inputSchema.required, ["CommandLine"])
+
+    process.env.FAKE_CALL_ARGS = JSON.stringify({ CommandLine: "pwd", toolSummary: "Show location" })
+    const res2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        metadata: { user_id: "u-ts-2" },
+        tools: [{ name: "run_command", input_schema: schema }],
+        messages: [{ role: "user", content: "run pwd with summary" }],
+      }),
+    })
+    const body2 = await res2.json()
+    assert.equal(res2.status, 200, JSON.stringify(body2))
+    assert.equal(body2.content.find(b => b.type === "tool_use")?.input?.toolSummary, "Show location")
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})

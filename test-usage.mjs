@@ -9,6 +9,7 @@ import path from "node:path"
 import { test } from "node:test"
 import { createUsageReader, fetchUsage, parseUsageReport } from "./usage.mjs"
 import { agySpawnSpec } from "./platform.mjs"
+import { forgetStoredSignIn } from "./signin.mjs"
 
 const report = groups => ({ status: "SUCCESS", command: { name: "usage", data: { groups } } })
 const group = (buckets, name = "Gemini Models") => ({ name, buckets })
@@ -207,10 +208,14 @@ const record = {
 }
 fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(record) + "\n")
 const mode = process.env.TEST_MODE
-if (mode === "version-hang" && version || mode === "hang" && !version) setInterval(() => {}, 1000)
+if (mode === "version-hang" && version || mode === "hang" && !version) {
+  if (process.env.TEST_ERROR) console.error(process.env.TEST_ERROR)
+  setInterval(() => {}, 1000)
+}
 else if (version) {
   console.log(process.env.TEST_VERSION || "1.3.5")
 } else if (mode === "fail") {
+  if (process.env.TEST_FAILURE_REPORT) console.log(process.env.TEST_FAILURE_REPORT)
   console.error(process.env.TEST_ERROR || "oops secret@example.com https://secret.invalid/token")
   process.exitCode = 1
 } else if (mode === "oversize") {
@@ -741,4 +746,64 @@ test("Windows reports exhausted workspace cleanup without disclosing local paths
   assert.equal(result.signIn, "kept")
   assert.match(result.error, /could not remove its temporary workspace/)
   assert.doesNotMatch(result.error, /agy-usage-windows-test-/)
+})
+
+const startupAuthLogs = [
+  "W1115 15:13:30.249469      10 cache.go:157] error getting token source: You are not logged into Antigravity.",
+  "I1115 15:13:30.317328       1 server_oauth.go:226] OAuth: authenticated successfully",
+  "I1115 15:13:32.684688       1 printmode.go:411] Print mode: silent auth succeeded",
+].join("\n")
+
+test("startup auth diagnostics cannot invalidate a usable sign-in on command failure", async t => {
+  for (const [stderr, finalError] of [
+    [startupAuthLogs + "\nconnection reset by peer", undefined],
+    [startupAuthLogs, "quota request timed out"],
+    [startupAuthLogs, undefined],
+  ]) {
+    forgetStoredSignIn({ dead: true })
+    t.after(() => forgetStoredSignIn({ dead: true }))
+    const f = await fixture(t, {
+      TEST_MODE: "fail", TEST_ERROR: stderr,
+      ...(finalError ? { TEST_FAILURE_REPORT: JSON.stringify({ status: "ERROR", error: finalError }) } : {}),
+    })
+    const stored = { state: "present", fp: "healthy", canRenew: true, expired: false }
+    const read = createUsageReader(() => f.executable, { ...f.options, signIn: async () => stored })
+    const result = await read()
+    assert.equal(result.signIn, "kept")
+    f.env.TEST_MODE = ""
+    assert.equal((await read()).windows.length, 1, "same credential must recover without logging in")
+  }
+})
+
+test("a final structured error takes precedence over contradictory diagnostics", async t => {
+  const { forgetStoredSignIn: reset } = await import("./signin.mjs")
+  for (const [stderr, error, expectedSignIn] of [
+    ["Authentication required", "connection reset", "kept"],
+    [startupAuthLogs + "\nconnection reset", "Authentication required", "expired"],
+    [startupAuthLogs, "invalid_grant: Token has been expired or revoked", "expired"],
+  ]) {
+    reset({ dead: true })
+    const f = await fixture(t, {
+      TEST_MODE: "fail", TEST_ERROR: stderr,
+      TEST_FAILURE_REPORT: JSON.stringify({ status: "ERROR", error }),
+    })
+    const stored = { state: "present", fp: `fp-${error}`, canRenew: true, expired: false }
+    assert.equal((await createUsageReader(() => f.executable, { ...f.options, signIn: async () => stored })()).signIn, expectedSignIn)
+  }
+  assert.throws(() => parseUsageReport({ status: "ERROR", error: "connection reset", response: "Authentication required" }), error => error.kind !== "auth" && /network request/.test(error.message))
+})
+
+test("a timeout with only OAuth diagnostics preserves sign-in instead of marking it expired", async t => {
+  const { forgetStoredSignIn: reset } = await import("./signin.mjs")
+  reset({ dead: true })
+  t.after(() => reset({ dead: true }))
+  const f = await fixture(t, { TEST_MODE: "hang", TEST_ERROR: startupAuthLogs })
+  const stored = { state: "present", fp: "refreshing", canRenew: true, expired: true }
+  const read = createUsageReader(() => f.executable, { ...f.options, timeoutMs: 1500, signIn: async () => stored })
+  assert.equal((await read()).signIn, "kept")
+  const logs = await f.logs()
+  assert.equal(logs.some(l => l.args.includes("/usage")), true, "the report child must have started")
+  f.env.TEST_MODE = ""
+  assert.equal((await read()).windows.length, 1)
+  await f.assertClean()
 })

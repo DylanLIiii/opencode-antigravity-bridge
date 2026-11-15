@@ -19,12 +19,13 @@ import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
 import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
-import { AgentNoticeFilter } from "./agent-notice.mjs"
+import { AgentNoticeFilter, isRefused429 } from "./agent-notice.mjs"
 import { SummaryThoughtFilter } from "./thought-filter.mjs"
 import { sanitizeInputSchema, TOOL_SEARCH_INPUT_SCHEMA } from "./tool-schema.mjs"
 import { cloakUser, outgoing, hint, turnsAway } from "./cloak.mjs"
 import { fitTools } from "./tool-budget.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
+import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
 import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
 import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
 
@@ -74,6 +75,8 @@ function detachedEvictMs() {
 const MAX_PARKED = 32
 const MAX_PROMPT_ATTEMPTS = 128
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
+const systemAppend = () => /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_SYSTEM_APPEND || "")
+const promptGuardEnabled = () => process.env.AGY_BRIDGE_PROMPT_GUARD !== "0"
 // Bound silence without meaningful agy output. agy emits nothing while it
 // generates tool-call arguments, so a large Write can be silent for minutes;
 // the default allows that at the cost of slower stall detection. This is not
@@ -206,21 +209,42 @@ function contextWindow(model, liveContext = null) {
 // process pool and its sessions never switch context mode mid-conversation.
 let cachedAgyUnlocked = false
 let cachedAgyError = null
+let cachedAgySearchKey = null
 
 function findAgy() {
-  if (cachedAgyPath) return cachedAgyPath
+  const env = process.env
+  if (cachedAgyPath && cachedAgySearchKey === "__wsl__" && wslDistro(env)) return cachedAgyPath
+  cachedAgyError = null
   try {
-    const wslPath = wslAgyPath(process.env)
-    if (wslPath) return cachedAgyPath = wslPath
+    const wslPath = wslAgyPath(env)
+    if (wslPath) {
+      cachedAgySearchKey = "__wsl__"
+      cachedAgyUnlocked = false
+      return cachedAgyPath = wslPath
+    }
   } catch (error) {
+    cachedAgyPath = null
+    cachedAgySearchKey = null
+    cachedAgyUnlocked = false
     cachedAgyError = error.message
     return null
   }
-  const candidates = agyCandidates(process.env, os.homedir())
+  const home = os.homedir()
+  const searchKey = JSON.stringify([env.AGY_PATH, env.PATH, env.Path, env.LOCALAPPDATA, env.XDG_DATA_HOME, home])
+  if (cachedAgyPath && cachedAgySearchKey === searchKey) {
+    try {
+      fs.accessSync(cachedAgyPath, fs.constants.X_OK)
+      return cachedAgyPath
+    } catch {}
+  }
+  cachedAgyPath = null
+  cachedAgyUnlocked = false
+  cachedAgySearchKey = searchKey
+  const candidates = agyCandidates(env, home)
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK)
-      const selected = selectAgy(candidate, process.env)
+      const selected = selectAgy(candidate, env)
       cachedAgyUnlocked = selected.unlocked
       cachedAgyPath = selected.path
       return cachedAgyPath
@@ -284,7 +308,7 @@ async function listAgyModels(agyPath, extraArgs = []) {
     env: accountEnv(process.env, geminiDir),
   })
   if (wslDistro() && (err || code !== 0 || !stdout.trim())) throw new Error(`WSL agy models failed: ${err?.message || stderr?.trim() || "empty model response"}. Check wsl.exe, the configured distro and AGY_PATH; run agy in that same distro to sign in.`)
-  if (err || code !== 0) return FALLBACK_MODELS
+  if (err || code !== 0) return { models: FALLBACK_MODELS, isFallback: true }
   const out = []
   for (const raw of stdout.split("\n")) {
     const line = raw.trim()
@@ -297,7 +321,7 @@ async function listAgyModels(agyPath, extraArgs = []) {
     out.push({ id, name, effort })
   }
   if (wslDistro() && !out.length) throw new Error("WSL agy returned no models. Run agy in the configured distro to sign in.")
-  return out.length ? out : FALLBACK_MODELS
+  return out.length ? { models: out, isFallback: false } : { models: FALLBACK_MODELS, isFallback: true }
 }
 
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
@@ -432,7 +456,7 @@ function modelFamilyId(model) {
   return model.id.slice(0, -(model.effort.length + 1))
 }
 
-function buildModelCatalog(list) {
+function buildModelCatalog(list, isFallback = false) {
   const rawIds = new Set(list.map(model => model.id))
   const families = new Map()
   for (const model of list) {
@@ -474,17 +498,18 @@ function buildModelCatalog(list) {
     })
     routes.set(id, { byEffort, efforts, defaultEffort })
   }
-  return { models, routes, rawIds }
+  return { models, routes, rawIds, isFallback }
 }
 
 async function loadModelCatalog(agyPath, refresh = false, account = DEFAULT_ACCOUNT) {
   const key = `${agyPath}|${account.key}`
   if (!refresh && catalogCache.has(key)) return catalogCache.get(key)
   if (refresh && !wslDistro() && (await backgroundBlocked({ dir: account.dir }))) {
-    return buildModelCatalog(FALLBACK_MODELS)
+    return buildModelCatalog(FALLBACK_MODELS, true)
   }
   const extraArgs = account.dir ? [`--gemini_dir=${account.dir}`] : []
-  const catalog = buildModelCatalog(await listAgyModels(agyPath, extraArgs))
+  const listed = await listAgyModels(agyPath, extraArgs)
+  const catalog = buildModelCatalog(listed.models, listed.isFallback)
   catalogCache.set(key, catalog)
   return catalog
 }
@@ -739,6 +764,19 @@ class PromptOutcomeUnknownError extends Error {
 
 // An upstream failure inside a healthy agy session. The process keeps its
 // conversation, so a different follow-up continues without replaying history.
+export function streamErrorOf(error) {
+  const type = error?.kind || "api_error"
+  return {
+    type,
+    message: String(error?.message ?? error),
+    // Declare status explicitly so clients do not classify quoted upstream text (e.g. "code 429") as 429.
+    ...(type === "invalid_request_error" ? { status: 400 } : {}),
+    ...(error?.code ? { code: error.code } : {}),
+    ...(typeof error?.retryable === "boolean" ? { retryable: error.retryable } : {}),
+    ...(Number.isSafeInteger(error?.retryAfterMs) ? { retry_after_ms: error.retryAfterMs } : {}),
+  }
+}
+
 class AgentTurnError extends Error {
   constructor(message, kind = "api_error", classification = null) {
     super(message)
@@ -1140,6 +1178,9 @@ class Turn {
       if (text.trim()) this.deliveredTextChars += text.length
       this.push({ type: "text", text })
     }
+    if (this.notices.refusedDetail && !this.done && !this.finalized) {
+      this.proc.refuseTurn(this, this.notices.refusedDetail)
+    }
   }
 
   flushText(holdTerminal = false) {
@@ -1444,7 +1485,7 @@ class Proc {
     const capabilities = init?.agentCapabilities ?? {}
     this.supportsImages = capabilities.promptCapabilities?.image === true ||
       capabilities.prompt_capabilities?.image === true
-    const appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
+    const appendable = systemAppend() && capabilities._meta?.antigravity?.systemPrompt?.append === true
     const resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
     this.instructionsInSession = appendable && !!this.instructions
     const meta = this.instructionsInSession
@@ -1798,6 +1839,7 @@ class Proc {
       for (;;) {
         turn.logOffset = await fileSize(this.logPath)
         // A cancel that arrived before the prompt would be ignored by agy.
+        if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
           if (this.hasSentFirstTurn) this.unsentPrompt = promptParts
           turn.complete({ stopReason: "cancelled" })
@@ -1835,6 +1877,7 @@ class Proc {
           lateCalls = null
           continue
         }
+        if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
           turn.complete({ stopReason: "cancelled" })
           return
@@ -1927,6 +1970,7 @@ class Proc {
         if (turn.agentError) throw await this.#agentError(turn)
         // Steering has already put these results in its next user prompt. Do
         // not queue a second late-results prompt (or retain it as unsent input).
+        if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
           turn.complete({ stopReason: "cancelled" })
           return
@@ -1989,6 +2033,9 @@ class Proc {
     if (/code 429\b/i.test(detail) && /(?:system\s+prompt|system\s+instructions).{0,80}(?:reject|invalid|block|denied)/i.test(detail) && turnsAway(this.instructions)) {
       return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "invalid_request_error")
     }
+    if (isRefused429(detail) && turnsAway(this.instructions) && (!promptGuardEnabled() || turnsAway(outgoingSystemText(this.instructions)))) {
+      return new AgentTurnError(`agy bridge: Antigravity answered 429 to this system prompt — ${hint(this.instructions)}`, "rate_limit_error")
+    }
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
     const kind = classification.category === "forbidden" ? "permission_error"
       : classification.category === "request_rejected" ? "invalid_request_error"
@@ -2037,15 +2084,44 @@ class Proc {
     if (!turn.calls.length) this.finalizeTurn(turn)
   }
 
+  refuseTurn(turn, detail) {
+    if (turn.refusedDetail || turn.done || turn.finalized) return
+    turn.refusedDetail = detail
+    turn.agentError = true
+    const error = this.#formatAgentError(detail, turn.promptGuardMatched)
+    error.keepProcess = false
+    this.expectedMessages = turn.baseHistory
+    turn.fail(error)
+    for (const call of turn.calls) clearTimeout(call.deadline)
+    for (const waiter of turn.awaitCalls.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.reply({ content: [{ type: "text", text: error.message }], isError: true })
+    }
+    this.conn?.notify("session/cancel", { sessionId: this.sessionId })
+    const timer = setTimeout(() => {
+      if (this.turn === turn && !turn.finalized && !this.dead) {
+        dropFromPool(this)
+        this.stop().catch(() => {})
+      }
+    }, CANCEL_SETTLE_MS)
+    timer.unref?.()
+    turn.settled.then(() => clearTimeout(timer))
+  }
+
   acceptMcpCall(message, socket) {
     const turn = this.turn
     if (!turn || turn.done || turn.finalized || turn.cancelRequested) {
       throw new Error("agy bridge: no active turn for MCP call")
     }
     const name = message.name
-    const args = message.arguments ?? {}
+    let args = message.arguments ?? {}
     if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("agy bridge: invalid tool arguments")
-    if (!this.tools.some((tool) => tool.name === name)) throw new Error(`agy bridge: undeclared tool ${name}`)
+    const tool = this.tools.find((item) => item.name === name)
+    if (!tool) throw new Error(`agy bridge: undeclared tool ${name}`)
+    // agy reserves toolSummary internally on run_command and strips it from forwarded args.
+    if (name === "run_command" && tool.inputSchema?.properties?.toolSummary && !Object.hasOwn(args, "toolSummary")) {
+      args = { ...args, toolSummary: "Run command" }
+    }
     const signature = stableJSON(args)
     const running = turn.calls.find((call) => call.deferred && !call.lateDelivered &&
       call.name === name && stableJSON(call.arguments) === signature)
@@ -2695,6 +2771,7 @@ function park(proc) {
     historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
     toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
     instructionsHash: digest(instructionsIdentity(proc.instructions)),
+    systemAppend: systemAppend(),
     workDir: proc.workDir,
     userCloak: USER_CLOAK,
     at: Date.now(),
@@ -2707,7 +2784,9 @@ function peekParked(convKey, opts) {
   loadParked()
   const entry = parked.get(convKey)
   if (!entry || Date.now() - entry.at > RESUME_TTL_MS || (entry.workDir ?? null) !== (opts.workDir ?? null) ||
-    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions)) || entry.userCloak !== USER_CLOAK) return null
+    entry.instructionsHash !== digest(instructionsIdentity(opts.instructions)) ||
+    entry.systemAppend !== systemAppend() ||
+    entry.userCloak !== USER_CLOAK) return null
   if (entry.historyHash === digest(historyKey(opts.history))) return entry
   const ids = toolUseIdentitiesKey(opts.history)
   if (ids == null || entry.toolUseIdentitiesHash !== digest(ids) ||
@@ -3746,7 +3825,7 @@ function matchToolResults(body, blocks, accountName = null) {
 // boundaries. User, assistant, tool and mid-session content never pass through
 // this guard.
 function guardRequestSystem(body) {
-  if (process.env.AGY_BRIDGE_PROMPT_GUARD === "0") return { body, diagnostics: [] }
+  if (!promptGuardEnabled()) return { body, diagnostics: [] }
   const diagnostics = []
   const apply = (value) => {
     if (typeof value !== "string" && !Array.isArray(value)) return value
@@ -3880,6 +3959,9 @@ function normalizeTools(body) {
       throw new UnsupportedContent(`an invalid schema for tool ${tool.name}`)
     }
     const inputSchema = sanitizeInputSchema(rawSchema)
+    if (tool.name === "run_command" && Array.isArray(inputSchema.required)) {
+      inputSchema.required = inputSchema.required.filter((key) => key !== "toolSummary")
+    }
     tools.push({
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
@@ -5238,16 +5320,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             closeBlock()
             clearInterval(pingTimer)
             pingTimer = null
-            send("error", {
-              type: "error",
-              error: {
-                type: event.error?.kind || "api_error",
-                message: String(event.error?.message ?? event.error),
-                ...(event.error?.code ? { code: event.error.code } : {}),
-                ...(typeof event.error?.retryable === "boolean" ? { retryable: event.error.retryable } : {}),
-                ...(Number.isSafeInteger(event.error?.retryAfterMs) ? { retry_after_ms: event.error.retryAfterMs } : {}),
-              },
-            })
+            send("error", { type: "error", error: streamErrorOf(event.error) })
             if (!event.error?.keepProcess) {
               dropFromPool(proc)
               await proc.stop().catch(() => {})
@@ -5403,7 +5476,9 @@ async function jsonResponseFromStream(stream, fallbackModel, fallbackId) {
   if (buffer.trim()) processBlock(buffer)
 
   if (streamError) {
-    const status = streamError.code === "upstream_idle_timeout" ? 504
+    const status = Number.isInteger(streamError.status)
+      ? streamError.status
+      : streamError.code === "upstream_idle_timeout" ? 504
       : streamError.type === "rate_limit_error" ? 429
       : streamError.type === "permission_error" ? 403 : streamError.type === "invalid_request_error" ? 400 : 502
     return new Response(JSON.stringify({ type: "error", error: streamError }), {
@@ -5530,6 +5605,7 @@ function expandHome(value) {
 
 export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
   const magpie = !!input.magpie
+  keepAgyCurrent(findAgy)
   if (magpie) void startContextService({
     port: options?.contextPort,
     unavailableReason: wslDistro() ? "wsl" : null,
@@ -5583,6 +5659,16 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
       // Each native account has its own local profile reference. WSL exposes
       // only the distro's existing CLI account.
       single: !!wslDistro(),
+      cli: {
+        name: "Antigravity CLI",
+        manual: AGY_MANUAL,
+        installed: async () => findAgy() !== null,
+        install: async ({ signal } = {}) => {
+          if (findAgy()) return
+          await installAgy({ signal })
+          if (!findAgy()) throw new Error("agy was installed, but the plugin can't run it")
+        },
+      },
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
       usage: async getAuth => {
         if (!magpie) return readUsage()
@@ -5605,7 +5691,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             if (!agy) {
               return {
                 type: "failed",
-                error: cachedAgyError || "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli — then run `agy` once to sign in.",
+                error: cachedAgyError || `agy CLI not found. Update magpie and try again to have it installed, or install Antigravity CLI yourself: ${AGY_MANUAL} — then run \`agy\` once to sign in.`,
               }
             }
             const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
@@ -5620,7 +5706,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             }
             forgetStoredSignIn({ dead: true })
             offeredProbes.clear()
-            return { type: "success", key: "agy" }
+            const email = wslDistro() ? "" : await storedEmail()
+            return { type: "success", key: "agy", ...(email ? { metadata: { email } } : {}) }
           },
         },
         ...(wslDistro() ? [] : [...accountImportMethods(importEntries), accountLogin]),
@@ -5691,7 +5778,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
 
             const guarded = guardRequestSystem(body)
             body = guarded.body
-            const promptGuardMatched = guarded.diagnostics.length > 0
+            // guardRequestSystem already neutralized matched lines before agy sees the prompt; don't blame subsequent 429s on it.
+            const promptGuardMatched = false
             const rawModel = body.model || ""
             if (wslDistro() && rawModel.replace(/^antigravity-bridge\//, "").includes("/")) return jsonError(400, "Named account profiles are unavailable in WSL mode; use the distro default account")
             let account, modelId
@@ -5799,7 +5887,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 messages: body.messages, layout, nonstream: body.stream === false,
                 account: account.name, accountKey: account.key, geminiDir: account.dir, userId: body.metadata?.user_id || "",
                 validateReplay: () => validateAcpPromptBudget(
-                  renderReplayPromptParts(body, callerWorkDir, true, instructions), instructions, body) }
+                  renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
+                  systemAppend() ? instructions : "", body) }
               const claim = () => {
                 if (!promptAttempt) {
                   const key = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)
@@ -6018,9 +6107,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
         const accounts = magpie ? [boundAccount(context.auth, { allowMissing: true })]
           : agy ? await getAccounts(agy, { refresh: true }) : [DEFAULT_ACCOUNT]
         const out = {}
-        await Promise.all(accounts.map(async account => {
+        const accountFallbacks = await Promise.all(accounts.map(async account => {
           const blocked = agy && !wslDistro() ? await backgroundBlocked({ dir: account.dir }) : ""
-          const catalogPromise = agy && !blocked ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS))
+          const catalogPromise = agy && !blocked ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS, true))
           const offeredPromise = agy && !blocked
             ? probeOfferedModels(agy, account, configuredTimeout("AGY_BRIDGE_MODEL_PROBE_WAIT_MS", MODEL_PROBE_WAIT_MS))
             : Promise.resolve(null)
@@ -6064,7 +6153,12 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               } : {}),
             }
           }
+          return !agy || !!blocked || !!catalog.isFallback
         }))
+        // Signal fallback lists to Magpie so user-selected models are preserved while agy cannot list them.
+        if (!agy || (accountFallbacks.length > 0 && accountFallbacks.every(Boolean))) {
+          out[Symbol.for("magpie.fellBack")] = true
+        }
         return out
       },
     },

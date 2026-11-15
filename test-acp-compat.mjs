@@ -188,7 +188,7 @@ for (const mode of ["compaction-failure", "compaction-refusal"]) {
     assert.equal(response.status, mode === "compaction-failure" ? 429 : 502, JSON.stringify(payload))
     const sent = logs().slice(before).filter(event => event.kind === "prompt")
     assert.equal(sent.length, mode === "compaction-failure" ? 2 : 1)
-    assert.ok(sent.every(event => event.prompt.some(part => part.text?.startsWith("[Bridge compaction fragment "))))
+    assert.ok(sent.every(event => event.prompt.some(part => part.text?.includes("[Bridge compaction fragment "))))
     assert.ok(!JSON.stringify(payload).includes("ACK-INTERNAL"))
     const retry = await request(client, messages)
     assert.notEqual(retry.status, 200)
@@ -225,9 +225,11 @@ test("a customized compaction-looking prompt keeps the ordinary request and inst
   assert.equal(response.status, 200, await response.text())
   const sent = logs().slice(before).filter(event => event.kind === "prompt")
   assert.equal(sent.length, 1)
-  assert.match(sent[0].append, /Keep the user's instructions/)
-  assert.ok(!sent[0].append.includes("You are summarizing an existing conversation"))
-  assert.ok(sent[0].prompt.some(part => part.text?.includes(latest)))
+  const promptText = sent[0].prompt.map(part => part.text || "").join("")
+  assert.equal(sent[0].append, "")
+  assert.match(promptText, /Keep the user's instructions/)
+  assert.ok(!promptText.includes("You are summarizing an existing conversation"))
+  assert.ok(promptText.includes(latest))
 })
 
 test("cancelling an ingestion prompt prevents remaining fragments from being submitted", async () => {
@@ -277,29 +279,62 @@ for (const mode of ["response-first", "notification-first", "legacy", "legacy-ha
   })
 }
 
+test("default first-turn external system instructions do not send systemPrompt.append on new or resume", async () => {
+  process.env.COMPAT_MODE = "response-first"
+  delete process.env.AGY_BRIDGE_SYSTEM_APPEND
+  const start = logs().length
+  let messages = [{ role: "user", content: "default external opening" }]
+  for (let round = 0; round < 3; round++) {
+    const response = await request(await loader(), messages, { system: "DEFAULT_EXTERNAL_MARKER" })
+    const body = await response.json()
+    assert.equal(response.status, 200, JSON.stringify(body))
+    messages = [...messages, { role: "assistant", content: body.content }, { role: "user", content: `next default ${round}` }]
+  }
+  const events = logs().slice(start)
+  const opens = events.filter(e => e.kind === "request" && ["session/new", "session/resume"].includes(e.method))
+  assert.equal(opens.length, 3)
+  assert.deepEqual(opens.map(e => e.method), ["session/new", "session/resume", "session/resume"])
+  for (const event of opens) {
+    assert.equal(event.params._meta?.antigravity?.systemPrompt?.append, undefined)
+  }
+  const prompts = events.filter(e => e.kind === "prompt")
+  assert.equal(prompts.length, 3)
+  assert.match(prompts[0].prompt.map(p => p.text || "").join(""), /<external_system_instructions>[\s\S]*DEFAULT_EXTERNAL_MARKER[\s\S]*<\/external_system_instructions>/)
+  for (let i = 1; i < prompts.length; i++) {
+    assert.equal(prompts[i].prompt.map(p => p.text || "").join(""), `next default ${i - 1}`)
+  }
+})
+
 for (const mode of ["response-first", "legacy-resume", "no-append"]) {
   test(`resume append: ${mode}`, async () => {
+    const prevAppend = process.env.AGY_BRIDGE_SYSTEM_APPEND
+    process.env.AGY_BRIDGE_SYSTEM_APPEND = "1"
     process.env.COMPAT_MODE = mode
-    const start = logs().length
-    let messages = [{ role: "user", content: `resume opening ${mode}` }]
-    for (let round = 0; round < 3; round++) {
-      const response = await request(await loader(), messages, { system: "APPEND_COMPAT_MARKER" })
-      const body = await response.json()
-      assert.equal(response.status, 200, JSON.stringify(body))
-      messages = [...messages, { role: "assistant", content: body.content }, { role: "user", content: `next ${mode} ${round}` }]
-    }
-    const events = logs().slice(start)
-    const opens = events.filter(e => e.kind === "request" && ["session/new", "session/resume"].includes(e.method))
-    assert.equal(opens.length, 3)
-    assert.deepEqual(opens.map(e => e.method), ["session/new", "session/resume", "session/resume"])
-    for (const [i, event] of opens.entries()) {
-      const append = event.params._meta?.antigravity?.systemPrompt?.append || ""
-      assert.equal(append.split("APPEND_COMPAT_MARKER").length - 1, mode === "no-append" || (mode === "legacy-resume" && i > 0) ? 0 : 1)
-    }
-    const prompts = events.filter(e => e.kind === "prompt")
-    assert.equal(prompts.length, 3)
-    for (let i = 1; i < prompts.length; i++) {
-      assert.equal(prompts[i].prompt.map(p => p.text || "").join(""), `next ${mode} ${i - 1}`, "resume submits only the new user turn")
+    try {
+      const start = logs().length
+      let messages = [{ role: "user", content: `resume opening ${mode}` }]
+      for (let round = 0; round < 3; round++) {
+        const response = await request(await loader(), messages, { system: "APPEND_COMPAT_MARKER" })
+        const body = await response.json()
+        assert.equal(response.status, 200, JSON.stringify(body))
+        messages = [...messages, { role: "assistant", content: body.content }, { role: "user", content: `next ${mode} ${round}` }]
+      }
+      const events = logs().slice(start)
+      const opens = events.filter(e => e.kind === "request" && ["session/new", "session/resume"].includes(e.method))
+      assert.equal(opens.length, 3)
+      assert.deepEqual(opens.map(e => e.method), ["session/new", "session/resume", "session/resume"])
+      for (const [i, event] of opens.entries()) {
+        const append = event.params._meta?.antigravity?.systemPrompt?.append || ""
+        assert.equal(append.split("APPEND_COMPAT_MARKER").length - 1, mode === "no-append" || (mode === "legacy-resume" && i > 0) ? 0 : 1)
+      }
+      const prompts = events.filter(e => e.kind === "prompt")
+      assert.equal(prompts.length, 3)
+      for (let i = 1; i < prompts.length; i++) {
+        assert.equal(prompts[i].prompt.map(p => p.text || "").join(""), `next ${mode} ${i - 1}`, "resume submits only the new user turn")
+      }
+    } finally {
+      if (prevAppend === undefined) delete process.env.AGY_BRIDGE_SYSTEM_APPEND
+      else process.env.AGY_BRIDGE_SYSTEM_APPEND = prevAppend
     }
   })
 }

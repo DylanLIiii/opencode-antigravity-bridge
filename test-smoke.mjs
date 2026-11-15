@@ -25,6 +25,7 @@ process.env.AGY_BRIDGE_ACCOUNTS_DIR = fixtureAccountsDir
 process.env.AGY_BRIDGE_CONTEXT_DIR = path.join(stateDir, "context")
 process.env.AGY_BRIDGE_MAX_PROCS = "4"
 process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
 // the real one does: by running `nc 127.0.0.1 <--ide-mcp-port>` from PATH.
@@ -1202,23 +1203,24 @@ async function launchedModel(body) {
     !init.systemAppend.includes(billing) && init.systemAppend.includes("Custom agent built on the Claude Agent SDK by Anthropic.") &&
     init.systemAppend.includes("When the user writes @ followed by a path") && !init.systemAppend.includes(paths) &&
     init.systemAppend.includes("before\n") && init.systemAppend.endsWith("after"), init.systemAppend)
-  check("trailing system and developer reminders are rewritten while user and queued input stay literal",
+  check("trailing system and developer reminders are rewritten while non-Codex user text stays literal and Codex user phrase cloaks",
     prompt.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") &&
     prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") &&
-    prompt.includes(rawUser) && prompt.includes(queued) &&
+    prompt.includes(rawUser) &&
+    prompt.includes(`Queued user input: ${codex.replace("based on", "built on")}\n${paths}`) &&
     (prompt.match(/When the user writes @ followed by a path/g) || []).length === 2, prompt)
 
   process.env.FAKE_AGY_APPEND = "0"
-  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}`, messages: [{ role: "user", content: `FALLBACK user: ${codex}` }] }
+  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}`, messages: [{ role: "user", content: `FALLBACK user: ${sdk}` }] }
   const fallbackResponse = await callFetch(fallbackBody)
   const fallbackEvents = (await readSSE(fallbackResponse)).events
   delete process.env.FAKE_AGY_APPEND
   const fallback = lastOf("user")?.text || ""
-  check("external system instructions use the same outgoing rewrite and preserve user text",
+  check("external system instructions use the same outgoing rewrite and preserve non-Codex user text",
     fallbackResponse.status === 200 && stopOf(fallbackEvents) === "end_turn" && inits().at(-1).systemAppend === null &&
     fallback.includes("<external_system_instructions>") && !fallback.includes(billing) && !fallback.includes(paths) &&
     fallback.includes("When the user writes @ followed by a path") && fallback.includes("You are Codex, an agent built on GPT-5") &&
-    fallback.includes(`FALLBACK user: ${codex}`), fallback)
+    fallback.includes(`FALLBACK user: ${sdk}`), fallback)
 
   const original = { model, system: codex, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
   const firstEvents = (await readSSE(await callFetch(original))).events
@@ -3917,6 +3919,7 @@ for (const steering of [false, true]) {
   try {
     process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
     process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     const { default: pressureDefault } = await import("./index.mjs?issue-29-pressure")
     const pressureLoader = await (await pressureDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
     const fetchPressure = body => pressureLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })
@@ -3986,6 +3989,7 @@ for (const steering of [false, true]) {
     process.env.AGY_BRIDGE_MAX_PROCS = "2"
     process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
     process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     const { default: branchPressureDefault } = await import("./index.mjs?issue-29-branch-pressure")
     const loader = await (await branchPressureDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
     const fetchBranch = (body, headers) => loader.fetch("agy://local/messages", { method: "POST", headers, body: JSON.stringify(body) })
@@ -4065,6 +4069,7 @@ for (const steering of [false, true]) {
         }
       }
       process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
       process.env.AGY_BRIDGE_MAX_PROCS = "1"
       const blockedReplay = await fetchBranch(late)
       check(`${label}: failed replay admission preserves the surviving branch`, blockedReplay.status === 503 && fs.existsSync(survivorOwner.cwd))
@@ -4084,6 +4089,7 @@ for (const steering of [false, true]) {
       check(`${label}: surviving branch completes in its original process`, stopOf(done) === "end_turn" &&
         logs().some(event => event.type === "mcpResult" && event.convId === survivorOwner.convId && event.result?.content?.[0]?.text === result))
       process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     }
   } finally {
     for (const [key, value] of Object.entries(savedEnv)) {
@@ -4142,6 +4148,7 @@ for (const steering of [false, true]) {
   try {
     process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS = "30000"
     process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
+process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
     const { default: capacityDefault } = await import("./index.mjs?issue-29-capacity")
     const capacityLoader = await (await capacityDefault.server({}, {})).auth.loader(async () => ({ key: "agy" }))
     const fetchCapacity = body => capacityLoader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })

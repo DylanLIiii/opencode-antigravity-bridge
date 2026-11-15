@@ -1,7 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
-import { cloak, hint, outgoing, turnsAway } from "./cloak.mjs"
+import { cloak, cloakUser, hint, outgoing, turnsAway } from "./cloak.mjs"
+import { ideToolOf, userTurnParts } from "./index.mjs"
 
 const billing = "x-anthropic-billing-header: cc_version=1.2.3; cc_entrypoint=cli;"
 const agentIdentity = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -196,4 +197,37 @@ test("near misses and non-string values remain untouched", () => {
   for (const value of [null, undefined, 42, { value: "system" }, "RFC 2119 keywords: MUST,REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL.", "You are Codex, an agent based on GPT-4"]) {
     assert.equal(outgoing(value), value)
   }
+})
+
+test("Nov 14 client triggers (Hermes, OpenCode, Codex CLI, pi), user-turn cloaking, and ideToolOf permission parsing", () => {
+  const cases = [
+    ["You are Hermes Agent, an AI assistant.", "You're Hermes Agent, an AI assistant.", /Hermes/],
+    ["You are opencode, the best coding agent on the planet.", "You're opencode, the best coding agent on the planet.", /OpenCode/],
+    ["You are a coding agent running in the Codex CLI, a terminal-based coding assistant.", "You're a coding agent running in the Codex CLI, a terminal-based coding assistant.", /Codex/],
+    ["You are an expert coding assistant. You operate as a coding assistant running inside pi.", "You are an expert coding assistant. You operate as a coding assistant running within pi.", /\bpi\b/],
+  ]
+  for (const [input, expected, hintPattern] of cases) {
+    assert.equal(turnsAway(input), true, input)
+    const cloaked = cloak(input)
+    assert.equal(cloaked, expected)
+    assert.equal(turnsAway(cloaked), false)
+    assert.match(hint(input), hintPattern)
+  }
+
+  assert.equal(cloakUser("You are Codex, an agent based on GPT-5"), "You are Codex, an agent built on GPT-5")
+  assert.equal(cloakUser("You are opencode"), "You are opencode")
+  const parts = userTurnParts([
+    { type: "text", text: "You are Codex, a coding agent based on GPT-5" },
+    { type: "image", data: "abc" },
+  ])
+  assert.deepEqual(parts, [
+    { type: "text", text: "You are Codex, a coding agent built on GPT-5" },
+    { type: "image", data: "abc" },
+  ])
+
+  assert.equal(ideToolOf({ name: "mcp_ide-tools_bash", title: "Run shell" }), "bash")
+  assert.equal(ideToolOf({ title: "mcp(ide-tools/read_file)?" }), "read_file")
+  assert.equal(ideToolOf({ title: 'mcp "ide-tools/edit"' }), "edit")
+  assert.equal(ideToolOf({ toolName: "ide-tools/glob" }), "glob")
+  assert.equal(ideToolOf({ name: "run_command", title: "run_command" }), null)
 })

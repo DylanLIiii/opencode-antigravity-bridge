@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.9
+
+- Query CloudCode model metadata (`loadCodeAssist` / `fetchAvailableModels`) and known Antigravity limits so models report accurate `limit.context`, `limit.output`, image capabilities, and `reasoning` flags (`gemini-pro-orchestrator*`, `claude-opus-4-6-thinking`, 1M Gemini/Claude 5.5, 250K Claude 4.6, 65K image model).
+- Prevent silent empty or failed `agy` turns from falsely returning HTTP 200 by checking `agy-acp.log`, notice state, delivered content, and SQLite step completion (`step_type=15`) before settling a turn.
+- Remove bogus `1`-token floor in `responseUsage` for zero-output non-final steps and zero-estimate inputs.
+- Add client tool-budget capping (`tool-budget.mjs`) to protect small-window OpenCode / IDE callers from oversized `tools[]` definitions and map `ideToolOf` tool call names cleanly.
+- Incorporate `agy-cli` 0.1.55 cloak updates (`cloak.mjs`, `cloakUser`) and pre-spawn stored sign-in health checking (`signin.mjs`) so dead/missing credentials fail fast without wasting `agy` spawns or background usage checks.
+- Split the OpenCode 1.x / 2.x plugin entrypoint (`opencode.mjs` / `opencode2.mjs`) and expose `"."` -> `"./opencode2.mjs"` in `package.json` while keeping `main` as `"./index.mjs"`.
+
 ## 0.8.8
 
 - Recover oversized stock OpenCode compaction requests by sending ordered, UTF-8-safe history fragments within agy's per-prompt limit, then returning only the final summary (#65). Use a temporary tool-free session so pending tools keep their original owner; prevalidate the full bounded plan, suppress ingestion acknowledgements, and stop on cancellation or upstream failure. Ordinary oversized input is still rejected without truncation. Multi-fragment compaction uses additional model calls and remains subject to the configured total text budget and model context window.

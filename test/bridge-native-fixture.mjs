@@ -24,6 +24,7 @@ export function nativeFixture() {
   const env = {
     AGY_PATH: agy, AGY_BRIDGE_ACCOUNTS_DIR: accounts, AGY_BRIDGE_STATE_FILE: path.join(root, "state.json"),
     AGY_BRIDGE_CONVERSATIONS_DIR: root, AGY_BRIDGE_CONTEXT_DIR: path.join(root, "context"),
+    AGY_BRIDGE_STORED_SIGNIN: "skip",
     FAKE_AGY_LOG: log, FAKE_AGY_STATE: root, AGY_BRIDGE_USAGE: "1",
   }
   const logs = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []

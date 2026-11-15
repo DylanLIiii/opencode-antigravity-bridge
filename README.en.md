@@ -306,7 +306,16 @@ user profile or VM.
   model; they cannot guarantee that a model never quotes historical content.
 - **Cancellation that keeps the session.** A client that stops reading gets
   `session/cancel`; the session stays alive and the partial answer the client
-  saw becomes part of the expected history.
+  saw becomes part of the expected history. If the client then retries the
+  identical request (streaming or not) while that exact live session is idle,
+  acknowledged the cancel, ran no tool, and still matches the account, model,
+  effort, tools, instructions and working directory, the bridge sends one short
+  "answer again in full" prompt in the same session instead of returning
+  `prompt_outcome_unknown`. The original prompt is never resent, and the client's
+  own history is what the next turn is matched against. Upstream errors, idle
+  timeouts, process death or eviction, restarts, pending or used tool calls,
+  changed requests, a conversation that has moved on, and compaction requests keep
+  the `prompt_outcome_unknown` rejection.
 - **User steering during tools.** With compatible history, instructions and
   working directory, AGY 1.5.0+ receives another `session/prompt` in the running
   session, using its documented native steering. Live results go only through
@@ -369,6 +378,8 @@ user profile or VM.
   prompt has been submitted, an identical streaming or non-streaming retry gets
   `prompt_outcome_unknown` rather than issuing another `session/prompt`; a
   different follow-up can continue the surviving session without replaying it.
+  The one exception is a clean client-initiated cancellation of a live session
+  (see "Cancellation that keeps the session"), which continues in place.
 - **Scoped system-prompt guard.** Standalone Claude billing metadata blocks and
   two exact Claude Agent SDK identity sentences are normalized before system
   blocks are flattened. User messages, tool results, code quotations, vendor

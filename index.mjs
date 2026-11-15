@@ -132,6 +132,7 @@ const MAX_CONTINUATIONS = (() => {
   return Number.isSafeInteger(value) && value >= 0 ? value : 3
 })()
 const CONTINUE_PROMPT = "Continue exactly where your previous output stopped. Do not repeat any earlier text."
+const CANCEL_CONTINUATION_PROMPT = "[The previous reply was interrupted before it finished. Answer my last message again, in full.]"
 // agy commits a model call to its conversation store just after the call ends.
 const STEP_USAGE_WAIT_MS = 1_000
 const STEP_USAGE_POLL_MS = 25
@@ -965,6 +966,7 @@ class Turn {
     this.clientProgressAt = this.lastProgressAt
     this.deadlineAt = null
     this.baseHistory = trailingMessages({ messages }).history.map((message) => ({ ...message }))
+    this.requestMessagesHash = digest(stableJSON(messages))
     this.events = []
     this.waiters = []
     this.calls = []
@@ -975,6 +977,10 @@ class Turn {
     this.done = false
     this.finalized = false
     this.cancelRequested = false
+    this.clientCancelled = false
+    this.cancelAcknowledged = false
+    this.cancelContinuation = false
+    this.cancelledExpectedHash = null
     this.agentError = false
     this.deliveredTextChars = 0
     this.deliveredThinkingChars = 0
@@ -1211,7 +1217,23 @@ class Turn {
     this.done = true
     for (const attempt of [this.promptAttempt, ...this.steeringAttempts].filter(Boolean)) {
       if (!attempt.submitted) releasePromptAttempt(attempt)
-      else if (result?.stopReason === "cancelled") settlePromptAttempt(attempt)
+      else if (result?.stopReason === "cancelled") {
+        // Only an acknowledged client cancellation can authorize another nudge.
+        // Cancelling an unsent nudge preserves the already-submitted original.
+        const canContinue = this.clientCancelled &&
+          (this.cancelAcknowledged || (this.cancelContinuation && !this.promptSubmitted)) &&
+          !this.agentError && !this.proc.dead && !this.proc.stopping && !this.proc.retiring &&
+          !this.proc.compaction && !this.calls.length && !this.awaitCalls.length &&
+          !this.steeringAttempts.length && attempt === this.promptAttempt
+        if (canContinue) {
+          this.proc.cancelledTurn = {
+            attempt,
+            requestMessagesHash: this.requestMessagesHash,
+            expectedMessagesHash: this.cancelledExpectedHash,
+          }
+        }
+        settlePromptAttempt(attempt, null, canContinue ? { clientCancelled: true, proc: this.proc } : {})
+      }
       // A successful submitted attempt is released by finalizeTurn only after
       // its response has been delivered to the stream without throwing.
     }
@@ -1222,6 +1244,7 @@ class Turn {
   fail(error) {
     if (this.done || this.finalized) return
     this.done = true
+    this.proc.invalidateCancelledTurn()
     for (const attempt of [this.promptAttempt, ...this.steeringAttempts].filter(Boolean)) {
       if (attempt.submitted) settlePromptAttempt(attempt, error)
       else releasePromptAttempt(attempt)
@@ -1388,6 +1411,8 @@ class Proc {
     this.hasSentFirstTurn = false
     this.historyInvalid = false
     this.unsentPrompt = null
+    this.cancelledTurn = null
+    this.continuingCancel = false
     this.turn = null
     this.expectedMessages = null
     this.toolsVersion = 1
@@ -1756,7 +1781,10 @@ class Proc {
     }
   }
 
-  startTurn(content, messages, model, selection, promptAttempt = null, promptGuardMatched = false, compactionStages = []) {
+  startTurn(content, messages, model, selection, promptAttempt = null, promptGuardMatched = false, compactionStages = [], cancelContinuation = false) {
+    if (this.continuingCancel && !cancelContinuation) {
+      throw new BusyError("agy bridge: this conversation is continuing a cancelled response")
+    }
     if (this.dead) throw this.deadError
     if (this.retiring) throw new BusyError("agy bridge: this conversation's process is being retired")
     if (this.turn) throw new BusyError("agy bridge: this conversation still has an unfinished response")
@@ -1767,10 +1795,17 @@ class Proc {
     logBridgeEvent(this, null, "prompt_prepared", this.hasSentFirstTurn ? "continuation" : "history_replay", {}, {
       prompt_text_bytes: textBytes, prompt_parts: content.length,
     })
+    this.continuingCancel = false
+    this.invalidateCancelledTurn()
     const turn = new Turn(this, messages)
     turn.compactionStages = compactionStages.slice()
     turn.hiddenCompactionOutput = compactionStages.length > 0
+    turn.cancelContinuation = cancelContinuation
     turn.promptAttempt = promptAttempt
+    if (promptAttempt) {
+      promptAttempt.proc = this
+      promptAttempt.turn = turn
+    }
     turn.promptGuardMatched = promptGuardMatched
     this.turn = turn
     this.expectedMessages = messages.map((message) => ({ ...message }))
@@ -1783,9 +1818,38 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    if (historyKey(this.expectedMessages) === historyKey(messages)) return true
-    return sameToolUseIdentities(this.expectedMessages, messages) &&
-      historyKey(stripToolUseInputs(this.expectedMessages)) === historyKey(stripToolUseInputs(messages))
+    return sameMessageHistory(this.expectedMessages, messages)
+  }
+
+  invalidateCancelledTurn() {
+    const attempt = this.cancelledTurn?.attempt
+    this.cancelledTurn = null
+    // Terminal dedup records retain only the failed request's digest once the
+    // live-session exception expires. Do not keep retired process/history graphs
+    // reachable through the six-hour attempt cache. A claimed continuation is
+    // already active and retains its references until it settles normally.
+    if (attempt?.terminal && attempt.proc === this) {
+      attempt.proc = null
+      attempt.clientCancelled = false
+    }
+  }
+
+  matchesCancelledTurnMessages(messages) {
+    if (this.historyInvalid || !this.hasSentFirstTurn || !Array.isArray(this.expectedMessages) ||
+      !Array.isArray(messages) || !messages.length || !this.cancelledTurn) {
+      return false
+    }
+    if (this.cancelledTurn.requestMessagesHash !== digest(stableJSON(messages)) ||
+      this.cancelledTurn.expectedMessagesHash !== digest(stableJSON(this.expectedMessages))) {
+      return false
+    }
+    if (this.expectedMessages.length !== messages.length &&
+      !(this.expectedMessages.length === messages.length + 1 &&
+        this.expectedMessages[messages.length]?.role === "assistant" &&
+        assistantTextOf(this.expectedMessages[messages.length]) !== null)) {
+      return false
+    }
+    return stableJSON(this.expectedMessages.slice(0, messages.length)) === stableJSON(messages)
   }
 
   // Clients such as Claude Code normalize tool_use inputs when recording an
@@ -1853,7 +1917,7 @@ class Proc {
         // A cancel that arrived before the prompt would be ignored by agy.
         if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
-          if (this.hasSentFirstTurn) this.unsentPrompt = promptParts
+          if (this.hasSentFirstTurn && !turn.cancelContinuation) this.unsentPrompt = promptParts
           turn.complete({ stopReason: "cancelled" })
           return
         }
@@ -1891,6 +1955,9 @@ class Proc {
         }
         if (turn.refusedDetail) throw this.#formatAgentError(turn.refusedDetail, turn.promptGuardMatched)
         if (turn.cancelRequested) {
+          turn.flushText(true)
+          turn.cancelAcknowledged = ["cancelled", "end_turn"].includes(result?.stopReason) &&
+            !turn.notices.failureCandidate && !await lastAgentError(this.logPath, turn.logOffset)
           turn.complete({ stopReason: "cancelled" })
           return
         }
@@ -2005,7 +2072,10 @@ class Proc {
       }
     } catch (error) {
       if (turn.cancelRequested && !this.dead) {
-        turn.complete({ stopReason: "cancelled" })
+        // ACP rejection/transport failure during cancellation is an unknown
+        // outcome, not evidence that the client cancellation completed safely.
+        if (!turn.promptSubmitted) turn.complete({ stopReason: "cancelled" })
+        else turn.fail(error)
         return
       }
       if (error instanceof AgentTurnError && !this.dead && !turn.calls.length) {
@@ -2023,8 +2093,8 @@ class Proc {
       turn.promptInFlight = false
       clearTimeout(turn.timer)
       this.lastUsed = Date.now()
-      turn.settle()
       if (turn.cancelRequested) this.finalizeTurn(turn)
+      turn.settle()
     }
   }
 
@@ -2060,14 +2130,24 @@ class Proc {
 
   // Cancel a turn the client stopped reading. The session stays usable; the
   // partial answer the client saw becomes part of the expected history.
-  cancelTurn(turn, partialContent) {
+  cancelTurn(turn, partialContent, clientCancelled = false) {
     if (turn.cancelRequested || turn.done || turn.finalized) return false
     if (turn.hasPendingMcp() || this.dead) return false
+    this.invalidateCancelledTurn()
     turn.cancelRequested = true
     if (turn.stepsFile) this.stepUsageTrusted = false
     turn.detach()
     if (this.expectedMessages && partialContent.length) {
       this.expectedMessages.push({ role: "assistant", content: partialContent })
+    }
+    if (this.compaction && turn.promptAttempt?.submitted) {
+      settlePromptAttempt(turn.promptAttempt)
+    } else if (clientCancelled && !this.compaction && !turn.calls.length &&
+      !turn.steeringAttempts.length && !turn.compactionStages?.length) {
+      turn.clientCancelled = true
+      turn.cancelledExpectedHash = Array.isArray(this.expectedMessages)
+        ? digest(stableJSON(this.expectedMessages))
+        : null
     }
     this.conn.notify("session/cancel", { sessionId: this.sessionId })
     const timer = setTimeout(() => {
@@ -2267,6 +2347,7 @@ class Proc {
   }
 
   continueWith(results) {
+    this.invalidateCancelledTurn()
     const turn = this.turn
     if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
     turn.touchClient()
@@ -2300,6 +2381,7 @@ class Proc {
   }
 
   async steerTurn(turn, results, content, body, model, selection, promptAttempt, promptGuardMatched, signal) {
+    this.invalidateCancelledTurn()
     this.steering = true
     try {
       await this.updateTools(normalizeTools(body))
@@ -2510,6 +2592,8 @@ class Proc {
     if (this.dead) return
     this.dead = true
     this.deadError = error
+    this.invalidateCancelledTurn()
+    this.continuingCancel = false
     this.conn?.close(error)
     if (this.configExpectation) {
       clearTimeout(this.configExpectation.timer)
@@ -2525,7 +2609,7 @@ class Proc {
 
   canPark() {
     return !!this.sessionId && this.hasSentFirstTurn && !this.historyInvalid && !this.turn &&
-      !this.dead && !this.steering && Array.isArray(this.expectedMessages)
+      !this.dead && !this.steering && !this.continuingCancel && Array.isArray(this.expectedMessages)
   }
 
   stop() {
@@ -2887,6 +2971,8 @@ function restoreParked(reservation) {
 
 async function retire(key, proc) {
   proc.retiring = true
+  proc.invalidateCancelledTurn()
+  proc.continuingCancel = false
   park(proc)
   if (pool.get(key) === proc) pool.delete(key)
   await proc.stop().catch(() => {})
@@ -2896,7 +2982,7 @@ async function evictIdle() {
   const cutoff = Date.now() - IDLE_MS
   const victims = []
   for (const [key, proc] of pool) {
-    if (proc.retiring || proc.steering) continue
+    if (proc.retiring || proc.steering || proc.continuingCancel) continue
     if (proc.dead || (!proc.turn && proc.lastUsed < cutoff)) victims.push([key, proc])
   }
   for (const [key, proc] of victims) await retire(key, proc)
@@ -2966,7 +3052,7 @@ function matchingReclaimedRoute(convKey, opts) {
 async function evictLRU() {
   let oldest = null
   for (const [key, proc] of pool) {
-    if (proc.turn || proc.retiring || proc.steering) continue
+    if (proc.turn || proc.retiring || proc.steering || proc.continuingCancel) continue
     if (!oldest || proc.lastUsed < oldest.proc.lastUsed) oldest = { key, proc }
   }
   if (oldest) {
@@ -3014,7 +3100,7 @@ async function withAcquireLock(key, fn) {
 }
 
 function findFlattenedProc(opts) {
-  const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && proc.hasSentFirstTurn &&
+  const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && !proc.continuingCancel && proc.hasSentFirstTurn &&
     (proc.account || null) === (opts.account || null) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
     proc.workDir === opts.workDir && proc.model === opts.model && proc.toolsSignature === JSON.stringify(opts.tools) &&
     sameInstructions(proc.instructions, opts.instructions) && isContinuedOpening(proc, opts.messages?.[0]))
@@ -3025,10 +3111,10 @@ function findFlattenedProc(opts) {
 async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew = false) {
   let extra = null
   for (let attempt = 0; ; attempt++) {
-    const keys = [...new Set([convKey, extra].filter(Boolean))].sort()
+    const keys = [...new Set([convKey, opts.ownerKey, extra].filter(Boolean))].sort()
     const lock = (i, fn) => i === keys.length ? fn() : withAcquireLock(keys[i], () => lock(i + 1, fn))
     const result = await lock(0, async () => {
-      const candidate = isFreshConversation && !forceNew && !pool.has(convKey) ? findFlattenedProc(opts) : null
+      const candidate = isFreshConversation && !forceNew && !pool.has(convKey) && !opts.cancelContinuation ? findFlattenedProc(opts) : null
       if (candidate && !keys.includes(candidate.convKey)) {
         if (attempt < 2) return { retry: candidate.convKey }
         return { value: await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew) }
@@ -3098,6 +3184,40 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   await evictIdle()
   convKey = conversationSlot(convKey, opts, forceNew)
   let existing = pool.get(convKey)
+  // The retry claim reserves this process before acquisition yields. Ordinary
+  // requests must not change its tools or retire it before the nudge starts.
+  if (existing?.continuingCancel && !opts.cancelContinuation) {
+    throw new BusyError("agy bridge: this conversation is continuing a cancelled response")
+  }
+  if (opts.cancelContinuation) {
+    if (existing !== opts.cancelContinuationProc || existing.dead || existing.stopping || existing.retiring ||
+      existing.turn || existing.steering || existing.cancelledTurn?.attempt !== opts.promptAttempt ||
+      existing.workDir !== opts.workDir || !sameInstructions(existing.instructions, opts.instructions) ||
+      existing.toolsSignature !== JSON.stringify(opts.tools) ||
+      existing.currentModel !== opts.model ||
+      existing.currentSelectionKey !== stableJSON({ model: opts.model, selection: opts.selection }) ||
+      !existing.matchesCancelledTurnMessages(opts.messages)) {
+      if (opts.cancelContinuationProc) {
+        opts.cancelContinuationProc.continuingCancel = false
+        opts.cancelContinuationProc.invalidateCancelledTurn()
+      }
+      throw new PromptOutcomeUnknownError(existing?.deadError)
+    }
+    try {
+      await existing.updateTools(opts.tools)
+    } catch (error) {
+      existing.continuingCancel = false
+      existing.invalidateCancelledTurn()
+      throw new PromptOutcomeUnknownError(existing.deadError || error)
+    }
+    if (existing.dead || existing.stopping || existing.retiring || existing.turn ||
+      existing.cancelledTurn?.attempt !== opts.promptAttempt) {
+      existing.continuingCancel = false
+      existing.invalidateCancelledTurn()
+      throw new PromptOutcomeUnknownError(existing.deadError)
+    }
+    return { proc: existing, history: opts.messages }
+  }
   if (existing?.steering) throw new BusyError("agy bridge: this conversation is accepting user steering")
   if (existing?.turn?.cancelRequested) {
     await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
@@ -3439,6 +3559,13 @@ function sameToolUseIdentities(left, right) {
   const a = toolUseIdentitiesKey(left)
   const b = toolUseIdentitiesKey(right)
   return a != null && a === b
+}
+
+function sameMessageHistory(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return false
+  if (historyKey(expected) === historyKey(actual)) return true
+  return sameToolUseIdentities(expected, actual) &&
+    historyKey(stripToolUseInputs(expected)) === historyKey(stripToolUseInputs(actual))
 }
 
 
@@ -3966,14 +4093,83 @@ function releasePromptAttempt(attempt) {
   if (attempt && promptAttempts.get(attempt.key) === attempt) promptAttempts.delete(attempt.key)
 }
 
-function settlePromptAttempt(attempt, error = null) {
+function settlePromptAttempt(attempt, error = null, { clientCancelled = false, proc = null } = {}) {
   if (!attempt || promptAttempts.get(attempt.key) !== attempt) return
   attempt.terminal = true
   attempt.error = error
+  attempt.clientCancelled = Boolean(clientCancelled && !error && proc && !proc.dead && !proc.stopping && !proc.retiring)
+  attempt.proc = attempt.clientCancelled ? proc : null
+  attempt.turn = null
   attempt.at = Date.now()
 }
 
-function claimPromptAttempt(key) {
+function canContinueCancelledAttempt(attempt, agy, opts) {
+  if (!attempt?.terminal || !attempt.submitted || !attempt.clientCancelled || attempt.error) return false
+  if (!opts || opts.compaction) return false
+  const proc = attempt.proc
+  if (!proc || proc.dead || proc.stopping || proc.retiring || proc.compaction || proc.historyInvalid) return false
+  if (!proc.hasSentFirstTurn || !proc.sessionId || proc.turn || proc.steering || proc.continuingCancel) return false
+  if (pool.get(proc.convKey) !== proc || proc.cancelledTurn?.attempt !== attempt) return false
+  if ((proc.account ?? null) !== (opts.account ?? null) || proc.agyPath !== agy || proc.userId !== (opts.userId || "")) return false
+  if (proc.workDir !== opts.workDir || !sameInstructions(proc.instructions, opts.instructions)) return false
+  if (proc.toolsSignature !== JSON.stringify(opts.tools)) return false
+  if (proc.currentModel !== opts.model ||
+    proc.currentSelectionKey !== stableJSON({ model: opts.model, selection: opts.selection })) return false
+  return proc.matchesCancelledTurnMessages(opts.messages)
+}
+
+function findMatchingCancelledProc(convKey, messages) {
+  const inFamily = (slot) => slot === convKey || slot.startsWith(`${convKey}:fork:`)
+  for (const [slot, proc] of pool) {
+    if (!inFamily(slot) || !proc.cancelledTurn) continue
+    if (proc.cancelledTurn.requestMessagesHash === digest(stableJSON(messages))) return proc
+  }
+  return null
+}
+
+async function settlePendingCancelledAttempt(key, convKey, messages, signal) {
+  const inFamily = (slot) => slot === convKey || slot.startsWith(`${convKey}:fork:`)
+  let existing = promptAttempts.get(key)
+  if (!existing) {
+    for (const [slot, proc] of pool) {
+      if (!inFamily(slot)) continue
+      if (proc.turn?.clientCancelled && proc.turn.requestMessagesHash === digest(stableJSON(messages))) {
+        existing = proc.turn.promptAttempt
+        break
+      }
+    }
+  }
+  const turn = existing?.turn
+  if (!existing || existing.terminal || !turn?.clientCancelled || turn.finalized) return
+  if (existing.waitingForCancel) {
+    throw new BusyError("agy bridge: this identical prompt is already being acquired or running")
+  }
+  existing.waitingForCancel = true
+  try {
+    let timer = null
+    await Promise.race([
+      turn.settled,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, CANCEL_SETTLE_MS)
+        timer.unref?.()
+      }),
+    ]).finally(() => clearTimeout(timer))
+    if (signal?.aborted) throw signal.reason || new Error("request aborted before prompt submission")
+    if (!turn.finalized) {
+      const proc = existing.proc || turn.proc
+      if (proc) {
+        dropFromPool(proc)
+        proc.abandonTurn(turn)
+        proc.stop().catch(() => {})
+      }
+      settlePromptAttempt(existing)
+    }
+  } finally {
+    existing.waitingForCancel = false
+  }
+}
+
+function claimPromptAttempt(key, agy = null, acquireOpts = null) {
   const now = Date.now()
   const existing = promptAttempts.get(key)
   if (existing) {
@@ -3983,7 +4179,24 @@ function claimPromptAttempt(key) {
       // Refresh LRU order without extending the terminal record's TTL.
       promptAttempts.delete(key)
       promptAttempts.set(key, existing)
-      if (existing.terminal) throw new PromptOutcomeUnknownError(existing.error)
+      if (existing.terminal) {
+        if (canContinueCancelledAttempt(existing, agy, acquireOpts)) {
+          const proc = existing.proc
+          existing.terminal = false
+          existing.clientCancelled = false
+          existing.continuation = true
+          proc.continuingCancel = true
+          proc.lastUsed = now
+          acquireOpts.cancelContinuation = true
+          acquireOpts.cancelContinuationProc = proc
+          acquireOpts.promptAttempt = existing
+          acquireOpts.ownerKey = proc.convKey
+          return existing
+        }
+        existing.clientCancelled = false
+        existing.proc = null
+        throw new PromptOutcomeUnknownError(existing.error)
+      }
       throw new BusyError("agy bridge: this identical prompt is already being acquired or running")
     }
   }
@@ -3995,7 +4208,18 @@ function claimPromptAttempt(key) {
     if (!oldest) throw new BusyError("agy bridge: too many prompt attempts are still in progress")
     promptAttempts.delete(oldest.key)
   }
-  const attempt = { key, at: now, submitted: false, terminal: false, error: null }
+  const attempt = {
+    key,
+    at: now,
+    submitted: false,
+    terminal: false,
+    error: null,
+    clientCancelled: false,
+    continuation: false,
+    waitingForCancel: false,
+    proc: null,
+    turn: null,
+  }
   promptAttempts.set(key, attempt)
   return attempt
 }
@@ -5264,7 +5488,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
       const abort = () => {
         if (finished) return
         detach()
-        if (!proc.cancelTurn(turn, partial())) {
+        if (!proc.cancelTurn(turn, partial(), true)) {
           dropFromPool(proc)
           proc.abandonTurn(turn)
           proc.stop().catch(() => {})
@@ -5577,13 +5801,15 @@ function streamResponse(proc, turn, body, signal, retryInitialAuth = null) {
   })
 }
 
-async function beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt = null, promptGuardMatched = false) {
+async function beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt = null, promptGuardMatched = false, cancelContinuation = false) {
   const flattened = proc.pendingFlattenedTurn
   proc.pendingFlattenedTurn = null
-  const contentParts = proc.hasSentFirstTurn
-    ? mergePromptParts(renderContinuedTurnParts(flattened ? [flattened, ...body.messages.slice(1)] : body.messages.slice(history.length)), outputFormatReminder(body))
-    : renderReplayPromptParts(body, callerWorkDir, proc.instructionsInSession,
-      proc.instructionsInSession ? proc.instructions : "")
+  const contentParts = cancelContinuation
+    ? mergePromptParts([{ type: "text", text: CANCEL_CONTINUATION_PROMPT }], outputFormatReminder(body))
+    : proc.hasSentFirstTurn
+      ? mergePromptParts(renderContinuedTurnParts(flattened ? [flattened, ...body.messages.slice(1)] : body.messages.slice(history.length)), outputFormatReminder(body))
+      : renderReplayPromptParts(body, callerWorkDir, proc.instructionsInSession,
+        proc.instructionsInSession ? proc.instructions : "")
   if (promptHasImage(contentParts) && !proc.supportsImages) {
     if (!proc.hasSentFirstTurn) {
       dropFromPool(proc)
@@ -5591,7 +5817,7 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
     }
     throw new UnsupportedContent("image input with this agy ACP server; update to an image-capable agy version")
   }
-  return proc.startTurn(contentParts, body.messages, model, selection, promptAttempt, promptGuardMatched)
+  return proc.startTurn(contentParts, body.messages, model, selection, promptAttempt, promptGuardMatched, [], cancelContinuation)
 }
 
 // Native Magpie sign-in forms (auth.methods[].prompts + authorize(inputs)) that
@@ -5950,10 +6176,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 validateReplay: () => validateAcpPromptBudget(
                   renderReplayPromptParts(body, callerWorkDir, systemAppend() && !!instructions, instructions),
                   systemAppend() ? instructions : "", body) }
-              const claim = () => {
+              const claim = (continuationOpts = null) => {
                 if (!promptAttempt) {
                   const key = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)
-                  promptAttempt = claimPromptAttempt(key)
+                  promptAttempt = claimPromptAttempt(key, agy, continuationOpts)
                 }
                 return promptAttempt
               }
@@ -5962,11 +6188,15 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 // SSE response exists. A caller that left during those awaits
                 // must never submit a prompt when the handshake finally returns.
                 if (init.signal?.aborted) {
-                  dropFromPool(proc)
-                  await proc.stop().catch(() => {})
+                  if (!acquireOpts.cancelContinuation) {
+                    dropFromPool(proc)
+                    await proc.stop().catch(() => {})
+                  } else {
+                    proc.continuingCancel = false
+                  }
                   throw init.signal.reason || new Error("request aborted before prompt submission")
                 }
-                return beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched)
+                return beginTurn(proc, history, body, callerWorkDir, model, selection, promptAttempt, promptGuardMatched, acquireOpts.cancelContinuation)
               }
               if (resultBlocks.length) {
                 const matches = matchToolResults(body, resultBlocks, account.name)
@@ -6108,7 +6338,15 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 }
               }
 
-              claim()
+              if (!resultBlocks.length) {
+                const attemptKey = promptAttemptKey(convKey, body, trailing, model, selection, tools, instructions)
+                await settlePendingCancelledAttempt(attemptKey, convKey, body.messages, init.signal)
+                const cancelledProc = findMatchingCancelledProc(convKey, body.messages)
+                if (cancelledProc && cancelledProc.cancelledTurn?.attempt?.key !== attemptKey) {
+                  throw new PromptOutcomeUnknownError()
+                }
+              }
+              claim(!resultBlocks.length ? acquireOpts : null)
               const { proc, history } = await acquireProc(
                 agy,
                 convKey,
@@ -6117,7 +6355,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 resultBlocks.length > 0,
               )
               const turn = await begin(proc, history)
-              const retryInitialAuth = resultBlocks.length > 0 ? null : async (failedProc, failedTurn) => {
+              const retryInitialAuth = resultBlocks.length > 0 || acquireOpts.cancelContinuation ? null : async (failedProc, failedTurn) => {
                 failedTurn.detach()
                 failedProc.finalizeTurn(failedTurn)
                 if (history.length > 0 && failedProc.sessionId) {
@@ -6150,7 +6388,17 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               }
               return streamResponse(proc, turn, body, init.signal, retryInitialAuth)
             } catch (error) {
-              if (promptAttempt && !promptAttempt.submitted) releasePromptAttempt(promptAttempt)
+              if (promptAttempt && !promptAttempt.turn) {
+                if (!promptAttempt.submitted) releasePromptAttempt(promptAttempt)
+                else if (!promptAttempt.terminal) {
+                  const proc = promptAttempt.proc
+                  if (proc) proc.continuingCancel = false
+                  const canRestore = Boolean(init.signal?.aborted && proc && !proc.dead && !proc.stopping &&
+                    !proc.retiring && proc.cancelledTurn?.attempt === promptAttempt)
+                  settlePromptAttempt(promptAttempt, canRestore ? null : error,
+                    canRestore ? { clientCancelled: true, proc } : {})
+                }
+              }
               return jsonError(error.statusCode ?? 502, error.message, error.code, error.noRetry)
             }
           },

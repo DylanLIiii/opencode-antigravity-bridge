@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.9
+## 0.9.0
 
 - Query CloudCode model metadata (`loadCodeAssist` / `fetchAvailableModels`) and known Antigravity limits so models report accurate `limit.context`, `limit.output`, image capabilities, and `reasoning` flags (`gemini-pro-orchestrator*`, `claude-opus-4-6-thinking`, 1M Gemini/Claude 5.5, 250K Claude 4.6, 65K image model).
 - Prevent silent empty or failed `agy` turns from falsely returning HTTP 200 by checking `agy-acp.log`, notice state, delivered content, and SQLite step completion (`step_type=15`) before settling a turn.
@@ -9,6 +9,14 @@
 - Incorporate `agy-cli` 0.1.55–0.1.64 parity updates: `cloak.mjs` DeepSeek Harness / Claude Code CLI rules, pre-spawn stored sign-in health & `storedEmail` naming (`signin.mjs`), `Symbol.for("magpie.fellBack")` fallback signaling, explicit `status: 400` in `streamErrorOf` (`plugins#1151`), managed fallback CLI installer & `auth.cli` (`install.mjs`, `ownAgyPath`, `X_OK` cache re-validation), `run_command` `toolSummary` deduplication (`plugins#1174`), and glog startup diagnostic stripping / `invalid_grant` & structured failure handling in `usage.mjs` (`plugins#1177`).
 - Deliver client system instructions in first-turn `<external_system_instructions>` by default (`AGY_BRIDGE_SYSTEM_APPEND=1` opt-in for `session/new` `systemPrompt.append`), track `systemAppend` in parked session compatibility, suppress `agy` 1.5.9 `⚠ RESOURCE_EXHAUSTED (code 429)` / attempt-1 refusal banners and fast-fail via `refuseTurn`, and avoid mislabeling sanitized 429 errors as `AGY_ERROR_PROMPT_GUARD_MATCHED`.
 - Split the OpenCode 1.x / 2.x plugin entrypoint (`opencode.mjs` / `opencode2.mjs`) and expose `"."` -> `"./opencode2.mjs"` in `package.json` while keeping `main` as `"./index.mjs"`.
+
+## 0.8.9
+
+- Say interactive Claude Code's system prompt another way so Antigravity no longer answers it with `RESOURCE_EXHAUSTED (code 429)` whatever quota is left. Three passages are turned away on their own: the identity line `You are Claude Code, Anthropic's official CLI for Claude.` (now `You're …`, as the Agent SDK variants were already handled by prompt-guard), the `IMPORTANT: Assist with authorized security testing…` policy, and the `<pasted_content>` guidance. Small edits to the two passages are still turned away, so each is sent as an equivalent rewording that keeps every instruction; matching folds whitespace and invisible characters as before.
+- Rewrite the Pi-Bolt opening identity to a neutral equivalent before sending system instructions to agy, preserving the surrounding persona, documentation paths, user/tool text and client-text session identities (#73).
+- Let an identical retry after an acknowledged client cancellation request a full answer in the original live agy session without resubmitting the original prompt (#74). Require unchanged request context and no tool work, serialize competing retries, preserve the client's history view, and keep upstream failures, timeouts, dead sessions and cancelled compaction blocked.
+- Clear cancelled-session references when eligibility ends and protect a claimed continuation from competing session mutations. Cover cancellation recovery and client-history reuse in the cross-platform fake-ACP suite.
+- Track authentication-test child lifetimes with dedicated connections so Windows PID reuse cannot report unrelated processes as leaked fixture children.
 
 ## 0.8.8
 

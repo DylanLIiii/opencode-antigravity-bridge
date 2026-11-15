@@ -20,7 +20,7 @@ const send = value => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...v
 if (process.argv.includes("--version")) { console.log("1.5.4"); process.exit(0) }
 if (process.argv.includes("models")) { console.log("gemini-test-high\tTest High"); process.exit(0) }
 log({ kind: "spawn" })
-let sessionId, model = "other", effort = "low", append = "", fragments = 0
+let sessionId, model = "other", effort = "low", append = "", fragments = 0, cancelPrompt = null
 const options = () => [
   { id: "model", category: "model", type: "select", currentValue: model, options: ["other", "gemini-test"].map(value => ({ value, name: value })) },
   { id: "thought_level", category: "thought_level", type: "select", currentValue: effort,
@@ -62,10 +62,24 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     return
   }
   if (msg.method === "session/set_model") { model = p.modelId; return reply({}) }
+  if (msg.method === "session/cancel") {
+    cancelPrompt?.({ stopReason: "cancelled" })
+    cancelPrompt = null
+    return
+  }
   if (msg.method === "session/prompt") {
     log({ kind: "prompt", append, model, effort, prompt: p.prompt })
     const text = p.prompt.map(part => part.text || "").join("")
     const chunk = text => send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })
+    if (text.startsWith("CANCEL_RETRY original")) {
+      cancelPrompt = reply
+      if (mode !== "cancel-before-text") chunk("Partial answer")
+      return
+    }
+    if (text === "[The previous reply was interrupted before it finished. Answer my last message again, in full.]") {
+      chunk("Complete replacement answer")
+      return reply({ stopReason: "end_turn" })
+    }
     if (text.includes("[Bridge compaction fragment ")) {
       fragments++
       if (mode === "compaction-failure" && fragments === 2) {
@@ -73,6 +87,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
         return reply({ stopReason: "end_turn" })
       }
       if (mode === "compaction-refusal") return reply({ stopReason: "refusal" })
+      if (mode === "compaction-cancel") { cancelPrompt = reply; return }
       if (mode === "compaction-hang") return
       chunk("ACK-INTERNAL")
       return reply({ stopReason: "end_turn", usage: { inputTokens: 10, outputTokens: 2 } })
@@ -232,19 +247,72 @@ test("a customized compaction-looking prompt keeps the ordinary request and inst
   assert.ok(promptText.includes(latest))
 })
 
-test("cancelling an ingestion prompt prevents remaining fragments from being submitted", async () => {
-  process.env.COMPAT_MODE = "compaction-hang"
-  const client = await loader()
-  const abort = new AbortController()
-  const before = logs().length
-  const response = await request(client, summaryMessages(), { stream: true }, abort.signal)
-  const reading = response.text().catch(() => "aborted")
-  await waitFor(() => logs().slice(before).some(event => event.kind === "prompt"))
-  abort.abort()
-  await reading
-  await waitFor(() => logs().slice(before).some(event => event.method === "session/cancel"))
-  assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, 1)
+test("cancelling an ingestion prompt prevents remaining fragments from being submitted and blocks retry", async () => {
+  for (const mode of ["compaction-hang", "compaction-cancel"]) {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const abort = new AbortController()
+    const before = logs().length
+    const messages = summaryMessages()
+    const response = await request(client, messages, { stream: true }, abort.signal)
+    const reading = response.text().catch(() => "aborted")
+    await waitFor(() => logs().slice(before).some(event => event.kind === "prompt"))
+    abort.abort()
+    await reading
+    await waitFor(() => logs().slice(before).some(event => event.method === "session/cancel"))
+    if (mode === "compaction-cancel") {
+      await waitFor(() => logs().slice(before).some(event => event.kind === "response" && event.method === "session/prompt"))
+    }
+    assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, 1)
+    const retry = await request(client, messages, { stream: true })
+    const payload = await retry.json()
+    assert.equal(retry.status, 409)
+    assert.equal(payload.error?.code, "prompt_outcome_unknown")
+    assert.equal(retry.headers.get("x-should-retry"), "false")
+    assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, 1)
+  }
 })
+
+for (const mode of ["cancel-before-text", "cancel-partial"]) for (const stream of [true, false]) {
+  test(`client cancellation continues once in the original session: ${mode}, retry stream=${stream}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const start = logs().length
+    const messages = [{ role: "user", content: `CANCEL_RETRY original ${mode} ${stream}` }]
+    const abort = new AbortController()
+    const response = await request(client, messages, { stream: true }, abort.signal)
+    const reader = response.body.getReader()
+    if (mode === "cancel-partial") {
+      let text = ""
+      while (!text.includes("Partial answer")) {
+        const chunk = await reader.read()
+        assert.equal(chunk.done, false)
+        text += new TextDecoder().decode(chunk.value)
+      }
+      await reader.cancel()
+    } else {
+      await waitFor(() => logs().slice(start).some(event => event.kind === "prompt"))
+      abort.abort()
+      await reader.read().catch(() => {})
+    }
+    const retry = await request(client, messages, { stream })
+    const raw = await retry.text()
+    assert.equal(retry.status, 200, raw)
+    assert.match(raw, /Complete replacement answer/)
+    const prompts = logs().slice(start).filter(event => event.kind === "prompt")
+    assert.equal(prompts.length, 2, "one original submission and one nudge")
+    assert.equal(prompts[0].pid, prompts[1].pid)
+    assert.equal(prompts[1].prompt.map(part => part.text || "").join(""),
+      "[The previous reply was interrupted before it finished. Answer my last message again, in full.]")
+    const followup = await request(client, [...messages,
+      { role: "assistant", content: "Complete replacement answer" }, { role: "user", content: "next task" }])
+    assert.equal(followup.status, 200, await followup.text())
+    const sent = logs().slice(start).filter(event => event.kind === "prompt")
+    assert.equal(sent.length, 3)
+    assert.equal(sent[2].pid, prompts[0].pid)
+    assert.equal(sent[2].prompt.map(part => part.text || "").join(""), "next task")
+  })
+}
 
 for (const mode of ["response-first", "notification-first", "legacy", "legacy-hang", "unsupported", "missing", "missing-effort", "cross-session", "conflict", "conflict-effort", "bad-response", "real-error", "close", "hang"]) {
   test(`configuration protocol: ${mode}`, async () => {

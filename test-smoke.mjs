@@ -1180,15 +1180,19 @@ async function launchedModel(body) {
   const rfc = "RFC 2119 keywords: MUST, REQUIRED,\nSHOULD, RECOMMENDED, MAY, OPTIONAL."
   const codex = "You are Codex, an agent based on GPT-5"
   const hermes = "Hermes Agent, an intelligent AI assistant created by Nous Research"
-  const rawUser = `User text remains literal: ${sdk}\n${paths}`
-  const queued = `Queued user input: ${codex}\n${paths}`
+  const pi = "You are a coding assistant running inside Pi-Bolt"
+  const piNeutral = "You are a coding assistant running inside a tool"
+  const piDocs = "<docs>Read ~/.pi/agent/Pi-Bolt/README.md and run Pi-Bolt tools.</docs>"
+  const stock = `${pi}, a build of pi (a coding agent harness) compiled ahead of time. Help users inspect files, run commands, and modify code.\n${piDocs}`
+  const rawUser = `User text remains literal: ${sdk}\n${paths}\n${pi}`
+  const queued = `Queued user input: ${codex}\n${paths}\n${pi}`
   const body = {
-    model, system: `before\n${billing}\n${sdk}\n${paths}\nafter`,
+    model, system: `before\n${billing}\n${sdk}\n${paths}\n${stock}\nafter`,
     messages: [
       { role: "user", content: rawUser },
       { role: "system", content: `${rfc}\n${paths}` },
       { role: "developer", content: [
-        { type: "text", text: `${hermes}\n${paths}` },
+        { type: "text", text: `${hermes}\n${paths}\n${pi}.` },
         { type: "text", text: `The user sent a new message while you were working:\n${queued}` },
       ] },
     ],
@@ -1201,15 +1205,16 @@ async function launchedModel(body) {
     response.status === 200 && stopOf(events) === "end_turn" &&
     !init.systemAppend.includes(billing) && init.systemAppend.includes("Custom agent built on the Claude Agent SDK by Anthropic.") &&
     init.systemAppend.includes("When the user writes @ followed by a path") && !init.systemAppend.includes(paths) &&
+    init.systemAppend.includes(stock.replace(pi, piNeutral)) && init.systemAppend.includes(piDocs) &&
     init.systemAppend.includes("before\n") && init.systemAppend.endsWith("after"), init.systemAppend)
   check("trailing system and developer reminders are rewritten while user and queued input stay literal",
     prompt.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") &&
-    prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") &&
+    prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") && prompt.includes(`${piNeutral}.`) &&
     prompt.includes(rawUser) && prompt.includes(queued) &&
     (prompt.match(/When the user writes @ followed by a path/g) || []).length === 2, prompt)
 
   process.env.FAKE_AGY_APPEND = "0"
-  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}`, messages: [{ role: "user", content: `FALLBACK user: ${codex}` }] }
+  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}\n${pi}.`, messages: [{ role: "user", content: `FALLBACK user: ${codex}` }] }
   const fallbackResponse = await callFetch(fallbackBody)
   const fallbackEvents = (await readSSE(fallbackResponse)).events
   delete process.env.FAKE_AGY_APPEND
@@ -1218,15 +1223,15 @@ async function launchedModel(body) {
     fallbackResponse.status === 200 && stopOf(fallbackEvents) === "end_turn" && inits().at(-1).systemAppend === null &&
     fallback.includes("<external_system_instructions>") && !fallback.includes(billing) && !fallback.includes(paths) &&
     fallback.includes("When the user writes @ followed by a path") && fallback.includes("You are Codex, an agent built on GPT-5") &&
-    fallback.includes(`FALLBACK user: ${codex}`), fallback)
+    fallback.includes(`${piNeutral}.`) && fallback.includes(`FALLBACK user: ${codex}`), fallback)
 
-  const original = { model, system: codex, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
+  const original = { model, system: pi, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
   const firstEvents = (await readSSE(await callFetch(original))).events
   const firstInit = inits().at(-1)
   const second = nextTurn(original, firstEvents, "MEMORY identity unchanged")
   const secondEvents = (await readSSE(await callFetch(second))).events
   check("unchanged client instructions reuse the same session", lastOf("user").convId === firstInit.convId && stopOf(secondEvents) === "end_turn")
-  const third = { ...nextTurn(second, secondEvents, "MEMORY identity changed"), system: codex.replace("based on", "built on") }
+  const third = { ...nextTurn(second, secondEvents, "MEMORY identity changed"), system: piNeutral }
   const thirdEvents = (await readSSE(await callFetch(third))).events
   const thirdInit = inits().at(-1)
   check("distinct client instructions do not share identity even when outgoing text is the same",
@@ -1237,9 +1242,9 @@ async function launchedModel(body) {
     const first = { model, messages: [{ role: "user", content: `TOOL rewrite notices ${location}` }], tools: [echoTool] }
     const firstEvents = (await readSSE(await callFetch(first))).events
     const convId = inits().at(-1).convId
-    const toolText = `Literal tool payload: ${codex}\n${paths}\n${billing}`
+    const toolText = `Literal tool payload: ${codex}\n${paths}\n${billing}\n${pi}`
     const second = continuation(first, firstEvents, toolText)
-    const notice = { type: "text", text: `<system-reminder>${rfc}\n${paths}</system-reminder>` }
+    const notice = { type: "text", text: `<system-reminder>${rfc}\n${paths}\n${pi}</system-reminder>` }
     const update = { type: "text", text: `<system-update>${billing}</system-update>` }
     if (location === "inline") second.messages.at(-1).content.push(notice, update)
     else second.messages.push({ role: location, content: [notice, update] })
@@ -1249,7 +1254,7 @@ async function launchedModel(body) {
     const text = delivered?.result?.content?.map(part => part.text).join("\n") || ""
     check(`${location} tool-side reminders are rewritten without changing tool payload`,
       response.status === 200 && stopOf(final) === "end_turn" && text.startsWith(toolText) &&
-      text.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") && text.includes("When the user writes @ followed by a path") &&
+      text.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") && text.includes("When the user writes @ followed by a path") && text.includes(piNeutral) &&
       !text.slice(toolText.length).includes(paths) && !text.slice(toolText.length).includes(billing), text)
   }
 }

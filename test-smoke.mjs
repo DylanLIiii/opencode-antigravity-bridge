@@ -26,6 +26,7 @@ process.env.AGY_BRIDGE_CONTEXT_DIR = path.join(stateDir, "context")
 process.env.AGY_BRIDGE_MAX_PROCS = "4"
 process.env.AGY_BRIDGE_DETACHED_EVICT_MS = "30000"
 process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
+process.env.AGY_BRIDGE_CLOUDCODE_METADATA = "0"
 
 // A fake `agy` that speaks ACP on stdio and reaches the client tools the way
 // the real one does: by running `nc 127.0.0.1 <--ide-mcp-port>` from PATH.

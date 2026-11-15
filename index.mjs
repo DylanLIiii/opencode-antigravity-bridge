@@ -6431,7 +6431,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
           const offeredPromise = agy && !blocked
             ? probeOfferedModels(agy, account, configuredTimeout("AGY_BRIDGE_MODEL_PROBE_WAIT_MS", MODEL_PROBE_WAIT_MS))
             : Promise.resolve(null)
-          const cloudPromise = blocked ? Promise.resolve(null) : fetchCloudCodeModels(account, agy, true)
+          const cloudPromise = blocked ? Promise.resolve(null) : fetchCloudCodeModels(account, agy)
           const [catalog, offered, cloudData] = await Promise.all([catalogPromise, offeredPromise, cloudPromise])
           const offeredIds = new Set((offered || []).map(item => item.id))
           // ACP is an optional confirmation. Unknown/empty/failed probes must

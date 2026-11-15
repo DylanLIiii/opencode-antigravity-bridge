@@ -21,7 +21,7 @@ magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 
 | | 你得到什么 | 依据 |
 | --- | --- | --- |
-| **官方 CLI 通道** | 驱动真实的 `agy acp`（Agent Client Protocol），不逆向私有接口、不伪装 IDE | 见[工作原理](#它是怎么工作的) |
+| **官方 CLI 推理通道** | 使用真实的 `agy acp`（Agent Client Protocol）推理，可选 CloudCode 请求补充模型元数据 | 见[工作原理](#它是怎么工作的) |
 | **多账号，原生体验** | 每个 Google 账号在 Magpie 中独立成行，**共用不带前缀的普通模型 ID**，由 Magpie 的账号首选、开关与路由规则选择；会话、进程和额度按账号隔离 | 见[账号管理](#账号管理入口) |
 | **OpenCode 兼容** | 直接用 OpenCode 时，仍可用 `<账号>/<模型id>` 前缀选择账号 | 见[多账号](#多账号) |
 | **精简 agent（默认开启）** | 去掉 agy 自带约 8K 的编码 prompt；历史实测 "Reply OK" 输入 8,357 → 509（−94%） | 见[省 token 实测](#省-token-实测) |
@@ -30,10 +30,16 @@ magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 | **真正的客户端工具** | 客户端工具以 MCP 原生工具出现，支持并行、多轮、长耗时工具，每个调用只执行一次 | 见[客户端工具行为](#使用说明) |
 | **流式 · 思考 · 图片** | 文本与思考摘要流式输出，支持内联图片输入（需 agy 声明图片能力） | 见 [FAQ](#faq--注意事项) |
 | **用量看得见** | 日志区分实际输入、缓存读写、输出与思考量；Magpie Usage 页可看订阅额度 | 见[上下文与用量](#上下文窗口与压缩) |
-| **可选上下文解锁** | 默认 256K 声明；显式 `unlock` 后托管副本声明 512K（客户端策略，未端到端验证） | 见[上下文解锁](#可选上下文解锁默认关闭) |
+| **模型上下文元数据** | 优先账号元数据／已知型号限制；缺失时回退 256K，已解锁副本回退 512K。实际 CLI 可用容量仍需验证 | 见[上下文解锁](#可选上下文解锁默认关闭) |
 
 可用模型取决于你安装的 agy 版本和账号实际开放的型号：插件会按账号探测后再列出，
 不保证所有 Gemini / Claude / GPT-OSS 型号都可用。
+
+模型发现可使用所选账号已有的 OAuth access token 查询 CloudCode 的上下文、输出和图片能力，
+结果按账号缓存五分钟，刷新失败保留上次结果。设置 `AGY_BRIDGE_CLOUDCODE_METADATA=0`
+可关闭这些凭据读取和元数据请求；WSL 模式不读取 Windows 宿主凭据。元数据不代表
+已验证的 agy 端到端容量。系统指令默认放在首轮 `<external_system_instructions>` 中，
+`AGY_BRIDGE_SYSTEM_APPEND=1` 才启用 ACP 声明支持的 system append。
 
 ## 省 token 实测
 
@@ -377,13 +383,15 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
   `authenticate` 去切换登录。需要多账号时使用上方"多账号"小节的
   `--gemini_dir` 隔离方案（Magpie 使用原生账号行，OpenCode 使用 `<账号>/<模型id>` 前缀）。Windows 上
   命名账号还需要该小节的"文件登录态"开关，否则 agy 会读取整机全局的凭据管理器。
-- **Prompt Guard**：默认开启，仅处理 system 中的独立计费元数据和已知 Agent SDK
-  身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭。不会全局替换厂商名称或清洗 user 正文。
+- **Prompt Guard**：默认开启，处理 system 中的独立计费元数据和已知 Agent SDK
+  身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭该入口规范化。系统文本出口还会等义改写
+  已知不兼容短语；用户提交文本中仅 Codex GPT-5 身份短语会改写，不会全局替换厂商名称。
 - **错误与重试**：通用 `RESOURCE_EXHAUSTED` 不再被当作确定配额耗尽；已提交 Prompt
   的相同请求重试会返回 `prompt_outcome_unknown`，不会再次调用 `session/prompt`
   （客户端主动取消且原会话仍存活的情形除外，见上文“异常防重发”）。
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
-  （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。支持 append 时通过 `session/new` 安装指令；
+  （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。默认首轮用户输入携带系统指令；
+  显式启用 `AGY_BRIDGE_SYSTEM_APPEND=1` 且 ACP 支持时通过 `session/new` 安装指令；
   原生 agy 1.5+ 的 resume 会重新设置同一份 append，避免恢复后丢失，也不会累加或重复放进用户消息。
   旧版 ACP 保留原行为；恢复失败保留旧快照。
 - **超时**：启动 60s、agy 无实质输出 10min（0.6.5 起，原为 120s）、等客户端工具结果

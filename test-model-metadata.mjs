@@ -4,11 +4,12 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 
-const KEYS = ["AGY_BRIDGE_CLOUDCODE_URL", "AGY_BRIDGE_STORED_SIGNIN", "AGY_BRIDGE_DISABLE_KEYCHAIN", "AGY_BRIDGE_CLOUDCODE_METADATA", "AGY_BRIDGE_WSL_DISTRO", "HOME", "USERPROFILE"]
+const KEYS = ["AGY_BRIDGE_CLOUDCODE_URL", "AGY_BRIDGE_STORED_SIGNIN", "AGY_BRIDGE_DISABLE_KEYCHAIN", "AGY_BRIDGE_CLOUDCODE_METADATA", "AGY_BRIDGE_WSL_DISTRO"]
 const saved = Object.fromEntries(KEYS.map(k => [k, process.env[k]]))
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-metadata-"))
-// A synthetic home: os.homedir() follows HOME/USERPROFILE, so no real token is reachable.
-const home = path.join(root, "home")
+// Stub only the credential reader's home lookup; don't repurpose process HOME.
+const fixtureHome = path.join(root, "home")
+const homedir = os.homedir
 const realishAgy = path.join(process.cwd(), ".fake-agy-not-in-tmpdir")
 
 function writeToken(dir, token) {
@@ -24,8 +25,7 @@ const { fetchCloudCodeModels, invalidateModelMetadataCache, getCachedCloudCodeMo
 
 test.beforeEach(() => {
   for (const k of KEYS) delete process.env[k]
-  process.env.HOME = home
-  process.env.USERPROFILE = home
+  os.homedir = () => fixtureHome
   process.env.AGY_BRIDGE_DISABLE_KEYCHAIN = "1"
   process.env.AGY_BRIDGE_CLOUDCODE_URL = "http://cloudcode.invalid"
   calls = []
@@ -35,12 +35,13 @@ test.beforeEach(() => {
     return respond(url)
   }
   invalidateModelMetadataCache()
-  fs.rmSync(home, { recursive: true, force: true })
-  writeToken(path.join(home, ".gemini"), { access_token: "host-default-token" })
+  fs.rmSync(fixtureHome, { recursive: true, force: true })
+  writeToken(path.join(fixtureHome, ".gemini"), { access_token: "host-default-token" })
 })
 
 test.after(() => {
   globalThis.fetch = realFetch
+  os.homedir = homedir
   for (const [k, v] of Object.entries(saved)) {
     if (v === undefined) delete process.env[k]
     else process.env[k] = v

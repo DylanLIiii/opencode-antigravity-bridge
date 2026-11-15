@@ -65,7 +65,9 @@ test("CloudCode model metadata sets real context, output, image capabilities, an
     JSON.stringify({ token: { access_token: "test-cloudcode-token" } }),
   )
 
+  let metadataRequests = 0
   const server = http.createServer((req, res) => {
+    metadataRequests++
     if (req.url === "/v1internal:loadCodeAssist") {
       res.writeHead(200, { "content-type": "application/json" })
       res.end(JSON.stringify({ cloudaicompanionProject: "proj-test" }))
@@ -172,6 +174,9 @@ if (args.includes("acp")) {
     assert.equal(models["alpha/gpt-oss-120b-medium"]?.limit.context, 131_072)
     assert.equal(models["alpha/gpt-oss-120b-medium"]?.limit.output, 32_768)
     assert.equal(models["alpha/gpt-oss-120b-medium"]?.capabilities?.attachment, undefined)
+    const requestsAfterDiscovery = metadataRequests
+    await plugin.provider.models(plugin.provider, {})
+    assert.equal(metadataRequests, requestsAfterDiscovery, "catalog refresh reuses unexpired account metadata")
   } finally {
     invalidateModelMetadataCache()
     for (const [k, v] of Object.entries(prev)) {

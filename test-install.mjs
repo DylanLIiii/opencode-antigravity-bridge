@@ -7,7 +7,7 @@ import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import { gzipSync } from "node:zlib"
-import { agyPlatform, drained, installAgy, installedVersion, untarMember, updateOwnAgy } from "./install.mjs"
+import { agyPlatform, drained, installAgy, installedVersion, run, untarMember, updateOwnAgy } from "./install.mjs"
 import { agyCandidates, ownAgyPath } from "./platform.mjs"
 
 const unix = process.platform !== "win32"
@@ -209,4 +209,76 @@ test("waiting on a full stream leaves no listener behind", async () => {
   out.emit("error", new Error("disk full"))
   await assert.rejects(failed, /disk full/)
   assert.equal(out.listenerCount("drain"), 0)
+})
+
+test("an archive that can't be written out rejects instead of crashing the host", async () => {
+  const archive = path.join(root, "a.tar.gz")
+  fs.writeFileSync(archive, tar([["antigravity", Buffer.alloc(5000, 7)]]))
+  let uncaught = null
+  const onUncaught = (error) => { uncaught = error }
+  process.prependListener("uncaughtException", onUncaught)
+  try {
+    await assert.rejects(untarMember(archive, "antigravity", path.join(root, "missing", "agy")), { code: "ENOENT" })
+    await sleep(20)
+  } finally {
+    process.off("uncaughtException", onUncaught)
+  }
+  assert.equal(uncaught, null)
+})
+
+test("a download that can't be written leaves nothing and doesn't crash", { skip: !unix }, async () => {
+  release("1.5.9")
+  const bin = path.join(root, "agy")
+  const realCreate = fs.createWriteStream
+  fs.createWriteStream = (file, opts) => realCreate(path.join(root, "gone", path.basename(String(file))), opts)
+  try {
+    await assert.rejects(installAgy({ bin, platform: "linux_amd64" }), { code: "ENOENT" })
+  } finally {
+    fs.createWriteStream = realCreate
+  }
+  assert.deepEqual(fs.readdirSync(root), [])
+})
+
+test("the version check is bounded even when the binary ignores SIGTERM and a child holds its pipes", { skip: !unix }, async () => {
+  const exe = path.join(root, "stuck")
+  fs.writeFileSync(exe, "#!/bin/sh\ntrap '' TERM\n(sleep 30) &\nsleep 30\n", { mode: 0o755 })
+  const started = Date.now()
+  const r = await run(exe, ["--version"], { timeoutMs: 200, killGraceMs: 100 })
+  assert.ok(Date.now() - started < 5_000, `run took ${Date.now() - started}ms`)
+  assert.notEqual(r.code, 0)
+  assert.match(r.stopped, /timed out/)
+})
+
+test("cancelling during the version check stops it and installs nothing", { skip: !unix }, async () => {
+  const bin = path.join(root, "agy")
+  release("1.5.9", [["antigravity", Buffer.from("#!/bin/sh\nsleep 30\n")]])
+  const ctl = new AbortController()
+  const started = Date.now()
+  const done = installAgy({ bin, platform: "linux_amd64", signal: ctl.signal })
+  for (let i = 0; i < 100 && !fs.readdirSync(root).some((f) => f.startsWith(".agy-")); i++) await sleep(20)
+  await sleep(100)
+  ctl.abort()
+  await assert.rejects(done, { name: "AbortError" })
+  assert.ok(Date.now() - started < 10_000)
+  assert.deepEqual(fs.readdirSync(root), [])
+})
+
+test("on Windows a replacement that fails puts the working agy back", { skip: !unix }, async () => {
+  const bin = path.join(root, "agy.exe")
+  fs.writeFileSync(bin, "old working agy")
+  fs.writeFileSync(bin + ".version", "1.5.9\n")
+  release("1.6.0")
+  const realRename = fs.renameSync
+  fs.renameSync = (from, to) => {
+    if (to === bin && path.basename(String(from)).startsWith(".agy-")) throw Object.assign(new Error("EBUSY: locked"), { code: "EBUSY" })
+    return realRename(from, to)
+  }
+  try {
+    await assert.rejects(installAgy({ bin, platform: "windows_amd64" }), { code: "EBUSY" })
+  } finally {
+    fs.renameSync = realRename
+  }
+  assert.equal(fs.readFileSync(bin, "utf8"), "old working agy")
+  assert.equal(installedVersion(bin), "1.5.9")
+  assert.deepEqual(fs.readdirSync(root).sort(), ["agy.exe", "agy.exe.version"])
 })

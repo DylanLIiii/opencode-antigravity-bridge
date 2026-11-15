@@ -4,6 +4,7 @@
 
 - Register hook-defined providers in the OpenCode 2.x adapter and contain failed sign-in callbacks. Bound and cancel installer version checks, route archive/file errors to the caller, and preserve the working Windows binary on replacement or rollback failure.
 - Isolate fake-ACP and timeout fixtures from host sign-in/keychain state and background metadata/update requests on every platform.
+- Give native Windows sign-in fixtures their required OS environment, verify auth failures after version probing, and track model-probe lifetimes independently of reused process IDs. Increase only the fixture handshake deadline for busy CI runners.
 - Preserve latest main's Pi-Bolt/Claude Code prompt rewrites and client-cancel recovery. Review fixes keep original submission guards after later prompt rejections and require output from each compaction fragment and the final summary.
 - Treat retry-notice-only output as an empty failed response, while preserving uncorroborated terminal quotations and successful recovery output.
 - Isolate optional CloudCode credential reads from WSL and test/mock default profiles, add `AGY_BRIDGE_CLOUDCODE_METADATA=0`, honor metadata cache TTL and preserve successful metadata after transient refresh failures. Account resets invalidate in-flight cache writes.

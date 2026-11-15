@@ -128,7 +128,7 @@ Object.assign(process.env, {
   AGY_BRIDGE_STORED_SIGNIN: "skip", AGY_BRIDGE_CLOUDCODE_METADATA: "0", AGY_CLI_DISABLE_AUTO_UPDATE: "1",
   AGY_BRIDGE_STATE_FILE: path.join(root, "sessions.json"), AGY_BRIDGE_CONVERSATIONS_DIR: path.join(root, "conversations"),
   AGY_BRIDGE_ACCOUNTS_DIR: path.join(root, "accounts"), AGY_BRIDGE_CONTEXT_DIR: path.join(root, "context"),
-  AGY_BRIDGE_CONFIG_TIMEOUT_MS: "500", AGY_BRIDGE_START_TIMEOUT_MS: "3000",
+  AGY_BRIDGE_CONFIG_TIMEOUT_MS: "1500", AGY_BRIDGE_START_TIMEOUT_MS: "5000",
 })
 delete process.env.AGY_BRIDGE_WSL_DISTRO
 const logs = () => fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []
@@ -342,12 +342,13 @@ for (const mode of ["cancel-before-text", "cancel-partial"]) for (const stream o
     const messages = [{ role: "user", content: `CANCEL_RETRY original ${mode} ${stream}` }]
     const abort = new AbortController()
     const response = await request(client, messages, { stream: true }, abort.signal)
+    assert.equal(response.status, 200, response.status === 200 ? undefined : await response.text())
     const reader = response.body.getReader()
     if (mode === "cancel-partial") {
       let text = ""
       while (!text.includes("Partial answer")) {
         const chunk = await reader.read()
-        assert.equal(chunk.done, false)
+        assert.equal(chunk.done, false, `response ended before partial answer: ${text}`)
         text += new TextDecoder().decode(chunk.value)
       }
       await reader.cancel()

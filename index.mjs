@@ -1149,7 +1149,7 @@ class Turn {
   fail(error) {
     if (this.done || this.finalized) return
     this.done = true
-    this.proc.cancelledTurn = null
+    this.proc.invalidateCancelledTurn()
     for (const attempt of [this.promptAttempt, ...this.steeringAttempts].filter(Boolean)) {
       if (attempt.submitted) settlePromptAttempt(attempt, error)
       else releasePromptAttempt(attempt)
@@ -1683,7 +1683,7 @@ class Proc {
       prompt_text_bytes: textBytes, prompt_parts: content.length,
     })
     this.continuingCancel = false
-    this.cancelledTurn = null
+    this.invalidateCancelledTurn()
     const turn = new Turn(this, messages)
     turn.compactionStages = compactionStages.slice()
     turn.hiddenCompactionOutput = compactionStages.length > 0
@@ -1706,6 +1706,19 @@ class Proc {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
     return sameMessageHistory(this.expectedMessages, messages)
+  }
+
+  invalidateCancelledTurn() {
+    const attempt = this.cancelledTurn?.attempt
+    this.cancelledTurn = null
+    // Terminal dedup records retain only the failed request's digest once the
+    // live-session exception expires. Do not keep retired process/history graphs
+    // reachable through the six-hour attempt cache. A claimed continuation is
+    // already active and retains its references until it settles normally.
+    if (attempt?.terminal && attempt.proc === this) {
+      attempt.proc = null
+      attempt.clientCancelled = false
+    }
   }
 
   matchesCancelledTurnMessages(messages) {
@@ -1973,7 +1986,7 @@ class Proc {
   cancelTurn(turn, partialContent, clientCancelled = false) {
     if (turn.cancelRequested || turn.done || turn.finalized) return false
     if (turn.hasPendingMcp() || this.dead) return false
-    this.cancelledTurn = null
+    this.invalidateCancelledTurn()
     turn.cancelRequested = true
     if (turn.stepsFile) this.stepUsageTrusted = false
     turn.detach()
@@ -2158,7 +2171,7 @@ class Proc {
   }
 
   continueWith(results) {
-    this.cancelledTurn = null
+    this.invalidateCancelledTurn()
     const turn = this.turn
     if (!turn || turn.finalized) throw new BusyError("agy bridge: no response is waiting for these tool results")
     turn.touchClient()
@@ -2192,7 +2205,7 @@ class Proc {
   }
 
   async steerTurn(turn, results, content, body, model, selection, promptAttempt, promptGuardMatched, signal) {
-    this.cancelledTurn = null
+    this.invalidateCancelledTurn()
     this.steering = true
     try {
       await this.updateTools(normalizeTools(body))
@@ -2354,7 +2367,7 @@ class Proc {
     if (this.dead) return
     this.dead = true
     this.deadError = error
-    this.cancelledTurn = null
+    this.invalidateCancelledTurn()
     this.continuingCancel = false
     this.conn?.close(error)
     if (this.configExpectation) {
@@ -2727,7 +2740,7 @@ function restoreParked(reservation) {
 
 async function retire(key, proc) {
   proc.retiring = true
-  proc.cancelledTurn = null
+  proc.invalidateCancelledTurn()
   proc.continuingCancel = false
   park(proc)
   if (pool.get(key) === proc) pool.delete(key)
@@ -2940,6 +2953,11 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   await evictIdle()
   convKey = conversationSlot(convKey, opts, forceNew)
   let existing = pool.get(convKey)
+  // The retry claim reserves this process before acquisition yields. Ordinary
+  // requests must not change its tools or retire it before the nudge starts.
+  if (existing?.continuingCancel && !opts.cancelContinuation) {
+    throw new BusyError("agy bridge: this conversation is continuing a cancelled response")
+  }
   if (opts.cancelContinuation) {
     if (existing !== opts.cancelContinuationProc || existing.dead || existing.stopping || existing.retiring ||
       existing.turn || existing.steering || existing.cancelledTurn?.attempt !== opts.promptAttempt ||
@@ -2950,7 +2968,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       !existing.matchesCancelledTurnMessages(opts.messages)) {
       if (opts.cancelContinuationProc) {
         opts.cancelContinuationProc.continuingCancel = false
-        opts.cancelContinuationProc.cancelledTurn = null
+        opts.cancelContinuationProc.invalidateCancelledTurn()
       }
       throw new PromptOutcomeUnknownError(existing?.deadError)
     }
@@ -2958,13 +2976,13 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       await existing.updateTools(opts.tools)
     } catch (error) {
       existing.continuingCancel = false
-      existing.cancelledTurn = null
+      existing.invalidateCancelledTurn()
       throw new PromptOutcomeUnknownError(existing.deadError || error)
     }
     if (existing.dead || existing.stopping || existing.retiring || existing.turn ||
       existing.cancelledTurn?.attempt !== opts.promptAttempt) {
       existing.continuingCancel = false
-      existing.cancelledTurn = null
+      existing.invalidateCancelledTurn()
       throw new PromptOutcomeUnknownError(existing.deadError)
     }
     return { proc: existing, history: opts.messages }

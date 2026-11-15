@@ -71,6 +71,15 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     log({ kind: "prompt", append, model, effort, prompt: p.prompt })
     const text = p.prompt.map(part => part.text || "").join("")
     const chunk = text => send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })
+    if (text.startsWith("CANCEL_RETRY original")) {
+      cancelPrompt = reply
+      if (mode !== "cancel-before-text") chunk("Partial answer")
+      return
+    }
+    if (text === "[The previous reply was interrupted before it finished. Answer my last message again, in full.]") {
+      chunk("Complete replacement answer")
+      return reply({ stopReason: "end_turn" })
+    }
     if (text.includes("[Bridge compaction fragment ")) {
       fragments++
       if (mode === "compaction-failure" && fragments === 2) {
@@ -261,6 +270,47 @@ test("cancelling an ingestion prompt prevents remaining fragments from being sub
     assert.equal(logs().slice(before).filter(event => event.kind === "prompt").length, 1)
   }
 })
+
+for (const mode of ["cancel-before-text", "cancel-partial"]) for (const stream of [true, false]) {
+  test(`client cancellation continues once in the original session: ${mode}, retry stream=${stream}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const start = logs().length
+    const messages = [{ role: "user", content: `CANCEL_RETRY original ${mode} ${stream}` }]
+    const abort = new AbortController()
+    const response = await request(client, messages, { stream: true }, abort.signal)
+    const reader = response.body.getReader()
+    if (mode === "cancel-partial") {
+      let text = ""
+      while (!text.includes("Partial answer")) {
+        const chunk = await reader.read()
+        assert.equal(chunk.done, false)
+        text += new TextDecoder().decode(chunk.value)
+      }
+      await reader.cancel()
+    } else {
+      await waitFor(() => logs().slice(start).some(event => event.kind === "prompt"))
+      abort.abort()
+      await reader.read().catch(() => {})
+    }
+    const retry = await request(client, messages, { stream })
+    const raw = await retry.text()
+    assert.equal(retry.status, 200, raw)
+    assert.match(raw, /Complete replacement answer/)
+    const prompts = logs().slice(start).filter(event => event.kind === "prompt")
+    assert.equal(prompts.length, 2, "one original submission and one nudge")
+    assert.equal(prompts[0].pid, prompts[1].pid)
+    assert.equal(prompts[1].prompt.map(part => part.text || "").join(""),
+      "[The previous reply was interrupted before it finished. Answer my last message again, in full.]")
+    const followup = await request(client, [...messages,
+      { role: "assistant", content: "Complete replacement answer" }, { role: "user", content: "next task" }])
+    assert.equal(followup.status, 200, await followup.text())
+    const sent = logs().slice(start).filter(event => event.kind === "prompt")
+    assert.equal(sent.length, 3)
+    assert.equal(sent[2].pid, prompts[0].pid)
+    assert.equal(sent[2].prompt.map(part => part.text || "").join(""), "next task")
+  })
+}
 
 for (const mode of ["response-first", "notification-first", "legacy", "legacy-hang", "unsupported", "missing", "missing-effort", "cross-session", "conflict", "conflict-effort", "bad-response", "real-error", "close", "hang"]) {
   test(`configuration protocol: ${mode}`, async () => {

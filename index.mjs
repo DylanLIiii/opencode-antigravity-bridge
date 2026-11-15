@@ -1297,6 +1297,12 @@ function isRecoverableResumeError(error) {
   return /\b(?:session[ /]resume|resume\s+capability|resuming\s+sessions)\b[\s\S]{0,80}\b(?:not\s+supported|unsupported)\b/i.test(message)
 }
 
+// agy states that the prompt never entered the session, so the same logical
+// request is safe to send again.
+function isPromptNotAdded(error) {
+  return /can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(String(error?.acpError?.message || ""))
+}
+
 // Only an explicit rejection of concurrent prompts proves the steer was not
 // accepted. Auth, transport and generic upstream failures must not resend it.
 function isUnsupportedSteering(error) {
@@ -2008,6 +2014,7 @@ class Proc {
         turn.fail(error)
         return
       }
+      if (turn.promptAttempt && isPromptNotAdded(error)) turn.promptAttempt.submitted = false
       turn.fail(error)
       dropFromPool(this)
       await this.stop().catch(() => {})
@@ -2300,7 +2307,10 @@ class Proc {
       }
       if (signal?.aborted) throw signal.reason || new Error("request aborted before user steering")
       const running = !turn.done && !turn.cancelRequested && !turn.finalized
-      if (running && this.canSteerNatively(model, selection)) {
+      // A call the client never saw keeps agy waiting, and agy refuses a
+      // concurrent prompt then. Cancel instead of provoking that rejection.
+      const unseen = running ? this.#unseenCalls(turn, results) : []
+      if (running && !unseen.length && this.canSteerNatively(model, selection)) {
         // Live results (including repeat-call waiters) go only through MCP.
         // Results AGY stopped waiting for must accompany the new instruction.
         const late = turn.calls.filter(call => call.deferred && !call.lateDelivered &&
@@ -2343,7 +2353,7 @@ class Proc {
         }, error => {
           const rejectMsg = String(error?.acpError?.message || "")
           if (!isUnsupportedSteering(error) || turn.cancelRequested || turn.done || this.dead) {
-            if (promptAttempt && /can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(rejectMsg)) {
+            if (promptAttempt && isPromptNotAdded(error)) {
               promptAttempt.submitted = false
             }
             throw error
@@ -2392,6 +2402,7 @@ class Proc {
       validateAcpPromptBudget(mergePromptParts(this.unsentPrompt, content), this.instructions, body)
       validatePromptBudget(results.flatMap(item => item.result.content), this.instructions, body)
       if (running) {
+        this.#closeUnseenCalls(unseen)
         this.continueWith(results)
         this.recordToolResults(turn, body.messages)
         this.cancelTurn(turn, [])
@@ -2409,6 +2420,20 @@ class Proc {
       return this.startTurn(content, body.messages, model, selection, promptAttempt, promptGuardMatched)
     } finally {
       this.steering = false
+    }
+  }
+
+  #unseenCalls(turn, results) {
+    return turn.calls.filter(call => !call.clientSeen && call.mcpSeen && !call.mcpResponded &&
+      !results.some(item => item.call === call))
+  }
+
+  #closeUnseenCalls(calls) {
+    for (const call of calls) {
+      clearTimeout(call.deadline)
+      this.#respondMcp(call, {
+        result: { content: [{ type: "text", text: "agy bridge: cancelled pending tool call for user steering" }], isError: true },
+      })
     }
   }
 

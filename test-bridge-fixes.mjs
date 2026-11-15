@@ -469,12 +469,12 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   }
 })
 
-test("steering waiting-for-permission rejection falls back cleanly without 409 lockup", async () => {
-  const workRoot = path.join(root, "steer-wait-work")
-  const accountsDir = path.join(root, "steer-wait-accounts")
-  const stateFile = path.join(root, "steer-wait-state.json")
-  const fakeDir = path.join(root, "fake-steer-wait-agy")
-  const logFile = path.join(root, "steer-wait.jsonl")
+for (const mode of ["rejected", "first-reject"]) test(`steering with an agy waiting prompt (${mode}) falls back cleanly without 409 lockup`, async () => {
+  const workRoot = path.join(root, `steer-wait-work-${mode}`)
+  const accountsDir = path.join(root, `steer-wait-accounts-${mode}`)
+  const stateFile = path.join(root, `steer-wait-state-${mode}.json`)
+  const fakeDir = path.join(root, `fake-steer-wait-agy-${mode}`)
+  const logFile = path.join(root, `steer-wait-${mode}.jsonl`)
   await fs.promises.mkdir(workRoot, { recursive: true })
   const fakeBin = writeFakeAgy(fakeDir, `
 import fs from "node:fs";
@@ -527,6 +527,11 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   } else if (msg.method === "session/prompt") {
     const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
     record({ type: "session/prompt", id: msg.id, text });
+    if (process.env.FAKE_WAIT_MODE === "first-reject" && !fs.existsSync(logFile + ".rejected")) {
+      fs.writeFileSync(logFile + ".rejected", "1");
+      send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Can't add this prompt to session s-wait: the running prompt is waiting for a permission or question answer; answer it or send session/cancel, then send this prompt again" } });
+      return;
+    }
     if (active) {
       send({
         jsonrpc: "2.0",
@@ -563,6 +568,7 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
     AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
     FAKE_WAIT_LOG: process.env.FAKE_WAIT_LOG,
+    FAKE_WAIT_MODE: process.env.FAKE_WAIT_MODE,
   }
   process.env.AGY_PATH = fakeBin
   process.env.AGY_BRIDGE_CONVERSATIONS_DIR = workRoot
@@ -570,18 +576,31 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   process.env.AGY_BRIDGE_STATE_FILE = stateFile
   process.env.AGY_BRIDGE_USAGE = "0"
   process.env.FAKE_WAIT_LOG = logFile
+  process.env.FAKE_WAIT_MODE = mode
   const tools = [
     { name: "update_plan", input_schema: { type: "object", properties: { step: { type: "string" } }, required: ["step"] } },
     { name: "bash", input_schema: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } },
   ]
   try {
-    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-wait=${Date.now()}`)
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-wait-${mode}=${Date.now()}`)
     const plugin = await AntigravityBridgePlugin()
     const loader = await plugin.auth.loader()
+    if (mode === "first-reject") {
+      const body = JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-wait-${mode}` }, tools, messages: [{ role: "user", content: "STOP_NOW plain" }] })
+      const first = await loader.fetch("agy://local/messages", { method: "POST", body })
+      const firstBody = await first.text()
+      assert.notEqual(first.status, 200, firstBody)
+      assert.notEqual(first.status, 409, firstBody)
+      const retry = await loader.fetch("agy://local/messages", { method: "POST", body })
+      const retryBody = await retry.json()
+      assert.equal(retry.status, 200, JSON.stringify(retryBody))
+      assert.ok(retryBody.content.some(b => b.type === "text" && b.text.includes("RECOVERED_AFTER_WAIT")), JSON.stringify(retryBody))
+      return
+    }
     const messages1 = [{ role: "user", content: "start plan" }]
     const res1 = await loader.fetch("agy://local/messages", {
       method: "POST",
-      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-wait-1" }, tools, messages: messages1 }),
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-wait-${mode}` }, tools, messages: messages1 }),
     })
     const body1 = await res1.json()
     assert.equal(res1.status, 200, JSON.stringify(body1))
@@ -601,7 +620,7 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     ]
     const res2 = await loader.fetch("agy://local/messages", {
       method: "POST",
-      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-wait-1" }, tools, messages: messages2 }),
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: `u-wait-${mode}` }, tools, messages: messages2 }),
     })
     const body2 = await res2.json()
     assert.equal(res2.status, 200, JSON.stringify(body2))
@@ -611,6 +630,7 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
     assert.equal(events.filter(e => e.type === "session/new").length, 1)
     assert.equal(events.filter(e => e.type === "session/cancel").length, 1)
+    assert.equal(events.filter(e => e.type === "session/prompt").length, 3)
     assert.ok(events.some(e => e.type === "unseen_bash_reply" && (e.r?.result?.isError === true || !!e.r?.error)), JSON.stringify(events))
   } finally {
     for (const [k, v] of Object.entries(prev)) {

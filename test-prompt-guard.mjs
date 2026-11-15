@@ -6,6 +6,7 @@ import {
   cloak, cloakUser, hint, outgoing, turnsAway,
   CLAUDE_CODE_PASTED, CLAUDE_CODE_PASTED_SAID, CLAUDE_CODE_SECURITY, CLAUDE_CODE_SECURITY_SAID,
 } from "./cloak.mjs"
+import { ideToolOf, userTurnParts } from "./index.mjs"
 
 const billing = "x-anthropic-billing-header: cc_version=1.2.3; cc_entrypoint=cli;"
 const agentIdentity = "You are a Claude agent, built on Anthropic's Claude Agent SDK."

@@ -1249,18 +1249,20 @@ async function launchedModel(body) {
     prompt.includes("RFC 2119 key words: MUST, REQUIRED,\nSHOULD") &&
     prompt.includes("Hermes Agent, an intelligent AI assistant built by Nous Research") && prompt.includes(`${piNeutral}.`) &&
     prompt.includes(rawUser) &&
-    prompt.includes(`Queued user input: ${codex.replace("based on", "built on")}\n${paths}`) &&
+    prompt.includes(`Queued user input: ${codex.replace("based on", "built on")}\n${paths}\n${pi}`) &&
     (prompt.match(/When the user writes @ followed by a path/g) || []).length === 2, prompt)
 
-  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}\n${pi}.`, messages: [{ role: "user", content: `FALLBACK user: ${sdk}` }] }
+  process.env.FAKE_AGY_APPEND = "0"
+  const fallbackBody = { model, system: `fallback\n${billing}\n${paths}\n${codex}\n${pi}.`, messages: [{ role: "user", content: `FALLBACK user: ${codex}` }] }
   const fallbackResponse = await callFetch(fallbackBody)
   const fallbackEvents = (await readSSE(fallbackResponse)).events
+  delete process.env.FAKE_AGY_APPEND
   const fallback = lastOf("user")?.text || ""
   check("external system instructions use the same outgoing rewrite and preserve non-Codex user text",
     fallbackResponse.status === 200 && stopOf(fallbackEvents) === "end_turn" && inits().at(-1).systemAppend === null &&
     fallback.includes("<external_system_instructions>") && !fallback.includes(billing) && !fallback.includes(paths) &&
     fallback.includes("When the user writes @ followed by a path") && fallback.includes("You are Codex, an agent built on GPT-5") &&
-    fallback.includes(`${piNeutral}.`) && fallback.includes(`FALLBACK user: ${sdk}`), fallback)
+    fallback.includes(`${piNeutral}.`) && fallback.includes(`FALLBACK user: ${codex.replace("based on", "built on")}`), fallback)
 
   const original = { model, system: pi, messages: [{ role: "user", content: "MEMORY rewritten system identity" }] }
   const firstEvents = (await readSSE(await callFetch(original))).events

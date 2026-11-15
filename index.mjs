@@ -1300,10 +1300,15 @@ function isRecoverableResumeError(error) {
 // Only an explicit rejection of concurrent prompts proves the steer was not
 // accepted. Auth, transport and generic upstream failures must not resend it.
 function isUnsupportedSteering(error) {
-  if (![-32600, -32601, -32602, -32000].includes(error?.acpError?.code)) return false
+  const code = error?.acpError?.code
+  if (!Number.isInteger(code) || code >= 0) return false
   const message = String(error.acpError.message || "")
-  return /(?:steer(?:ing)?|concurrent\s+prompts?|another\s+prompt|session\s+is\s+busy|(?:prompt|turn)\s+(?:is\s+)?already)/i.test(message) &&
-    /(?:not\s+supported|unsupported|busy|already|in\s+progress)/i.test(message)
+  if (/(?:steer(?:ing)?|concurrent\s+prompts?|another\s+prompt|session\s+is\s+busy|(?:prompt|turn)\s+(?:is\s+)?already)/i.test(message) &&
+    /(?:not\s+supported|unsupported|busy|already|in\s+progress)/i.test(message)) {
+    return true
+  }
+  return /can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(message) &&
+    /(?:waiting\s+for\s+a\s+permission|question\s+answer|send\s+session\/cancel|running\s+prompt|busy|already|in\s+progress|not\s+supported|unsupported)/i.test(message)
 }
 
 // Native CLI 1.5 introduced replacement-style resume append and configuration
@@ -2110,7 +2115,7 @@ class Proc {
 
   acceptMcpCall(message, socket) {
     const turn = this.turn
-    if (!turn || turn.done || turn.finalized || turn.cancelRequested) {
+    if (!turn || turn.done || turn.finalized || turn.cancelRequested || turn.steeringFallback) {
       throw new Error("agy bridge: no active turn for MCP call")
     }
     const name = message.name
@@ -2336,10 +2341,17 @@ class Proc {
           turn.lastPromptResult = result
           turn.recordPromptUsage(number, result?.usage)
         }, error => {
-          if (!isUnsupportedSteering(error) || turn.cancelRequested || turn.done || this.dead) throw error
+          const rejectMsg = String(error?.acpError?.message || "")
+          if (!isUnsupportedSteering(error) || turn.cancelRequested || turn.done || this.dead) {
+            if (promptAttempt && /can(?:'|\u2019|no)?t\s+add\s+(?:this\s+)?prompt\s+to\s+session\b/i.test(rejectMsg)) {
+              promptAttempt.submitted = false
+            }
+            throw error
+          }
           const fallbackParts = userTurnParts(content)
           validateAcpPromptBudget(fallbackParts, this.instructions, body)
-          this.nativeSteeringRejected = true
+          const waitingForAnswer = /(?:waiting\s+for\s+a\s+permission|question\s+answer|send\s+session\/cancel)/i.test(rejectMsg)
+          if (!waitingForAnswer) this.nativeSteeringRejected = true
           if (turn.stepsFile) this.stepUsageTrusted = false
           turn.stepCursor = null
           turn.steeringFallback = fallbackParts
@@ -2347,9 +2359,20 @@ class Proc {
           // AGY to store a cancellation in place of an already delivered result.
           for (const call of turn.calls) {
             if (call.deferred && call.result) call.lateDelivered = true
+            if (!call.clientSeen && call.mcpSeen && !call.mcpResponded && !results.some(item => item.call === call)) {
+              clearTimeout(call.deadline)
+              this.#respondMcp(call, {
+                result: { content: [{ type: "text", text: "agy bridge: cancelled pending tool call for user steering" }], isError: true },
+              })
+            }
           }
+          turn.events = turn.events.filter(event =>
+            event.type !== "tool" || event.call.clientSeen || results.some(item => item.call === event.call))
           if (turn.promptInFlight) this.conn.notify("session/cancel", { sessionId: this.sessionId })
-          logBridgeEvent(this, turn, "continued", "user_steering", {}, { steering_method: "cancel_then_prompt", fallback_reason: "native_steering_unsupported" })
+          logBridgeEvent(this, turn, "continued", "user_steering", {}, {
+            steering_method: "cancel_then_prompt",
+            fallback_reason: waitingForAnswer ? "running_prompt_waiting" : "native_steering_unsupported",
+          })
         }).catch(error => {
           pending.error = error
           turn.fail(error)

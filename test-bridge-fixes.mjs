@@ -468,3 +468,154 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     }
   }
 })
+
+test("steering waiting-for-permission rejection falls back cleanly without 409 lockup", async () => {
+  const workRoot = path.join(root, "steer-wait-work")
+  const accountsDir = path.join(root, "steer-wait-accounts")
+  const stateFile = path.join(root, "steer-wait-state.json")
+  const fakeDir = path.join(root, "fake-steer-wait-agy")
+  const logFile = path.join(root, "steer-wait.jsonl")
+  await fs.promises.mkdir(workRoot, { recursive: true })
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const logFile = process.env.FAKE_WAIT_LOG;
+const record = (entry) => fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n");
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+const sessionId = "s-wait";
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function connectControl(payload) {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, ...payload }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      const msg = JSON.parse(buf.slice(0, nl));
+      resolve(msg);
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+let active = null;
+let unseenDone = null;
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    record({ type: "session/new" });
+    await connectControl({ kind: "list" });
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId, models: { currentModelId: "gemini-test", availableModels: [{ modelId: "gemini-test", name: "Gemini Test" }] } } });
+  } else if (msg.method === "session/cancel") {
+    record({ type: "session/cancel" });
+    if (active) {
+      if (unseenDone) await unseenDone;
+      const id = active.id;
+      active = null;
+      send({ jsonrpc: "2.0", id, result: { stopReason: "cancelled" } });
+    }
+  } else if (msg.method === "session/prompt") {
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    record({ type: "session/prompt", id: msg.id, text });
+    if (active) {
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: {
+          code: -32603,
+          message: "Can't add this prompt to session s-wait: the running prompt is waiting for a permission or question answer; answer it or send session/cancel, then send this prompt again",
+        },
+      });
+      if (!unseenDone) {
+        unseenDone = new Promise(r => setTimeout(r, 15)).then(() =>
+          connectControl({ kind: "call", name: "bash", arguments: { cmd: "pwd" } }).then(r => {
+            record({ type: "unseen_bash_reply", r });
+            return r;
+          })
+        );
+      }
+      return;
+    }
+    if (!text.includes("STOP_NOW")) {
+      active = { id: msg.id };
+      void connectControl({ kind: "call", name: "update_plan", arguments: { step: "1" } }).catch(() => {});
+      return;
+    }
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "RECOVERED_AFTER_WAIT" } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    FAKE_WAIT_LOG: process.env.FAKE_WAIT_LOG,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = workRoot
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.FAKE_WAIT_LOG = logFile
+  const tools = [
+    { name: "update_plan", input_schema: { type: "object", properties: { step: { type: "string" } }, required: ["step"] } },
+    { name: "bash", input_schema: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } },
+  ]
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-wait=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+    const messages1 = [{ role: "user", content: "start plan" }]
+    const res1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-wait-1" }, tools, messages: messages1 }),
+    })
+    const body1 = await res1.json()
+    assert.equal(res1.status, 200, JSON.stringify(body1))
+    const toolUse = body1.content.find(b => b.type === "tool_use")
+    assert.equal(toolUse?.name, "update_plan")
+
+    const messages2 = [
+      ...messages1,
+      { role: "assistant", content: body1.content },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: toolUse.id, content: [{ type: "text", text: "Plan shown." }] },
+          { type: "text", text: "STOP_NOW: answer instead" },
+        ],
+      },
+    ]
+    const res2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "gemini-test", stream: false, metadata: { user_id: "u-wait-1" }, tools, messages: messages2 }),
+    })
+    const body2 = await res2.json()
+    assert.equal(res2.status, 200, JSON.stringify(body2))
+    assert.equal(body2.stop_reason, "end_turn")
+    assert.ok(body2.content.some(b => b.type === "text" && b.text.includes("RECOVERED_AFTER_WAIT")), JSON.stringify(body2))
+
+    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
+    assert.equal(events.filter(e => e.type === "session/new").length, 1)
+    assert.equal(events.filter(e => e.type === "session/cancel").length, 1)
+    assert.ok(events.some(e => e.type === "unseen_bash_reply" && (e.r?.result?.isError === true || !!e.r?.error)), JSON.stringify(events))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})

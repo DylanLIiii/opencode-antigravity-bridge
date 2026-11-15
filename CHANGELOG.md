@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.9
+
+- Rewrite the Pi-Bolt opening identity to a neutral equivalent before sending system instructions to agy, preserving the surrounding persona, documentation paths, user/tool text and client-text session identities (#73).
+- Let an identical retry after an acknowledged client cancellation request a full answer in the original live agy session without resubmitting the original prompt (#74). Require unchanged request context and no tool work, serialize competing retries, preserve the client's history view, and keep upstream failures, timeouts, dead sessions and cancelled compaction blocked.
+- Clear cancelled-session references when eligibility ends and protect a claimed continuation from competing session mutations. Cover cancellation recovery and client-history reuse in the cross-platform fake-ACP suite.
+- Track authentication-test child lifetimes with dedicated connections so Windows PID reuse cannot report unrelated processes as leaked fixture children.
+
 ## 0.8.8
 
 - Recover oversized stock OpenCode compaction requests by sending ordered, UTF-8-safe history fragments within agy's per-prompt limit, then returning only the final summary (#65). Use a temporary tool-free session so pending tools keep their original owner; prevalidate the full bounded plan, suppress ingestion acknowledgements, and stop on cancellation or upstream failure. Ordinary oversized input is still rejected without truncation. Multi-fragment compaction uses additional model calls and remains subject to the configured total text budget and model context window.

@@ -12,6 +12,7 @@ export const TURNED_AWAY = [
   "you are codex, a coding agent based on gpt-5",
   "hermes agent, an intelligent ai assistant created by nous research",
   "rfc 2119 keywords: must, required, should, recommended, may, optional.",
+  "you are a coding assistant running inside pi-bolt",
 ]
 
 const INVISIBLE_RE = /[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]/g
@@ -58,6 +59,7 @@ const SAID_AS = [
   (line) => line.replace(/based(\s+)on/i, "built$1on"),
   (line) => line.replace(/created(\s+)by/i, "built$1by"),
   (line) => line.replace(/(key)(words)/i, "$1 $2"),
+  (line) => line.replace(/pi-bolt$/i, "a tool"),
 ]
 
 function isBillingFields(text) {

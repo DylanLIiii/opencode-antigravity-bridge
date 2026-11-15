@@ -1,8 +1,9 @@
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import test from "node:test"
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agy auth retry-"))
@@ -11,6 +12,36 @@ const fakeAgyBin = path.join(tmpRoot, process.platform === "win32" ? "agy.cmd" :
 const logFile = path.join(tmpRoot, "events.jsonl")
 const stateDir = path.join(tmpRoot, "state")
 fs.mkdirSync(stateDir, { recursive: true })
+
+// A PID is not a process identity: Windows quickly reuses IDs from earlier
+// OAuth retries for other test workers. Track a unique connection held by each
+// fixture process instead. The OS closes it on normal exit or forced taskkill;
+// a genuinely leaked ACP/MCP child still prevents teardown from succeeding.
+const liveFixtures = new Map()
+let trackedFixtures = 0
+const lifecycle = net.createServer(socket => {
+  liveFixtures.set(socket, "starting fixture")
+  trackedFixtures++
+  socket.setEncoding("utf8")
+  let identity = ""
+  socket.on("data", data => { identity += data; liveFixtures.set(socket, identity.trim()) })
+  socket.on("error", () => {})
+  socket.on("close", () => liveFixtures.delete(socket))
+})
+await new Promise((resolve, reject) => {
+  lifecycle.once("error", reject)
+  lifecycle.listen(0, "127.0.0.1", resolve)
+})
+const lifecycleModule = path.join(tmpRoot, "fixture-lifecycle.mjs")
+fs.writeFileSync(lifecycleModule, `
+import net from "node:net"
+import { once } from "node:events"
+const socket = net.connect(Number(process.env.FAKE_E2E_LIFECYCLE_PORT), "127.0.0.1")
+await once(socket, "connect")
+socket.write("fixture pid=" + process.pid + "\\n")
+// Do not keep an otherwise exited child alive merely to report its lifetime.
+socket.unref()
+`)
 
 fs.writeFileSync(fakeAgyMjs, String.raw`
 import { spawn } from "node:child_process"
@@ -51,6 +82,7 @@ if (argv[0] === "acp" && argv.includes("--login")) {
   })
   setInterval(() => {}, 1000)
 } else if (argv[0] === "acp") {
+  await import(process.env.FAKE_E2E_LIFECYCLE_MODULE)
   log({ type: "fixture-process", pid: process.pid })
   const flag = (n) => { const i = argv.indexOf(n); return i < 0 ? null : argv[i + 1] }
   const agentLog = flag("--log-file")
@@ -86,7 +118,7 @@ if (argv[0] === "acp" && argv.includes("--login")) {
     if (!idePort || mcp) return
     // --ide-mcp-port is Bridge's private control endpoint, not an MCP socket.
     // Use the real stdio MCP adapter with its inherited control port/token.
-    mcp = spawn(process.execPath, [process.env.FAKE_E2E_MCP_SERVER], { stdio: ["pipe", "pipe", "pipe"] })
+    mcp = spawn(process.execPath, ["--import", process.env.FAKE_E2E_LIFECYCLE_MODULE, process.env.FAKE_E2E_MCP_SERVER], { stdio: ["pipe", "pipe", "pipe"] })
     log({ type: "fixture-process", pid: mcp.pid })
     const fail = error => {
       for (const waiter of mcpPending.values()) waiter.reject(error)
@@ -271,6 +303,8 @@ process.env.AGY_PATH = fakeAgyBin
 process.env.FAKE_E2E_LOG = logFile
 process.env.FAKE_E2E_STATE = stateDir
 process.env.FAKE_E2E_MCP_SERVER = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
+process.env.FAKE_E2E_LIFECYCLE_PORT = String(lifecycle.address().port)
+process.env.FAKE_E2E_LIFECYCLE_MODULE = pathToFileURL(lifecycleModule).href
 process.env.AGY_BRIDGE_STATE_FILE = path.join(stateDir, "sessions.json")
 process.env.AGY_BRIDGE_CONVERSATIONS_DIR = stateDir
 process.env.AGY_BRIDGE_ACCOUNTS_DIR = path.join(tmpRoot, "accounts")
@@ -283,16 +317,12 @@ const readLogs = () => fs.existsSync(logFile)
 
 test.after(async () => {
   fs.writeFileSync(path.join(stateDir, "stop-fixture"), "1")
-  const alive = pid => {
-    try { process.kill(pid, 0); return true } catch (error) {
-      if (error.code === "ESRCH") return false
-      throw error
-    }
-  }
-  const pids = [...new Set(readLogs().filter(event => event.type === "fixture-process" && event.pid).map(event => event.pid))]
   const deadline = Date.now() + 5000
-  while (pids.some(alive) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25))
-  assert.deepEqual(pids.filter(alive), [], "fixture ACP and MCP processes exited before cleanup")
+  while (liveFixtures.size && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25))
+  assert.deepEqual([...liveFixtures.values()], [], "fixture ACP and MCP processes exited before cleanup")
+  assert.equal(trackedFixtures, readLogs().filter(event => event.type === "fixture-process").length,
+    "every fixture ACP and production MCP process registered its own lifetime")
+  await new Promise((resolve, reject) => lifecycle.close(error => error ? reject(error) : resolve()))
   assert.ok(readLogs().some(event => event.type === "mcp-ready"), "the production MCP adapter completed a real handshake and tools/list")
   fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   setTimeout(() => process.exit(process.exitCode || 0), 30)

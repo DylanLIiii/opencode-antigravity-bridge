@@ -76,8 +76,10 @@ Prompt caching 由 Google 后端决定，插件不能保证命中率；它只让
   型号以账号实际探测结果为准。
 - **Prompt 风险收敛**：精确移除独立计费伪 header、规范化已知 Agent SDK 身份句，
   不全局改写用户正文；通用 429 不再被直接当作确定配额耗尽。
-- **异常防重发**：同一逻辑 Prompt 在提交后失败、取消或进程退出时，不会因客户端
-  自动重试再次交给 agy。
+- **异常防重发**：同一逻辑 Prompt 在提交后失败、超时或进程退出时，不会因客户端
+  自动重试再次交给 agy。仅有一种例外：客户端主动取消、且原 agy 会话仍存活并已确认取消、
+  期间没有工具调用时，相同请求重试会在同一会话里只发一句“请完整重答”的提示，
+  不会重发原 Prompt；账号、模型、工具、指令、工作目录任一变化或会话已推进则仍拒绝。
 - **流式输出 + 思考摘要 + 图片输入**：文本、思考过程、图片按顺序呈现。
   agy 内部的会话标题摘要也在同一思考流里，其提示词回显不再转发到客户端
   （诊断时可设 `AGY_BRIDGE_KEEP_SUMMARY_THOUGHTS=1` 恢复）。
@@ -378,7 +380,8 @@ manifest；旧副本留到显式 `context disable --purge` 才删除。普通 `d
 - **Prompt Guard**：默认开启，仅处理 system 中的独立计费元数据和已知 Agent SDK
   身份句；设置 `AGY_BRIDGE_PROMPT_GUARD=0` 可关闭。不会全局替换厂商名称或清洗 user 正文。
 - **错误与重试**：通用 `RESOURCE_EXHAUSTED` 不再被当作确定配额耗尽；已提交 Prompt
-  的相同请求重试会返回 `prompt_outcome_unknown`，不会再次调用 `session/prompt`。
+  的相同请求重试会返回 `prompt_outcome_unknown`，不会再次调用 `session/prompt`
+  （客户端主动取消且原会话仍存活的情形除外，见上文“异常防重发”）。
 - **会话状态文件**：`$XDG_STATE_HOME/magpie-agy-bridge/sessions.json`
   （0600，仅哈希），可用 `AGY_BRIDGE_STATE_FILE` 覆盖。支持 append 时通过 `session/new` 安装指令；
   原生 agy 1.5+ 的 resume 会重新设置同一份 append，避免恢复后丢失，也不会累加或重复放进用户消息。

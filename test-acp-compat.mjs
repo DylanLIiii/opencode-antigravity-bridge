@@ -123,6 +123,9 @@ fs.writeFileSync(executable, process.platform === "win32"
   : `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(source)} "$@"\n`, { mode: 0o755 })
 Object.assign(process.env, {
   AGY_PATH: executable, COMPAT_LOG: logFile, COMPAT_STOP: path.join(root, "stop"),
+  // The fake ACP owns authentication outcomes. Host keychain state must never
+  // reject a fixture request or provide credentials to background discovery.
+  AGY_BRIDGE_STORED_SIGNIN: "skip", AGY_BRIDGE_CLOUDCODE_METADATA: "0", AGY_CLI_DISABLE_AUTO_UPDATE: "1",
   AGY_BRIDGE_STATE_FILE: path.join(root, "sessions.json"), AGY_BRIDGE_CONVERSATIONS_DIR: path.join(root, "conversations"),
   AGY_BRIDGE_ACCOUNTS_DIR: path.join(root, "accounts"), AGY_BRIDGE_CONTEXT_DIR: path.join(root, "context"),
   AGY_BRIDGE_CONFIG_TIMEOUT_MS: "500", AGY_BRIDGE_START_TIMEOUT_MS: "3000",

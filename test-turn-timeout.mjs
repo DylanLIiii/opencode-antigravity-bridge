@@ -65,6 +65,7 @@ async function fixture(mode) {
     fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fake)} "$@"\n`, { mode: 0o700 })
     Object.assign(process.env, {
       AGY_PATH: wrapper, FAKE_AGY_LOG: logFile, FAKE_AGY_STATE: root,
+      AGY_BRIDGE_STORED_SIGNIN: "skip", AGY_BRIDGE_CLOUDCODE_METADATA: "0", AGY_CLI_DISABLE_AUTO_UPDATE: "1",
       AGY_BRIDGE_STATE_FILE: path.join(root, "sessions.json"),
       AGY_BRIDGE_ACCOUNTS_DIR: path.join(root, "accounts"),
       AGY_BRIDGE_CONVERSATIONS_DIR: root, AGY_BRIDGE_PING_INTERVAL_MS: "80",

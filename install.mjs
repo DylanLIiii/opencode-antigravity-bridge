@@ -14,6 +14,7 @@ export const AGY_MANUAL = process.platform === "win32"
   : "curl -fsSL https://antigravity.google/cli/install.sh | bash"
 const KEEP_FIRST_MS = 60_000
 const KEEP_EVERY_MS = 6 * 60 * 60 * 1000
+const KEEP_DEADLINE_MS = 20 * 60 * 1000
 
 function manifestBase(env = process.env) {
   const base = (env.AGY_BRIDGE_INSTALL_BASE || "").trim()
@@ -72,33 +73,70 @@ export function drained(out) {
     const done = (error) => {
       out.off("drain", done)
       out.off("error", done)
+      out.off("close", closed)
       error ? reject(error) : resolve()
     }
+    // a stream destroyed mid-wait never drains
+    const closed = () => done(new Error("the file closed before it was written"))
     out.on("drain", done)
     out.on("error", done)
+    out.on("close", closed)
   })
+}
+
+// writeTo opens file for streaming. A write error is always observed (no
+// uncaught "error" event), and close() settles only once the descriptor is
+// closed, so the caller can remove the file afterwards (Windows can't delete
+// an open file).
+function writeTo(file, mode) {
+  const out = fs.createWriteStream(file, { mode })
+  let failure = null
+  out.on("error", (error) => { failure ??= error })
+  const closed = new Promise((resolve) => out.once("close", resolve))
+  return {
+    async write(chunk) {
+      if (failure) throw failure
+      if (!out.write(chunk)) await drained(out)
+      if (failure) throw failure
+    },
+    async finish() {
+      if (failure) throw failure
+      await new Promise((resolve, reject) => out.end((error) => (error ? reject(error) : resolve())))
+      await closed
+      if (failure) throw failure
+    },
+    async abort() {
+      out.destroy()
+      await closed
+    },
+  }
 }
 
 async function download(url, file, signal) {
   const res = await fetch(url, { signal })
-  if (!res.ok || !res.body) throw new Error(`downloading agy failed: ${res.status}`)
+  if (!res.ok || !res.body) {
+    try { await res.body?.cancel() } catch {}
+    throw new Error(`downloading agy failed: ${res.status}`)
+  }
   const hash = createHash("sha512")
-  const out = fs.createWriteStream(file, { mode: 0o600 })
-  const wrote = new Promise((resolve, reject) => { out.on("finish", resolve); out.on("error", reject) })
+  const out = writeTo(file, 0o600)
   try {
     for await (const chunk of res.body) {
       hash.update(chunk)
-      if (!out.write(chunk)) await drained(out)
+      await out.write(chunk)
     }
-  } finally {
-    out.end()
+    await out.finish()
+  } catch (error) {
+    await out.abort()
+    throw error
   }
-  await wrote
   return hash.digest("hex")
 }
 
 export async function untarMember(archive, name, file) {
-  const gz = fs.createReadStream(archive).pipe(createGunzip())
+  const src = fs.createReadStream(archive)
+  const srcClosed = new Promise((resolve) => src.once("close", resolve))
+  const gz = src.pipe(createGunzip())
   const it = gz[Symbol.asyncIterator]()
   let buf = Buffer.alloc(0)
   const fill = async (n) => {
@@ -152,13 +190,13 @@ export async function untarMember(archive, name, file) {
       const entry = (longName ?? (prefix ? prefix + "/" + field(0, 100) : field(0, 100))).replace(/^\.\//, "")
       longName = null
       if ((type === "0" || type === "7") && entry === name) {
-        const out = fs.createWriteStream(file, { mode: 0o755 })
+        const out = writeTo(file, 0o755)
         try {
-          await pass(size, async (c) => {
-            if (!out.write(c)) await drained(out)
-          })
-        } finally {
-          await new Promise((resolve, reject) => out.end((error) => (error ? reject(error) : resolve())))
+          await pass(size, (c) => out.write(c))
+          await out.finish()
+        } catch (error) {
+          await out.abort()
+          throw error
         }
         return true
       }
@@ -166,24 +204,69 @@ export async function untarMember(archive, name, file) {
     }
   } finally {
     gz.destroy()
+    // the archive is removed next; Windows can't remove a file still open
+    src.destroy()
+    await srcClosed
   }
 }
 
-function run(file, args, { timeoutMs = 30_000 } = {}) {
+// run runs file once and settles by timeoutMs (or when signal aborts) even
+// if the child ignores SIGTERM or leaves a grandchild holding its pipes.
+export function run(file, args, { timeoutMs = 30_000, signal, killGraceMs = 2_000 } = {}) {
   return new Promise((resolve) => {
     let output = ""
     let child
+    let settled = false
+    let stopped = ""
+    let timer, killTimer, drainTimer
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearTimeout(killTimer)
+      clearTimeout(drainTimer)
+      signal?.removeEventListener("abort", onAbort)
+      resolve(stopped ? { ...result, code: -1, output: output || stopped, stopped } : result)
+    }
+    const stop = (why) => {
+      if (settled || stopped) return
+      stopped = why
+      try { child.kill() } catch {}
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL") } catch {}
+        // the child's pipes may still be held open by a grandchild
+        killTimer = setTimeout(() => finish({ code: -1, output }), killGraceMs)
+        killTimer.unref?.()
+      }, killGraceMs)
+      killTimer.unref?.()
+    }
+    const onAbort = () => stop("the install was cancelled")
+    if (signal?.aborted) {
+      resolve({ code: -1, output: "the install was cancelled", stopped: "the install was cancelled" })
+      return
+    }
     try {
       child = spawn(file, args, { env: childEnv(undefined), stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     } catch (error) {
       resolve({ code: -1, output: String(error?.message || error) })
       return
     }
-    const timer = setTimeout(() => child.kill(), timeoutMs)
+    signal?.addEventListener("abort", onAbort, { once: true })
+    timer = setTimeout(() => stop(`timed out after ${timeoutMs}ms`), timeoutMs)
+    timer.unref?.()
     child.stdout.on("data", (d) => { output += d })
     child.stderr.on("data", (d) => { output += d })
-    child.on("error", (error) => { clearTimeout(timer); resolve({ code: -1, output: String(error?.message || error) }) })
-    child.on("close", (code) => { clearTimeout(timer); resolve({ code, output }) })
+    child.on("error", (error) => finish({ code: -1, output: String(error?.message || error) }))
+    child.on("exit", (code) => {
+      // the exit code is known; give the pipes a moment to flush, not forever
+      drainTimer = setTimeout(() => {
+        child.stdout.destroy()
+        child.stderr.destroy()
+        finish({ code, output })
+      }, 500)
+      drainTimer.unref?.()
+    })
+    child.on("close", (code) => finish({ code, output }))
   })
 }
 
@@ -208,13 +291,25 @@ export async function installAgy({ signal, bin = ownPath(), platform = agyPlatfo
       fs.renameSync(payload, staged)
     }
     if (!windows) fs.chmodSync(staged, 0o755)
-    if (signal?.aborted) throw new DOMException("the install was cancelled", "AbortError")
-    const check = await run(staged, ["--version"])
-    if (check.code !== 0) throw new Error(`the downloaded agy doesn't run here (${lastLine(check.output) || `exit ${check.code}`})`)
-    if (windows && fs.existsSync(bin)) {
-      try { fs.renameSync(bin, path.join(dir, `.old-${tag}.exe`)) } catch {}
+    const cancelled = () => {
+      if (signal?.aborted) throw new DOMException("the install was cancelled", "AbortError")
     }
-    fs.renameSync(staged, bin)
+    cancelled()
+    const check = await run(staged, ["--version"], { signal })
+    cancelled()
+    if (check.code !== 0) throw new Error(`the downloaded agy doesn't run here (${lastLine(check.output) || `exit ${check.code}`})`)
+    let old = null
+    if (windows && fs.existsSync(bin)) {
+      old = path.join(dir, `.old-${tag}.exe`)
+      try { fs.renameSync(bin, old) } catch { old = null }
+    }
+    try {
+      fs.renameSync(staged, bin)
+    } catch (error) {
+      // put the working copy back rather than leave no agy at all
+      if (old) try { fs.renameSync(old, bin) } catch {}
+      throw error
+    }
     try { fs.writeFileSync(versionFile(bin), m.version + "\n") } catch {}
     return m.version
   } finally {
@@ -259,7 +354,8 @@ export function keepAgyCurrent(findAgy) {
   keeping = true
   const tick = async () => {
     try {
-      const was = await updateOwnAgy({ used: findAgy() })
+      // a stalled server must not stall every later check
+      const was = await updateOwnAgy({ used: findAgy(), signal: AbortSignal.timeout(KEEP_DEADLINE_MS) })
       if (was === "updated") console.error(`antigravity-bridge: updated its agy to ${installedVersion()}`)
     } catch (error) {
       console.error(`antigravity-bridge: couldn't update its agy: ${error?.message || error}`)

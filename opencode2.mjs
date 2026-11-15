@@ -298,6 +298,13 @@ async function setupPlugin(ctx, fn, live) {
   const auth = hooks.auth
   const authID = auth?.provider ? String(auth.provider) : undefined
   const providers = record(cfg.provider)
+  // A plugin that names its provider and package only in its provider hook
+  // (no config hook: the antigravity bridge) still needs a 2.x provider for
+  // its own model list to land in; without one 2.x shows sign-ins and no
+  // models.
+  const hookID = hooks.provider?.id ? String(hooks.provider.id) : undefined
+  if (hookID && hookID === authID && !providers[hookID] && typeof hooks.provider.models === "function" && typeof hooks.provider.npm === "string")
+    providers[hookID] = { npm: hooks.provider.npm, models: {} }
 
   // getAuth reads the active account: the credential 2.x holds, or what the
   // plugin last saved renewing it.
@@ -376,8 +383,15 @@ async function setupPlugin(ctx, fn, live) {
               const r = await m.authorize(inputs)
               if (m.type === "api") {
                 done()
-                return { url: "", instructions: "", mode: "auto", callback: Promise.resolve().then(() => credentialOf(methodID, r)) }
+                const callback = Promise.resolve().then(() => credentialOf(methodID, r))
+                // a failed sign-in is read later through callback; until
+                // then it must not be an unhandled rejection
+                callback.catch(() => {})
+                return { url: "", instructions: "", mode: "auto", callback }
               }
+              // a 1.x OAuth sign-in that fails before it has a URL answers
+              // {type: "failed"}, not {url, callback}
+              if (typeof r?.callback !== "function") throw new Error(r?.error || r?.message || "the sign-in failed")
               if (r?.method === "code")
                 return {
                   url: String(r.url ?? ""),

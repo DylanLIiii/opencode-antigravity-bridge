@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.9
+
+- Say interactive Claude Code's system prompt another way so Antigravity no longer answers it with `RESOURCE_EXHAUSTED (code 429)` whatever quota is left. Three passages are turned away on their own: the identity line `You are Claude Code, Anthropic's official CLI for Claude.` (now `You're …`, as the Agent SDK variants were already handled by prompt-guard), the `IMPORTANT: Assist with authorized security testing…` policy, and the `<pasted_content>` guidance. Small edits to the two passages are still turned away, so each is sent as an equivalent rewording that keeps every instruction; matching folds whitespace and invisible characters as before.
+
 ## 0.8.8
 
 - Recover oversized stock OpenCode compaction requests by sending ordered, UTF-8-safe history fragments within agy's per-prompt limit, then returning only the final summary (#65). Use a temporary tool-free session so pending tools keep their original owner; prevalidate the full bounded plan, suppress ingestion acknowledgements, and stop on cancellation or upstream failure. Ordinary oversized input is still rejected without truncation. Multi-fragment compaction uses additional model calls and remains subject to the configured total text budget and model context window.

@@ -69,7 +69,7 @@ test("confirmation, success, saved/current separation, failure, retry and disabl
   current = "default"
   assert.equal((await action("unlock")).status, 202)
   value = await status()
-  assert.equal(value.desired, "unlocked"); assert.equal(value.current, "default"); assert.equal(value.restartRequired, true); assert.equal(value.declaredContext, 256000)
+  assert.equal(value.desired, "unlocked"); assert.equal(value.current, "default"); assert.equal(value.restartRequired, true); assert.equal(value.declaredContext, 512000)
   assert.equal(value.last.ok, true); assert.ok(!JSON.stringify(value).includes("/private"))
   current = "unlocked"; fail = true
   assert.equal((await action("disable")).status, 202)
@@ -78,7 +78,7 @@ test("confirmation, success, saved/current separation, failure, retry and disabl
   fail = false
   assert.equal((await action("disable")).status, 202)
   value = await status()
-  assert.equal(value.last.ok, true); assert.equal(value.desired, "default"); assert.equal(value.current, "unlocked"); assert.equal(value.restartRequired, true)
+  assert.equal(value.last.ok, true); assert.equal(value.desired, "default"); assert.equal(value.current, "unlocked"); assert.equal(value.restartRequired, true); assert.equal(value.declaredContext, 1048576)
   assert.equal((await request("/api/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{" })).status, 400)
 })
 
@@ -97,7 +97,30 @@ test("override is reported separately, stale saved state is not actual unlock", 
   const { status } = await fixture(t, { env: { AGY_BRIDGE_CONTEXT_WINDOW: "700000" }, runtimeMode: () => "default", runTask: async () => ({ enabled: true, active: false, state: "stale" }) })
   const s = await status()
   assert.equal(s.desired, "unlocked"); assert.equal(s.effective, "default"); assert.equal(s.current, "default")
-  assert.equal(s.declaredContext, 700000); assert.equal(s.contextOverride, 700000); assert.equal(s.limits.gptOss, 131072)
+  assert.equal(s.declaredContext, 512000); assert.equal(s.contextOverride, 700000); assert.equal(s.limits.gptOss, 131072)
+})
+
+test("context override is capped by the selected runtime mode", async () => {
+  const env = {}
+  let current = "default"
+  const service = createContextService({ env, runtimeMode: () => current })
+  for (const [override, official, unlocked] of [
+    [undefined, 512000, 1048576],
+    ["256000", 256000, 256000],
+    ["700000", 512000, 700000],
+    ["1048576", 512000, 1048576],
+    ["1048577", 512000, 1048576],
+    ["invalid", 512000, 1048576],
+  ]) {
+    env.AGY_BRIDGE_CONTEXT_WINDOW = override
+    current = "default"
+    assert.equal(service.snapshot().declaredContext, official, `official mode: ${override}`)
+    current = "unlocked"
+    assert.equal(service.snapshot().declaredContext, unlocked, `unlocked mode: ${override}`)
+  }
+  current = "not-selected"
+  env.AGY_BRIDGE_CONTEXT_WINDOW = "700000"
+  assert.equal(service.snapshot().declaredContext, null)
 })
 
 test("WSL page cannot read or modify the host's context state", async t => {
@@ -215,7 +238,7 @@ function pageHarness() {
     if (!nodes.has(id)) nodes.set(id, { id, textContent: "", hidden: false, disabled: false, checked: false, listeners: {}, addEventListener(event, fn) { this.listeners[event] = fn }, focus() {}, style: {} })
     return nodes.get(id)
   }
-  let state = { desired: "default", effective: "default", current: "default", declaredContext: 256000, check: off, checking: false, operation: null, last: null }
+  let state = { desired: "default", effective: "default", current: "default", declaredContext: 512000, check: off, checking: false, operation: null, last: null }
   const requests = [], timers = []
   let failure = false
   const sandbox = { URL, URLSearchParams, console, location: { href: "http://host/_magpie/plugin/token/_magpie/service/", hash: "" },
@@ -240,6 +263,7 @@ function pageHarness() {
 test("UI reviews before writing, cancel has no effect, error retry and default restore", async () => {
   const page = pageHarness(); await page.settle()
   assert.ok(page.requests[0].url.endsWith("/_magpie/service/api/status"), "proxy token path retained")
+  assert.equal(page.node("declared").textContent, "512,000 tokens")
   page.change("unlocked"); await page.click("apply")
   assert.equal(page.node("review").hidden, false)
   assert.equal(page.requests.filter(r => r.opts.method === "POST").length, 0)
@@ -248,7 +272,9 @@ test("UI reviews before writing, cancel has no effect, error retry and default r
   page.change("unlocked"); await page.click("apply"); await page.click("confirm"); await page.settle()
   assert.match(page.node("feedback").textContent, /Saved successfully/)
   assert.equal(JSON.parse(page.requests.find(r => r.opts.method === "POST").opts.body).confirm, "unlock")
-  page.setFailure(true); page.change("default"); await page.click("apply"); await page.click("confirm"); await page.settle()
+  page.setFailure(true); page.change("default"); await page.click("apply")
+  assert.match(page.node("review-text").textContent, /capped at 512,000/)
+  await page.click("confirm"); await page.settle()
   assert.match(page.node("feedback").textContent, /Operation failed/)
   assert.equal(page.node("apply").disabled, false)
   page.setFailure(false); await page.click("apply"); await page.click("confirm"); await page.settle()

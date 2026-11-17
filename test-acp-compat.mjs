@@ -41,6 +41,14 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   if (["session/new", "session/resume"].includes(msg.method)) {
     sessionId = p.sessionId || "session-" + process.pid
     append = p._meta?.antigravity?.systemPrompt?.append || ""
+    if (mode === "context-usage") setTimeout(() => {
+      const usage = (used, size, id = sessionId) => send({ method: "session/update", params: { sessionId: id, update: { sessionUpdate: "usage_update", used, size } } })
+      usage(42, 1048576)
+      usage(99, 1048576, "wrong-session")
+      usage(-1, 1048576)
+      usage(0, 0)
+      usage("42", 1048576)
+    }, 10)
     return reply({ sessionId, configOptions: options(), models: { currentModelId: "other", availableModels: [] } })
   }
   if (msg.method === "session/set_config_option") {
@@ -69,6 +77,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   }
   if (msg.method === "session/prompt") {
     log({ kind: "prompt", append, model, effort, prompt: p.prompt })
+    if (mode === "context-usage") send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "usage_update", used: 123456, size: 1048576 } } })
     const text = p.prompt.map(part => part.text || "").join("")
     const chunk = text => send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } })
     const notAdded = () => send({ id: msg.id, error: { code: -32603, message: "Can't add this prompt to session: waiting for a permission" } })
@@ -375,6 +384,33 @@ for (const mode of ["cancel-before-text", "cancel-partial"]) for (const stream o
     assert.equal(sent[2].prompt.map(part => part.text || "").join(""), "next task")
   })
 }
+
+test("ACP context usage is observed while idle and generating without unlocking or billing the physical window", async () => {
+  process.env.COMPAT_MODE = "context-usage"
+  const savedOverride = process.env.AGY_BRIDGE_CONTEXT_WINDOW
+  process.env.AGY_BRIDGE_CONTEXT_WINDOW = "900000"
+  const write = process.stderr.write
+  const events = []
+  process.stderr.write = function(chunk, ...args) {
+    for (const line of String(chunk).split("\n")) {
+      if (line.startsWith("[agy-bridge] ")) events.push(JSON.parse(line.slice(13)))
+    }
+    return write.call(this, chunk, ...args)
+  }
+  try {
+    const response = await request(await loader(), [{ role: "user", content: "context usage fixture" }])
+    const body = await response.json()
+    assert.equal(response.status, 200, JSON.stringify(body))
+    const context = events.filter(event => event.action === "context_usage")
+    assert.deepEqual(context.map(event => event.context_tokens), [42, 123456])
+    assert.ok(context.every(event => event.upstream_context_window === 1048576 && event.declared_context_window === 512000))
+    assert.ok(body.usage.input_tokens < 123456, "rolling occupancy is not per-call billed usage")
+  } finally {
+    process.stderr.write = write
+    if (savedOverride === undefined) delete process.env.AGY_BRIDGE_CONTEXT_WINDOW
+    else process.env.AGY_BRIDGE_CONTEXT_WINDOW = savedOverride
+  }
+})
 
 for (const mode of ["response-first", "notification-first", "legacy", "legacy-hang", "unsupported", "missing", "missing-effort", "cross-session", "conflict", "conflict-effort", "bad-response", "real-error", "close", "hang"]) {
   test(`configuration protocol: ${mode}`, async () => {

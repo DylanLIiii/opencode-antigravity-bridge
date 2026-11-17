@@ -14,6 +14,7 @@ import { createAccountLoginMethod } from "./accounts-login.mjs"
 import { NativeAccountError, nativeAccount, nativeAccountResult, nativeAccountSlot, nativeModelId } from "./native-accounts.mjs"
 import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
 import { selectAgy } from "./context-unlock.mjs"
+import { declaredContextWindow } from "./context-policy.mjs"
 import { startContextService } from "./context-ui-service.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
@@ -113,13 +114,6 @@ const COMPACTION_REQUEST_MARKER = "Your task is to create a detailed summary of 
 const COMPACTION_REQUEST_REMINDER = "[This turn is a context-compaction request. A question or request at the start of the current turn " +
   "is the newest message of the conversation: record it in the summary as pending work; do not answer it or carry it out. " +
   "Reply only in the format the compaction instructions ask for.]"
-// Client compaction policy. Raising this declaration requires a separately
-// verified upstream window and does not alter agy's checkpoint configuration.
-const DEFAULT_CONTEXT_WINDOW = 256_000
-// Declared only when the bridge-managed unlocked agy copy is selected (explicit
-// `agy-bridge context unlock`). Deliberately below the patched ~983K checkpoint
-// ceiling: it is a client compaction policy, not an end-to-end verified limit.
-const UNLOCKED_CONTEXT_WINDOW = 512_000
 const LOG_TAIL_BYTES = 256 * 1024
 const NPM_ANTHROPIC = "@ai-sdk/anthropic"
 const PING_INTERVAL_MS = positiveTimeout(process.env.AGY_BRIDGE_PING_INTERVAL_MS, 15_000)
@@ -193,16 +187,9 @@ function configuredTimeout(name, fallback) {
 }
 
 function contextWindow(model, liveContext = null) {
-  const requested = Number(process.env.AGY_BRIDGE_CONTEXT_WINDOW)
-  if (Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576) {
-    const cap = Number.isSafeInteger(liveContext) && liveContext > 0 ? Math.min(requested, liveContext) : requested
-    return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(cap, 131_072) : cap
-  }
-  if (Number.isSafeInteger(liveContext) && liveContext > 0) {
-    return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(liveContext, 131_072) : liveContext
-  }
-  const window = agyUnlocked() ? UNLOCKED_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW
-  return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(window, 131_072) : window
+  return declaredContextWindow({
+    model, physical: liveContext, unlocked: agyUnlocked(), requested: process.env.AGY_BRIDGE_CONTEXT_WINDOW,
+  })
 }
 
 // The agy binary is chosen once per bridge process: the official install, or the
@@ -1744,6 +1731,19 @@ class Proc {
 
   #onNotification(method, params) {
     if (method !== "session/update" || params?.sessionId !== this.sessionId) return
+    // ACP 1.5.8+ reports rolling context occupancy independently of billable
+    // per-call usage. It also sends this while idle (new/load/model changes).
+    if (params.update?.sessionUpdate === "usage_update") {
+      const { used, size } = params.update
+      if (Number.isSafeInteger(used) && used >= 0 && Number.isSafeInteger(size) && size > 0) {
+        logBridgeEvent(this, null, "context_usage", "acp_usage_update", {}, {
+          model: this.currentModel,
+          context_tokens: used, upstream_context_window: size,
+          declared_context_window: contextWindow(this.currentModel, size),
+        })
+      }
+      return
+    }
     if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
       this.configOptions = params.update.configOptions
       this.currentSelectionKey = null

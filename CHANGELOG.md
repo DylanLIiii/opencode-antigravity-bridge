@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+- Declare a 512,000-token context window to Magpie and OpenCode for the official agy CLI, bounded by smaller model limits. Require a selected, verified managed unlock for larger windows, up to the model's physical limit (maximum 1,048,576); model metadata and `AGY_BRIDGE_CONTEXT_WINDOW` can no longer bypass the official ceiling. Keep GPT-OSS capped at 131,072.
+- Handle agy 1.5.8+ ACP `usage_update` notifications as context occupancy diagnostics, including updates outside active turns, without counting them as billable per-call usage. Report upstream physical capacity separately from the client declaration.
+- Share context policy between the provider and settings page, and update bilingual context controls and documentation for the 512K default and optional larger-window unlock.
+
 ## 0.9.0
 
 - Register hook-defined providers in the OpenCode 2.x adapter and contain failed sign-in callbacks. Bound and cancel installer version checks, route archive/file errors to the caller, and preserve the working Windows binary on replacement or rollback failure.

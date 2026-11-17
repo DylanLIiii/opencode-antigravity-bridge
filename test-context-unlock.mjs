@@ -6,6 +6,7 @@ import path from "node:path"
 import { test } from "node:test"
 import { ContextError, PATCHER, REQUIRED_GATES, contextStatus, disableContext, parseGates, selectAgy, sha256File, unlockContext } from "./context-unlock.mjs"
 import { main } from "./bin/agy-bridge.mjs"
+import { declaredContextWindow } from "./context-policy.mjs"
 
 // A fake "agy" file plus an injected runner: no real agy, python or model runs.
 const tmp = prefix => fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -37,6 +38,29 @@ function fakeRun({ version = "1.5.4", skipGate, officialChanged, failApply } = {
   }
   return { run, calls }
 }
+
+test("client context declarations require managed unlock above 512K and honor smaller model windows", () => {
+  const cases = [
+    [{}, 512_000],
+    [{ physical: 1_048_576 }, 512_000],
+    [{ requested: "512000" }, 512_000],
+    [{ requested: "900000", physical: 1_048_576 }, 512_000],
+    [{ requested: "300000", physical: 250_000 }, 250_000],
+    [{ physical: 65_536 }, 65_536],
+    [{ unlocked: true }, 1_048_576],
+    [{ unlocked: true, physical: 1_000_000 }, 1_000_000],
+    [{ unlocked: true, requested: "900000", physical: 1_048_576 }, 900_000],
+    [{ unlocked: true, requested: "900000", physical: 250_000 }, 250_000],
+    [{ unlocked: true, requested: "512000" }, 512_000],
+    [{ unlocked: true, model: "gpt-oss-120b-medium", requested: "900000" }, 131_072],
+    [{ model: "gpt-oss-120b", physical: 65_536 }, 65_536],
+  ]
+  for (const [options, expected] of cases) assert.equal(declaredContextWindow(options), expected, JSON.stringify(options))
+  for (const requested of ["", "bad", "0", "-1", "512000.5", "1048577", "Infinity"]) {
+    assert.equal(declaredContextWindow({ requested }), 512_000, requested)
+    assert.equal(declaredContextWindow({ requested, unlocked: true }), 1_048_576, requested)
+  }
+})
 
 test("the bundled patcher is the pinned, unmodified upstream file with its MIT license", () => {
   assert.equal(sha256File(PATCHER.path), PATCHER.sha256)

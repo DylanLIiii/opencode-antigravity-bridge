@@ -31,7 +31,7 @@ magpie plugin add https://github.com/DylanLIiii/opencode-antigravity-bridge
 | **Real client tools** | Client tools appear as native MCP tools: parallel, multi-round and long-running, each executed once | [What works](#what-works) |
 | **Streaming · thinking · images** | Streamed text and thought summaries; inline image input when agy advertises image support | [Limitations](#limitations) |
 | **Observable usage** | Separates actual input, cache reads/writes, output and thinking; subscription quota in Magpie's Usage page | [Subscription limits](#subscription-limits) |
-| **Model context metadata** | Account metadata/known limits when available; otherwise 256K, or 512K for a managed unlocked copy. Usable CLI capacity remains separate. | [Context unlock](#optional-context-unlock-off-by-default) |
+| **Model context metadata** | Official default declaration: 512K; up to 1M only with a selected, verified managed unlock. Model metadata can lower these limits; usable capacity remains unverified. | [Context unlock](#optional-context-unlock-off-by-default) |
 
 Available models depend on your installed agy and on what each account actually
 offers. The bridge probes each account before listing models; no particular
@@ -386,8 +386,10 @@ user profile or VM.
   names and safety instructions are not globally rewritten. Set
   `AGY_BRIDGE_PROMPT_GUARD=0` to disable this compatibility layer.
 - **Per-response token usage.** ACP reports one total per `session/prompt`,
-  which can span several responses (tool round-trips), and agy sends no
-  `usage_update`. agy does record every model call in its conversation store
+  which can span several responses (tool round-trips). Official agy 1.5.8+
+  also sends `usage_update` with context `used` / `size`; `size` describes the
+  physical window and does not unlock checkpoint limits. Per-response billing
+  still reads each model call from agy's conversation store
   (`~/.gemini/antigravity-cli/conversations/<sessionId>.db`); each response
   prefers `gen_metadata`, available when generation ends before client tools
   return. Older stores and unused generation tables use completed `steps`.
@@ -761,21 +763,29 @@ access token for context/output/image metadata. These optional metadata requests
 do not run inference; `AGY_BRIDGE_CLOUDCODE_METADATA=0` disables their credential
 reads and requests. Metadata is cached for five minutes per account, failed
 refreshes retain previous results, and WSL mode never reads host credentials.
-Known model limits fill missing metadata when credentials are available. Without
-metadata, the context declaration falls back to 256,000 tokens (512,000 for a
-verified unlocked copy). These declarations inform client compaction; they do
-not validate a usable end-to-end window. AGY's checkpoint
-threshold, per-step input limit and the model's physical window also constrain
-usable context. The locally inspected AGY 1.5.3 ACP session exposes model,
-thought level and mode selectors, with no context selector.
+Known model limits fill missing metadata when credentials are available. The
+official-agy default client declaration is 512,000 tokens. Declarations above
+512K require the running process to select a verified managed unlocked copy;
+that mode defaults to the model's physical maximum, up to 1,048,576 (1M) tokens.
+Account metadata or known model limits can lower either declaration, and GPT-OSS
+always stays capped at 131,072. These declarations inform client compaction;
+large context has not been verified end to end. Actual capacity and output
+reserves depend on the CLI, model and account, including AGY's checkpoint
+threshold and per-step input limits.
 
-After independently verifying a larger usable window for your CLI, model and
-account, set `AGY_BRIDGE_CONTEXT_WINDOW=512000` in the bridge's environment,
-restart the plugin and refresh the client's model catalog. Valid declarations
-are integers from 1 to 1,048,576. Invalid values use the default policy.
-Reported model limits also cap an explicit override; GPT-OSS remains capped at
-131,072 tokens. This setting changes the client-facing
-metadata. Usable capacity still depends on AGY. The 1 MiB per-submission text
+Set `AGY_BRIDGE_CONTEXT_WINDOW=256000` in the bridge's environment to lower the
+declaration, then restart the plugin and refresh the client's model catalog.
+Valid overrides are integers from 1 to 1,048,576; invalid values use the default
+policy. Overrides remain capped by the selected mode and reported model limits.
+For example, `700000` still declares at most 512,000 with official agy; it can
+declare 700,000 only in managed unlocked mode. This setting changes client-facing
+metadata and cannot itself unlock AGY limits.
+
+Official ACP sends `usage_update` with `used` / `size` starting in agy 1.5.8.
+The `size` field describes the physical window: a local Gemini carbon probe with
+official agy 1.5.9 reports `used = 0`, `size = 1048576` even without an unlock. This metadata does not unlock
+checkpoint limits or justify a 1M official-mode declaration. Per-step billing
+still comes from the local conversation store. The 1 MiB per-submission text
 budget is configured separately with `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`.
 
 #### Optional context unlock (off by default)
@@ -793,8 +803,9 @@ choice, verification for the next start and the running process; existing sessio
 keep their mode. It drives the same patch flow below, and the CLI commands remain
 available. WSL mode explains the limitation and cannot modify the host's unlock state.
 
-The patcher only builds verified copies of known agy builds. It removes agy's
-256K checkpoint gate; the patched threshold is about 983K (983,040). That is a
+The patcher only builds verified copies of known agy builds. On known older
+builds it removes agy's 256K checkpoint gate; the patched threshold is about
+983K (983,040). That is a
 gate value, **not a verified 1M usable capacity**, and long-context behaviour on
 newer agy builds is likewise unverified.
 
@@ -812,16 +823,20 @@ re-checks all six gates and records source, patcher and patched SHA-256, version
 and architecture in a manifest. The official install is never modified. If the
 build is unknown, a gate does not match, or the official agy later changes (for
 example `agy update`), the bridge keeps using the official agy and the default
-256K behaviour; run `unlock` again after an update. Restart Magpie after
+512K client declaration ceiling; run `unlock` again after an update. Restart Magpie after
 `unlock`/`disable`: the agy binary is chosen at start, so running sessions never
 change context mode. Only while a verified copy is selected does the bridge
-declare 512K to the client (still overridable with `AGY_BRIDGE_CONTEXT_WINDOW`;
-GPT-OSS stays at 131,072) and apply only `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`
+allow declarations above 512K, defaulting to up to 1,048,576 (1M) tokens. Model
+metadata may lower this maximum; `AGY_BRIDGE_CONTEXT_WINDOW` can adjust it within
+the mode ceiling, and GPT-OSS stays at 131,072. With the managed copy selected,
+the bridge applies only `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES`
 instead of the 180,000-byte official-agy clamp. The declared window is a client
 compaction policy, not a verified limit. **Limits:** upstream verified the patch
-on agy 1.4.12-1.5.3 only; a dry-run of the pinned script on a copy of 1.5.4
-(macOS arm64) matched all six gates, but no end-to-end long-context run has been
-done for 1.5.4 or on any other platform.
+on agy 1.4.12-1.5.3 only. Local dry-runs of the pinned script on 1.5.4 and 1.5.9
+(macOS arm64) matched all six gates. No actual patched 1.5.9 binary was created
+and no large-context inference was tested. These dry-runs do not extend the
+upstream validation range; no end-to-end long-context run has been done for
+1.5.4, 1.5.9 or on any other platform.
 
 Selection verifies the SHA-256 of both the official source and the managed copy.
 Published copies are reused by hash; failed publication preserves the previous
@@ -860,7 +875,7 @@ community observations and depend on the current account and CLI.
 | `AGY_BRIDGE_CLOUDCODE_URL` | official CloudCode endpoints | optional endpoint override; does not enable default host credential reads for mock/test agy paths |
 | `AGY_BRIDGE_STRIP_TOOL_RECORDS` | off | exactly `1` omits historical tool-result bodies during replay; current-turn results stay complete; reduces recall |
 | `AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES` | 1048576 | total UTF-8 text budget per submission plus session instructions; does not override the separate 180,000-byte ACP ceiling (including image-label reserves); oversized replay tries compact tool records, then omits oldest complete exchanges; irreducible input returns `context_length_exceeded` (`prompt_budget_exceeded` for a summary in the final eight messages) |
-| `AGY_BRIDGE_CONTEXT_WINDOW` | metadata or 256000/512000 fallback | explicit client context declaration, integer 1–1048576, capped by reported model context; GPT-OSS capped at 131072; requires separately verified usable capacity |
+| `AGY_BRIDGE_CONTEXT_WINDOW` | 512000 official / up to 1048576 managed unlocked | client context declaration, integer 1–1048576, capped by the selected mode and model metadata; above 512000 requires a selected, verified managed unlock; GPT-OSS capped at 131072; actual capacity and output reserves remain account dependent |
 | `AGY_BRIDGE_MODEL_PROBE_WAIT_MS` | 10000 | cold discovery wait for ACP confirmation, concurrent with the CLI catalog; timeout keeps the full CLI catalog |
 | `AGY_BRIDGE_MODEL_CACHE_TTL_MS` | 60000 | freshness of a successful account-scoped ACP catalog, measured from completion; stale results remain available during background refresh |
 | `AGY_BRIDGE_MODEL_PROBE_RETRY_MS` | 15000 | minimum retry delay after an empty, failed or unsupported ACP probe; failures keep the last successful result |

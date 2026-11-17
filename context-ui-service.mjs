@@ -13,6 +13,9 @@ import path from "node:path"
 import { createServer, request as httpRequest } from "node:http"
 import { Worker } from "node:worker_threads"
 import { contextStateDir } from "./context-unlock.mjs"
+import { CONTEXT_LIMITS, declaredContextWindow } from "./context-policy.mjs"
+
+export { CONTEXT_LIMITS } from "./context-policy.mjs"
 
 export const DEFAULT_CONTEXT_PORT = 47821
 export const CAPABILITY_HEADER = "x-bridge-context-capability"
@@ -21,7 +24,6 @@ const CHECK_TIMEOUT_MS = 60_000
 const MAX_BODY = 4096
 const APP_URL = new URL("./ui/context-app.html", import.meta.url)
 const TASK_URL = new URL("./context-ui-task.mjs", import.meta.url)
-export const CONTEXT_LIMITS = { default: 256_000, managed: 512_000, gptOss: 131_072 }
 
 export function contextPort(value) {
   const port = typeof value === "string" ? Number(value.trim()) : value
@@ -131,12 +133,12 @@ export function createContextService({ env = process.env, runtimeMode = () => "n
     const desired = check && check.state !== "unknown" ? (check.enabled ? "unlocked" : "default") : "unknown"
     const effective = check && check.state !== "unknown" ? (check.active ? "unlocked" : "default") : "unknown"
     const override = Number(env.AGY_BRIDGE_CONTEXT_WINDOW)
-    const contextOverride = Number.isSafeInteger(override) && override > 0 && override <= 1_048_576 ? override : null
+    const contextOverride = Number.isSafeInteger(override) && override > 0 && override <= CONTEXT_LIMITS.managed ? override : null
     return {
       desired, effective, current,
       unavailableReason,
       contextOverride,
-      declaredContext: contextOverride || (current === "not-selected" ? null : current === "unlocked" ? CONTEXT_LIMITS.managed : CONTEXT_LIMITS.default),
+      declaredContext: current === "not-selected" ? null : declaredContextWindow({ unlocked: current === "unlocked", requested: env.AGY_BRIDGE_CONTEXT_WINDOW }),
       restartRequired: current !== "not-selected" && effective !== "unknown" && current !== effective,
       check, checking: !!checking,
       operation: operation && { id: operation.id, action: operation.action, startedAt: operation.startedAt },

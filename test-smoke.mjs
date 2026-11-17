@@ -1043,15 +1043,15 @@ const legacyModel = "antigravity-bridge/gemini-test-low"
   check("grouped model declares Magpie and OpenCode reasoning", models["gemini-test"]?.capabilities?.reasoning === true && models["gemini-test"]?.reasoning === true)
   check("Gemini and Claude models expose image input to the host", models["gemini-test"]?.capabilities?.input?.image === true && models["claude-test-medium"]?.capabilities?.input?.image === true)
   check("single-effort models stay ungrouped", models["claude-test-medium"]?.name === "Claude Test (Medium)" && !models["claude-test-medium"]?.variants)
-  check("models declare the conservative client context window", models["gemini-test"]?.limit?.context === 256000)
+  check("models declare the official 512K client context window", models["gemini-test"]?.limit?.context === 512000)
   check("GPT-OSS declares its smaller physical window", models["gpt-oss-120b-medium"]?.limit?.context === 131072)
-  process.env.AGY_BRIDGE_CONTEXT_WINDOW = "512000"
+  process.env.AGY_BRIDGE_CONTEXT_WINDOW = "900000"
   const expanded = await plugin.provider.models()
-  check("context declaration accepts an explicit verified-window override", expanded["gemini-test"]?.limit?.context === 512000)
+  check("an override above 512K cannot bypass managed unlock", expanded["gemini-test"]?.limit?.context === 512000)
   check("expanded Gemini windows keep GPT-OSS within its physical window", expanded["gpt-oss-120b-medium"]?.limit?.context === 131072)
   for (const invalid of ["0", "-1", "bad", "512000.5", "1048577", "Infinity"]) {
     process.env.AGY_BRIDGE_CONTEXT_WINDOW = invalid
-    check(`invalid context declaration ${invalid} retains the default`, (await plugin.provider.models())["gemini-test"]?.limit?.context === 256000)
+    check(`invalid context declaration ${invalid} retains the default`, (await plugin.provider.models())["gemini-test"]?.limit?.context === 512000)
   }
   delete process.env.AGY_BRIDGE_CONTEXT_WINDOW
 }
@@ -5140,7 +5140,7 @@ for (const compacted of [true, false]) {
   fs.rmSync(srcDir, { recursive: true, force: true })
 }
 
-// Context declaration follows the *selected* agy binary: default stays 256K and
+// Context declaration follows the *selected* agy binary: default stays 512K and
 // gpt-oss keeps its own cap; only a verified managed copy raises the client
 // declaration and the per-submission ACP clamp.
 {
@@ -5161,7 +5161,7 @@ for (const compacted of [true, false]) {
   }
   const off = await run("off")
   const offLimits = await limits(off.mod)
-  check("default (no unlock) declares 256K and keeps gpt-oss at 131072", offLimits.gemini === 256_000 && offLimits.oss === 131_072, JSON.stringify(offLimits))
+  check("default (no unlock) declares 512K and keeps gpt-oss at 131072", offLimits.gemini === 512_000 && offLimits.oss === 131_072, JSON.stringify(offLimits))
   off.restore()
 
   const { unlockContext } = await import("./context-unlock.mjs")
@@ -5179,7 +5179,9 @@ for (const compacted of [true, false]) {
   })
   const onLimits = await limits(on.mod)
   check("a verified managed copy raises the client declaration but gpt-oss keeps its cap",
-    onLimits.gemini === 512_000 && onLimits.oss === 131_072, JSON.stringify(onLimits))
+    onLimits.gemini === 1_048_576 && onLimits.oss === 131_072, JSON.stringify(onLimits))
+  check("a verified managed copy permits an override above 512K",
+    (process.env.AGY_BRIDGE_CONTEXT_WINDOW = "900000", (await limits(on.mod)).gemini === 900_000))
   check("explicit AGY_BRIDGE_CONTEXT_WINDOW still applies on top of either mode",
     (process.env.AGY_BRIDGE_CONTEXT_WINDOW = "300000", (await limits(on.mod)).gemini === 300_000))
   on.restore()

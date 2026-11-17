@@ -255,7 +255,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
   <div role="listitem"><strong>N</strong><span lang="zh-CN">Google 账号，各自一行，共用普通模型 ID</span><span lang="en">Google accounts, one row each, sharing ordinary model IDs</span></div>
   <div role="listitem"><strong>−94%</strong><span lang="zh-CN">"Reply OK" 输入 token（历史实测，agy 1.4.12）</span><span lang="en">"Reply OK" input tokens (historical, agy 1.4.12)</span></div>
   <div role="listitem"><strong>91.7%</strong><span lang="zh-CN">一次 26k 稳定 prompt 样本的缓存读（不是承诺）</span><span lang="en">cache read in one 26k stable-prompt sample (not a promise)</span></div>
-  <div role="listitem"><strong>256K</strong><span lang="zh-CN">默认上下文声明；可选托管副本声明 512K</span><span lang="en">default context declaration; optional managed copy declares 512K</span></div>
+  <div role="listitem"><strong>512K</strong><span lang="zh-CN">官方默认上下文声明；托管解锁后最多声明 1M</span><span lang="en">official default declaration; up to 1M with managed unlock</span></div>
 </div>
 
 <!-- 01 accounts -->
@@ -405,11 +405,15 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
   <div>
     <h2 id="h-context"><span lang="zh-CN">保守默认，显式解锁。</span><span lang="en">Conservative default, explicit unlock.</span></h2>
     <div class="ctx">
-      <div><strong>256,000</strong><span lang="zh-CN">默认 <code>limit.context</code> 声明</span><span lang="en">default <code>limit.context</code> declaration</span></div>
-      <div><strong>512,000</strong><span lang="zh-CN">选中已校验托管副本时的声明，未端到端验证</span><span lang="en">declared with a verified managed copy; not end-to-end verified</span></div>
+      <div><strong>512,000</strong><span lang="zh-CN">官方默认 <code>limit.context</code> 声明上限</span><span lang="en">official default <code>limit.context</code> declaration ceiling</span></div>
+      <div><strong>1,048,576</strong><span lang="zh-CN">1M：仅选中已校验托管解锁副本后最多声明，模型元数据可降低上限</span><span lang="en">1M: maximum declaration only with a selected, verified managed unlock; model metadata may lower it</span></div>
       <div><strong>131,072</strong><span lang="zh-CN">GPT-OSS 始终封顶</span><span lang="en">GPT-OSS cap, always</span></div>
       <div class="warn"><strong>≈983K</strong><span lang="zh-CN">补丁后的 checkpoint gate 数值，不代表 1M 可用容量</span><span lang="en">patched checkpoint gate value, not 1M usable capacity</span></div>
     </div>
+    <p class="note">
+      <span lang="zh-CN"><code>AGY_BRIDGE_CONTEXT_WINDOW</code> 可降低声明，不能绕过官方 512K 上限。实际容量和输出预留取决于模型与账号，大上下文尚未经端到端验证。官方 agy 1.5.8 起发送 <code>usage_update</code> 的 <code>used</code>/<code>size</code>；本机官方 1.5.9 未解锁也报告 <code>size = 1048576</code>。该物理窗口元数据不解除 checkpoint 限制，逐步计费用量仍取自本地会话库。</span>
+      <span lang="en"><code>AGY_BRIDGE_CONTEXT_WINDOW</code> can lower declarations and cannot bypass the official 512K ceiling. Actual capacity and output reserves depend on the model and account; large context has not been verified end to end. Official agy 1.5.8+ sends <code>usage_update</code> with <code>used</code>/<code>size</code>; locally, official 1.5.9 reports <code>size = 1048576</code> even without an unlock. This physical-window metadata does not unlock checkpoint limits; per-step billing still comes from the local conversation store.</span>
+    </p>
     <p class="intro" style="margin-top:28px">
       <span lang="zh-CN">右键 Providers 中的 Antigravity Bridge 行，选择「Antigravity Bridge 上下文设置」，或从侧边栏打开同名页面：</span>
       <span lang="en">Right-click the Antigravity Bridge row in Providers and choose <strong>Antigravity Bridge context</strong>, or open it from the sidebar:</span>
@@ -422,8 +426,8 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
       <li><span lang="zh-CN">可恢复默认</span><span lang="en">Restore the default</span></li>
     </ol>
     <p class="note">
-      <span lang="zh-CN">保存后重启 Magpie 或重新加载 Bridge 插件，再刷新模型目录；已有会话保持原模式。WSL 页面仅显示状态说明。现有补丁只为已知构建生成受校验的副本，官方安装从不修改；新版 agy 的长上下文效果未经验证。CLI 入口同样可用：</span>
-      <span lang="en">After saving, restart Magpie or reload Bridge, then refresh models; running sessions keep their mode. The WSL page explains the limitation without changing host state. The patcher only builds verified copies of known builds and never modifies the official install; long context on newer agy builds is unverified. The CLI remains available:</span>
+      <span lang="zh-CN">保存后重启 Magpie 或重新加载 Bridge 插件，再刷新模型目录；已有会话保持原模式。WSL 页面仅显示状态说明。现有补丁只为已知构建生成受校验的副本，官方安装从不修改。上游验证范围仍为 agy 1.4.12–1.5.3；本机 arm64 agy 1.5.9 的固定补丁器 dry-run 命中全部六个 gate，但未生成实际补丁二进制或测试大上下文推理。CLI 入口同样可用：</span>
+      <span lang="en">After saving, restart Magpie or reload Bridge, then refresh models; running sessions keep their mode. The WSL page explains the limitation without changing host state. The patcher only builds verified copies of known builds and never modifies the official install. Upstream validation remains agy 1.4.12–1.5.3; a pinned-patcher dry-run on local arm64 agy 1.5.9 matched all six gates, but no actual patched binary or large-context inference was tested. The CLI remains available:</span>
     </p>
 <pre class="cli">agy-bridge context status
 agy-bridge context unlock     # Python 3.8+, patches only a copy

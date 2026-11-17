@@ -4,12 +4,19 @@ import { createHash } from "node:crypto"
 import { DEFAULT_ACCOUNT, listAccounts } from "./accounts.mjs"
 import { validateAccountName } from "./accounts-import.mjs"
 
+// A missing or malformed profile reference cannot recover on its own: the
+// user has to sign that account in again. `signIn: "expired"` is how Magpie's
+// host marks a row for sign-in from a models/usage hook error, and the loader
+// answers it with X-Magpie-Sign-In: expired. Other errors leave the row alone.
+const NEEDS_SIGN_IN = new Set(["bridge_account_unavailable", "bridge_account_invalid"])
+
 export class NativeAccountError extends Error {
   constructor(message, code = "bridge_account_unavailable", statusCode = 503) {
     super(message)
     this.code = code
     this.statusCode = statusCode
     this.noRetry = true
+    if (NEEDS_SIGN_IN.has(code)) this.signIn = "expired"
   }
 }
 
@@ -42,7 +49,7 @@ export function nativeAccount(auth, { allowMissing = false, env = process.env } 
   // Always rescan the filesystem: a removed profile must never keep using a
   // cached directory or silently fall back to the machine's default login.
   const account = listAccounts(env, { refresh: true }).find(item => item.name === name)
-  if (!account) throw new NativeAccountError(`Saved Bridge account "${name}" is unavailable. Restore its profile or sign in again.`)
+  if (!account) throw new NativeAccountError(`Saved Bridge account "${name}" is unavailable: its profile or credential is gone. Sign in again with "Add a Google account" using the name "${name}", or remove this row.`)
   return account
 }
 

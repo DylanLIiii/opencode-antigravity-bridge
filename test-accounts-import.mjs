@@ -4,7 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import { accountsRootDir, listAccounts } from "./accounts.mjs"
-import { importAccount, importAccounts, importManifest, ImportError, TOKEN_RELATIVE, validateAccountName } from "./accounts-import.mjs"
+import { importAccount, importAccounts, importManifest, ImportError, removeAccount, replaceAccountCredential, sweepStaging, TOKEN_RELATIVE, validateAccountName } from "./accounts-import.mjs"
 import { main } from "./bin/agy-bridge.mjs"
 
 // Only synthetic credentials: nothing here reads a real agy profile.
@@ -169,4 +169,94 @@ test("the CLI shares the backend and never prints credentials", () => {
   assert.ok(errors.some(line => /already exists/.test(line)))
   assert.ok(![...lines, ...errors].join("\n").includes(SECRET))
   assert.ok(lines.includes("cli"))
+})
+
+test("replacing a credential keeps the profile, matches names case-insensitively and refuses unsafe targets", { skip: process.platform === "win32" }, () => {
+  const { sources, root, env } = fixture()
+  const dir = profile(sources, "src")
+  importAccount("Work", dir, env)
+  const kept = path.join(root, "Work", "antigravity-cli", "conversations", "keep.pb")
+  fs.mkdirSync(path.dirname(kept), { recursive: true })
+  fs.writeFileSync(kept, "conversation")
+  const fresh = path.join(sources, "fresh.json")
+  fs.writeFileSync(fresh, JSON.stringify({ refresh_token: SECRET + "_new" }))
+  assert.deepEqual(replaceAccountCredential("work", fresh, env), { name: "Work", dir: path.join(root, "Work"), replaced: true })
+  const token = path.join(root, "Work", TOKEN_RELATIVE)
+  assert.equal(JSON.parse(fs.readFileSync(token, "utf8")).refresh_token, SECRET + "_new")
+  assert.equal(fs.statSync(token).mode & 0o777, 0o600)
+  assert.equal(fs.readFileSync(kept, "utf8"), "conversation")
+  assert.deepEqual(fs.readdirSync(path.dirname(token)).filter(n => n.endsWith(".tmp")), [])
+  // A bad source never touches the existing credential.
+  const before = fs.readFileSync(token, "utf8")
+  fs.writeFileSync(path.join(sources, "bad"), "not a token")
+  rejects(() => replaceAccountCredential("Work", path.join(sources, "bad"), env), "invalid_source")
+  assert.equal(fs.readFileSync(token, "utf8"), before)
+  rejects(() => replaceAccountCredential("missing", fresh, env), "not_found")
+  rejects(() => replaceAccountCredential("../Work", fresh, env), "invalid_name")
+  // A symlinked account folder or credential is never followed.
+  const outside = tmp("import-outside-")
+  fs.symlinkSync(outside, path.join(root, "linked"))
+  rejects(() => replaceAccountCredential("linked", fresh, env), "invalid_destination")
+  assert.deepEqual(fs.readdirSync(outside), [])
+  importAccount("tokenlink", dir, env)
+  const outsideToken = path.join(outside, "token")
+  fs.writeFileSync(outsideToken, "outside")
+  fs.rmSync(path.join(root, "tokenlink", TOKEN_RELATIVE))
+  fs.symlinkSync(outsideToken, path.join(root, "tokenlink", TOKEN_RELATIVE))
+  rejects(() => replaceAccountCredential("tokenlink", fresh, env), "invalid_destination")
+  assert.equal(fs.readFileSync(outsideToken, "utf8"), "outside")
+})
+
+test("removing an account deletes only its profile, unlinks symlinks without following, and frees the name", { skip: process.platform === "win32" }, () => {
+  const { sources, root, env } = fixture()
+  const dir = profile(sources, "src")
+  importAccount("Gone", dir, env)
+  importAccount("stays", dir, env)
+  assert.deepEqual(removeAccount("gone", env), { name: "Gone", dir: path.join(root, "Gone") })
+  assert.deepEqual(fs.readdirSync(root).sort(), ["stays"])
+  assert.deepEqual(listAccounts(env, { refresh: true }).map(a => a.name), [null, "stays"])
+  importAccount("Gone", dir, env)
+  assert.ok(fs.existsSync(path.join(root, "Gone", TOKEN_RELATIVE)), "the name can be used again")
+  rejects(() => removeAccount("missing", env), "not_found")
+  rejects(() => removeAccount("..", env), "invalid_name")
+  const outside = tmp("import-outside-")
+  fs.writeFileSync(path.join(outside, "keep"), "outside")
+  fs.symlinkSync(outside, path.join(root, "linked"))
+  removeAccount("linked", env)
+  assert.ok(!fs.existsSync(path.join(root, "linked")))
+  assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "outside")
+})
+
+test("staging sweep removes only old staging folders", () => {
+  const { root, env } = fixture()
+  fs.mkdirSync(root, { recursive: true })
+  for (const name of [".login-old", ".import-old", ".removed-old", ".login-new", ".other-old", "account"]) fs.mkdirSync(path.join(root, name))
+  const past = new Date(Date.now() - 2 * 60 * 60_000)
+  for (const name of [".login-old", ".import-old", ".removed-old", ".other-old", "account"]) fs.utimesSync(path.join(root, name), past, past)
+  assert.deepEqual(sweepStaging(env).sort(), [".import-old", ".login-old", ".removed-old"])
+  assert.deepEqual(fs.readdirSync(root).sort(), [".login-new", ".other-old", "account"])
+})
+
+test("the CLI replaces and removes accounts without printing credentials", () => {
+  const { sources, root, env } = fixture()
+  const dir = profile(sources, "src")
+  const lines = []
+  const out = line => lines.push(line)
+  const errors = []
+  const realError = console.error
+  console.error = line => errors.push(line)
+  try {
+    assert.equal(main(["accounts", "import", "cli", dir], { out, env }), 0)
+    fs.mkdirSync(path.join(root, "cli", "antigravity-cli", "conversations"))
+    assert.equal(main(["accounts", "replace", "cli", dir], { out, env }), 0)
+    assert.ok(fs.existsSync(path.join(root, "cli", "antigravity-cli", "conversations")))
+    assert.equal(main(["accounts", "replace", "nobody", dir], { out, env }), 1)
+    assert.equal(main(["accounts", "replace", "cli"], { out, env }), 2)
+    assert.equal(main(["accounts", "remove", "cli"], { out, env }), 0)
+    assert.ok(!fs.existsSync(path.join(root, "cli")))
+    assert.equal(main(["accounts", "remove", "cli"], { out, env }), 1)
+    assert.equal(main(["accounts", "remove"], { out, env }), 2)
+  } finally { console.error = realError }
+  assert.ok(errors.some(line => /does not exist/.test(line)))
+  assert.ok(![...lines, ...errors].join("\n").includes(SECRET))
 })

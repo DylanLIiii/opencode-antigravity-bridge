@@ -56,6 +56,7 @@ if (args.includes("--version")) { console.log("1.5.7"); process.exit(0) }
 if (args.includes("models")) {
   log({ type: "models-start" })
   await sleep(cfg.cliDelay)
+  if (cfg.cliMode === "fail") { log({ type: "models-end" }); process.exit(1) }
   process.stdout.write(JSON.parse(process.env.FAKE_CLI).map(([id, name]) => id + "  " + name).join("\n") + "\n")
   log({ type: "models-end" })
   process.exit(0)
@@ -246,4 +247,35 @@ test("cold wait is bounded, and old-CLI refresh preserves and throttles a previo
     delete process.env.AGY_BRIDGE_MODEL_CACHE_TTL_MS
     delete process.env.AGY_BRIDGE_MODEL_PROBE_RETRY_MS
   }
+})
+
+test("the CLI catalog is served from cache, refreshed once in the background, and kept when a refresh fails", async () => {
+  const auth = account("catalog", { acp: FULL })
+  const cli = () => events().filter(e => e.type === "models-start" && e.scope === "catalog").length
+  assert.deepEqual(await models(auth), FULL)
+  await probesSettled("catalog")
+  assert.equal(cli(), 1)
+  assert.deepEqual(await models(auth), FULL)
+  assert.deepEqual(await models(auth), FULL)
+  assert.equal(cli(), 1, "a fresh catalog does not start the CLI again")
+
+  process.env.AGY_BRIDGE_CATALOG_TTL_MS = "1"
+  try {
+    configure("catalog", { cliDelay: 1500 })
+    await sleep(5)
+    const started = Date.now()
+    const listed = await Promise.all([models(auth), models(auth), models(auth)])
+    assert(Date.now() - started < 1200, "a stale catalog is served without waiting for the CLI")
+    for (const result of listed) assert.deepEqual(result, FULL)
+    for (let i = 0; i < 100 && events().filter(e => e.type === "models-end" && e.scope === "catalog").length < 2; i++) await sleep(50)
+    assert.equal(cli(), 2, "concurrent stale listings share one background refresh")
+
+    configure("catalog", { cliDelay: 0, cliMode: "fail" })
+    await sleep(5)
+    assert.deepEqual(await models(auth), FULL)
+    for (let i = 0; i < 100 && events().filter(e => e.type === "models-end" && e.scope === "catalog").length < 3; i++) await sleep(50)
+    await sleep(50)
+    assert.deepEqual(await models(auth), FULL, "a failed refresh keeps the last good catalog")
+  } finally { delete process.env.AGY_BRIDGE_CATALOG_TTL_MS }
+  await probesSettled("catalog")
 })

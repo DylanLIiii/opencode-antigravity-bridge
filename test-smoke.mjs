@@ -5102,8 +5102,20 @@ for (const compacted of [true, false]) {
   const after = await importPlugin.provider.models()
   check("imported account appears in the model list with the account prefix",
     Object.keys(after).some(id => id.startsWith("imported/")) && Object.keys(after).some(id => !id.includes("/")))
-  const dup = await single.authorize({ name: "imported", source: srcDir })
-  check("repeating an import is refused, never overwritten", dup.type === "failed" && /already exists/.test(dup.error))
+  const keptFile = path.join(importRoot, "imported", "antigravity-cli", "conversations", "kept.pb")
+  fs.mkdirSync(path.dirname(keptFile), { recursive: true })
+  fs.writeFileSync(keptFile, "kept conversation")
+  const resignSource = path.join(srcDir, "resign-token")
+  fs.writeFileSync(resignSource, JSON.stringify({ refresh_token: "SYNTHETIC_RESIGN_FIXTURE_ONLY" }))
+  const dup = await single.authorize({ name: "imported", source: resignSource })
+  check("repeating a single import signs the account in again: only its credential is replaced",
+    dup.type === "success" && fs.readFileSync(keptFile, "utf8") === "kept conversation" &&
+    JSON.parse(fs.readFileSync(path.join(importRoot, "imported", "antigravity-cli", "antigravity-oauth-token"), "utf8")).refresh_token === "SYNTHETIC_RESIGN_FIXTURE_ONLY" &&
+    !JSON.stringify(dup).includes("SYNTHETIC"), JSON.stringify(dup))
+  const badResign = await single.authorize({ name: "imported", source: path.join(srcDir, "missing") })
+  check("a failed sign-in again keeps the previous credential",
+    badResign.type === "failed" &&
+    JSON.parse(fs.readFileSync(path.join(importRoot, "imported", "antigravity-cli", "antigravity-oauth-token"), "utf8")).refresh_token === "SYNTHETIC_RESIGN_FIXTURE_ONLY", JSON.stringify(badResign))
   const manifestFile = path.join(srcDir, "manifest.json")
   fs.writeFileSync(manifestFile, JSON.stringify([{ name: "batch-a", source: srcDir }, { name: "batch-b", source: srcDir }]))
   const batched = await batch.authorize({ manifest: manifestFile })

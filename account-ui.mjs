@@ -25,12 +25,12 @@ export const ACCOUNT_ACTIONS = {
 export const ACCOUNT_NAME_PROMPT = {
   type: "text",
   key: "name",
-  message: "New account name (existing accounts are kept; use a new name)",
+  message: "Account name (an existing name signs that account in again: only its credential is replaced, its conversations stay)",
   messages: {
-    zh: "新账号名称（已有账号会保留，请使用未占用的名称）",
-    "zh-TW": "新帳號名稱（既有帳號會保留，請使用尚未使用的名稱）",
-    ja: "新しいアカウント名（既存のアカウントは保持されます。未使用の名前を指定してください）",
-    de: "Neuer Kontoname (vorhandene Konten bleiben erhalten; neuen Namen verwenden)",
+    zh: "账号名称（填写已有名称即重新登录该账号：只替换登录凭据，对话记录保留）",
+    "zh-TW": "帳號名稱（填寫既有名稱即重新登入該帳號：只替換登入憑證，對話紀錄保留）",
+    ja: "アカウント名（既存の名前を指定するとそのアカウントに再ログインします。認証情報のみ置き換え、会話は保持されます）",
+    de: "Kontoname (ein vorhandener Name meldet dieses Konto erneut an: nur die Anmeldedaten werden ersetzt, Unterhaltungen bleiben erhalten)",
   },
   placeholder: "work",
 }

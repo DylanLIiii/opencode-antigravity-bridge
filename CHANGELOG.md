@@ -7,7 +7,8 @@
 - Add `agy-bridge accounts remove <name>` (Magpie removes only its own row and does not notify plugins) and `agy-bridge accounts replace <name> <source>`. Symlinked folders and credentials are unlinked or refused, never followed.
 - Report a missing or invalid account profile as needing sign-in: usage returns `signIn: "expired"`, listings throw with `signIn: "expired"`, and requests answer `X-Magpie-Sign-In: expired`, so Magpie marks the row instead of showing a bare read failure.
 - Only the single-account import form may replace an existing account's credential; a manifest that happens to hold one entry still refuses the name.
-- A catalog read that began before a sign-in again cannot publish its list afterwards (per-account generation guard), so request routing never uses the old credential's models.
+- A catalog read that began before a sign-in again cannot publish its list afterwards (per-account generation guard), so request routing never uses the old credential's models. The caches are invalidated before the credential swap as well as after, and every scope that names the account (`agy:<name>` and `dir:<path>`) is cleared, not just one of them.
+- Match a named account case-insensitively when clearing its state and retiring its processes, the same way account names are unique.
 - Serve each account's `agy models` catalog from a 10-minute cache with one shared background refresh, bounded first wait and last-good retention on failure. Each listing previously started a cold CLI per account (7.5–8.5 s measured), which with quota reads approached Magpie's per-listing budget.
 - Sweep hidden `.login-*`, `.import-*` and `.removed-*` staging folders older than an hour on plugin start and before a sign-in or import.
 

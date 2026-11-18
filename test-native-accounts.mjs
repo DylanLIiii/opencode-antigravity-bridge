@@ -257,11 +257,15 @@ test("signing an account in again keeps its rows and conversations, refreshes it
 
   const probes = () => f.logs().filter(e => e.type === "models" && e.geminiDir === dir).length
   const before = probes()
+  // A sign-in again invalidates the catalog twice (before and after the swap);
+  // either way the next listing must read the account again rather than serve
+  // the old credential's list.
   await plugin.provider.models({}, { auth })
-  assert.equal(probes(), before + 1, "the catalog is read again after a sign-in again")
+  const afterSignIn = probes()
+  assert(afterSignIn > before, "the catalog is read again after a sign-in again")
   await plugin.provider.models({}, { auth })
   await plugin.provider.models({}, { auth })
-  assert.equal(probes(), before + 1, "a fresh catalog is served from cache, not re-read on every listing")
+  assert.equal(probes(), afterSignIn, "a fresh catalog is served from cache, not re-read on every listing")
 
   // Batch imports keep refusing existing names: all-or-nothing, never overwrite.
   const manifest = path.join(f.root, "manifest.json")

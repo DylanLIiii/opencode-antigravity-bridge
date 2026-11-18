@@ -332,7 +332,7 @@ const catalogRefreshing = new Map()
 const catalogGeneration = new Map()
 
 function catalogGenerationOf(account) {
-  return catalogGeneration.get(account.key) ?? 0
+  return account?.key == null ? 0 : catalogGeneration.get(account.key) ?? 0
 }
 
 function catalogKey(agyPath, account) {
@@ -382,11 +382,37 @@ async function listingCatalog(agyPath, account) {
 // and request use the account's current credential.
 function forgetAccountState(account) {
   if (!account) return
-  // Bump first and unconditionally: a refresh already in flight may have no
-  // published catalog yet, and it must still learn that its answer is stale.
-  catalogGeneration.set(account.key, catalogGenerationOf(account) + 1)
+  const name = typeof account.name === "string" ? account.name.toLowerCase() : null
+  // Which account key a cache key belongs to: "…|dir:/x/Work" → "dir:/x/Work".
+  const accountKeyOf = key => key.slice(key.lastIndexOf("|") + 1)
+  const namesAccount = key => {
+    const rest = accountKeyOf(key)
+    if (account.key != null && rest === account.key) return true
+    if (name == null) return false
+    if (rest.startsWith("dir:")) return path.basename(rest.slice(4)).toLowerCase() === name
+    if (rest.startsWith("agy:")) {
+      try { return decodeURIComponent(rest.slice(4)).toLowerCase() === name } catch { return false }
+    }
+    return false
+  }
+  // Bump before forgetting, for every way this account is named: a refresh
+  // already in flight may have no published catalog yet, so it is not in any
+  // map to be found there.
+  const bumped = new Set()
+  if (account.key != null) {
+    bumped.add(account.key)
+    catalogGeneration.set(account.key, catalogGenerationOf(account) + 1)
+  }
   for (const map of [catalogCache, catalogReadAt, catalogRefreshing, offeredProbes]) {
-    for (const key of [...map.keys()]) if (key.endsWith(`|${account.key}`)) map.delete(key)
+    for (const key of [...map.keys()]) {
+      if (!namesAccount(key)) continue
+      const own = accountKeyOf(key)
+      if (!bumped.has(own)) {
+        bumped.add(own)
+        catalogGeneration.set(own, (catalogGeneration.get(own) ?? 0) + 1)
+      }
+      map.delete(key)
+    }
   }
 }
 
@@ -2900,8 +2926,12 @@ function dropFromPool(proc) {
 // ordinary idle path; it is never cut off mid-answer.
 async function retireAccountProcs(accountName) {
   const stops = []
+  // Names are unique case-insensitively, so a sign-in again may spell the name
+  // differently from the profile's own folder name.
+  const wanted = accountName == null ? null : String(accountName).toLowerCase()
   for (const proc of [...allProcs]) {
-    if ((proc.account ?? null) !== (accountName ?? null)) continue
+    const own = proc.account == null ? null : String(proc.account).toLowerCase()
+    if (own !== wanted) continue
     if (proc.dead || proc.stopping || proc.retiring) continue
     if (proc.turn || proc.steering || proc.continuingCancel) {
       // Finishes its response, then is retired (finalizeTurn) and never
@@ -5956,8 +5986,12 @@ async function importResult(entries, complete = () => ({ type: "success", key: "
       // this; a manifest keeps its all-or-nothing, never-overwrite rule even
       // when it holds a single entry.
       if (!(replace && entries.length === 1 && error instanceof ImportError && error.code === "name_collision")) throw error
+      // Invalidate the caches before the swap as well: a models read still
+      // running under the old credential must not publish in between. The
+      // swap itself is what stops the old processes, so that happens after.
+      await onReplace?.(entries[0].name, { retire: false })
       const replaced = replaceAccountCredential(entries[0].name, entries[0].source)
-      await onReplace?.(replaced)
+      await onReplace?.(entries[0].name)
       imported = [replaced]
     }
     accountsCache = null
@@ -6045,15 +6079,21 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
   if (!wslDistro()) sweepStaging()
   // After a sign-in again, nothing learned under the old credential may be used:
   // catalogs, ACP probes, metadata, the dead-sign-in mark, and live processes.
-  const accountChanged = async name => {
+  const accountChanged = async (name, { retire = true } = {}) => {
     accountsCache = null
     invalidateAccounts()
-    const account = name == null ? DEFAULT_ACCOUNT : listAccounts(process.env, { refresh: true }).find(item => item.name === name)
-    forgetAccountState(account)
+    // Names are unique case-insensitively, so a sign-in again may spell the
+    // name differently from the folder that holds the profile.
+    const wanted = name == null ? null : String(name).toLowerCase()
+    const account = wanted == null
+      ? DEFAULT_ACCOUNT
+      : listAccounts(process.env, { refresh: true }).find(item => item.name != null && item.name.toLowerCase() === wanted)
+    // A profile the scan no longer finds still has caches under its name.
+    forgetAccountState(account ?? (wanted == null ? null : { name, key: null }))
     if (account) nativeUsage.delete(account.key)
     forgetStoredSignIn({ dead: true })
     invalidateModelMetadataCache()
-    await retireAccountProcs(name)
+    if (retire) await retireAccountProcs(name)
   }
   const importEntries = async (entries, { signal, replace = false } = {}) => {
     if (signal?.aborted) return { type: "failed", error: "Account import was cancelled." }
@@ -6074,12 +6114,12 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
       } catch {
         return { type: "failed", error: "The profiles were saved, but Magpie could not register every account. Use 'Use a saved Bridge account' to register them without signing in again." }
       }
-    }, { replace, onReplace: replaced => accountChanged(replaced.name) })
+    }, { replace, onReplace: (name, options) => accountChanged(name, options) })
   }
   const accountLogin = createAccountLoginMethod(findAgy, {
     resultForAccount: name => native ? nativeAccountResult(name) : { type: "success", key: "agy" },
-    onImport: (name, { replaced } = {}) => {
-      if (replaced) return accountChanged(name)
+    onImport: (name, { replaced, retire } = {}) => {
+      if (replaced) return accountChanged(name, { retire: retire !== false })
       accountsCache = null
       invalidateAccounts()
       forgetStoredSignIn({ dead: true })

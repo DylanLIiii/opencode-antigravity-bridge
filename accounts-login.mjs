@@ -339,8 +339,15 @@ export function createAccountLoginMethod(findAgy, {
               if (verified.error) throw verified.error
               if (verified.code !== 0 || !verified.stdout.trim()) throw new LoginError("agy could not verify this account's models. Start the sign-in again.")
               if (finishSignal?.aborted || controller.signal.aborted || attempt !== generation) throw new LoginError(CANCELLED)
-              if (existing === undefined) importAccount(name, profile, signInEnv)
-              else replaceAccountCredential(accountName, profile, signInEnv)
+              if (existing === undefined) {
+                importAccount(name, profile, signInEnv)
+              } else {
+                // Invalidate the caches before the swap too: a models read
+                // still running under the old credential must not publish in
+                // between. The swap stops the old processes, so that is after.
+                try { await onImport(accountName, { replaced: true, retire: false }) } catch {}
+                replaceAccountCredential(accountName, profile, signInEnv)
+              }
               // The credential is already published; cleanup failing must
               // not turn a completed sign-in into an error.
               try { await onImport(accountName, { replaced: existing !== undefined }) } catch {}

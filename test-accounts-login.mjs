@@ -161,7 +161,7 @@ test("signing in again under an existing name replaces only the credential and k
   fs.writeFileSync(conversation, "kept conversation")
   const replaced = []
   const method = createAccountLoginMethod(() => "synthetic-agy", {
-    env: f.env, onImport: (name, info) => replaced.push([name, info.replaced]),
+    env: f.env, onImport: (name, info) => replaced.push([name, info.replaced, info.retire === false]),
     spawnProcess: (_file, args, opts) => spawn(process.execPath, [path.join(f.root, "fake-agy.mjs"), ...args], opts),
     resultForAccount: name => ({ type: "success", key: `agy:${name}` }),
     urlTimeoutMs: 2000, finishTimeoutMs: 2000, probeTimeoutMs: 2000, loginTimeoutMs: 5000,
@@ -170,7 +170,8 @@ test("signing in again under an existing name replaces only the credential and k
   const ticket = await method.authorize({ name: "work" })
   assert.equal(ticket.method, "code")
   assert.deepEqual(await ticket.callback(callbackURL()), { type: "success", key: "agy:Work" })
-  assert.deepEqual(replaced, [["Work", true]])
+  assert.deepEqual(replaced, [["Work", true, true], ["Work", true, false]],
+    "caches are invalidated before the swap too, without retiring processes yet")
   assert.equal(JSON.parse(fs.readFileSync(token, "utf8")).refresh_token, SECRET + "_r")
   assert.equal(fs.readFileSync(conversation, "utf8"), "kept conversation")
   assert.deepEqual(f.entries(), ["Work"])

@@ -6102,6 +6102,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
     }
     return importResult(entries, async imported => {
       if (!native) return { type: "success", key: "agy" }
+      // Imported profiles may replace a name this machine used before (a
+      // deleted account, a stale catalog under the same key).
+      for (const account of imported) forgetAccountState({ name: account.name, key: null })
       try {
         // The host saves/settles the first success itself. Other newly imported
         // profiles get deterministic slots through its supported auth interface.
@@ -6119,9 +6122,13 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
   const accountLogin = createAccountLoginMethod(findAgy, {
     resultForAccount: name => native ? nativeAccountResult(name) : { type: "success", key: "agy" },
     onImport: (name, { replaced, retire } = {}) => {
+      // Both a sign-in again and a fresh profile need their caches dropped: a
+      // profile deleted and recreated under the same name keeps the same
+      // account key, so a missing directory does not mean an unused one.
       if (replaced) return accountChanged(name, { retire: retire !== false })
       accountsCache = null
       invalidateAccounts()
+      forgetAccountState({ name, key: null })
       forgetStoredSignIn({ dead: true })
       invalidateModelMetadataCache()
     },

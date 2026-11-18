@@ -321,3 +321,37 @@ test("a row whose profile is gone tells Magpie it needs signing in again", { ski
   const unselected = await plugin.auth.usage(async () => undefined)
   assert.equal(unselected.signIn, "kept")
 })
+
+test("a profile deleted and signed in again under the same name is read afresh", { skip: process.platform === "win32" }, async t => {
+  const f = nativeFixture(), saved = { ...process.env }
+  Object.assign(process.env, f.env)
+  const { AntigravityBridgePlugin } = await import("./index.mjs?recreated")
+  const plugin = await AntigravityBridgePlugin({ magpie: {}, client: { auth: { set: async () => {} } } })
+  t.after(() => {
+    f.cleanup()
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]
+    Object.assign(process.env, saved)
+  })
+  const auth = record("Renamed")
+  assert.deepEqual(await plugin.auth.methods[1].authorize({ name: "Renamed", source: f.source }), nativeAccountResult("Renamed"))
+  const dir = path.join(f.accounts, "Renamed")
+  const probes = () => f.logs().filter(e => e.type === "models" && e.geminiDir === dir).length
+  await plugin.provider.models({}, { auth })
+  const before = probes()
+  assert(before > 0, "the first listing read the catalog")
+
+  // The profile is deleted; the row is not. Signing in again under the same
+  // name through Google creates a new profile at the same path, hence the same
+  // account key. This path goes through the sign-in method, not an import.
+  fs.rmSync(dir, { recursive: true, force: true })
+  const login = plugin.auth.methods[3]
+  const ticket = await login.authorize({ name: "Renamed" })
+  assert.equal(ticket.method, "code")
+  assert.deepEqual(await ticket.callback("https://antigravity.google/oauth-callback?code=4/smoke-login-code&state=smoke-login-state"),
+    nativeAccountResult("Renamed"))
+  assert.ok(fs.existsSync(path.join(dir, "antigravity-cli/antigravity-oauth-token")), "the profile was created again")
+
+  await plugin.provider.models({}, { auth })
+  const after = probes()
+  assert(after > before, `a recreated account is read again, not served the old credential's list (${before} -> ${after})`)
+})

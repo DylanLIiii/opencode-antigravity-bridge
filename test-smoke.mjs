@@ -5125,6 +5125,14 @@ for (const compacted of [true, false]) {
   fs.writeFileSync(manifestFile, JSON.stringify([{ name: "batch-c", source: srcDir }, { name: "imported", source: srcDir }]))
   const rolled = await batch.authorize({ manifest: manifestFile })
   check("a colliding manifest fails before any write", rolled.type === "failed" && !fs.existsSync(path.join(importRoot, "batch-c")))
+  // A one-entry manifest is still a manifest: no replacement, unlike the
+  // single-account form above.
+  fs.writeFileSync(manifestFile, JSON.stringify([{ name: "imported", source: resignSource }]))
+  const oneEntry = await batch.authorize({ manifest: manifestFile })
+  check("a one-entry manifest never overwrites an existing account",
+    oneEntry.type === "failed" && /already exists/.test(oneEntry.error) &&
+    JSON.parse(fs.readFileSync(path.join(importRoot, "imported", "antigravity-cli", "antigravity-oauth-token"), "utf8")).refresh_token === "SYNTHETIC_RESIGN_FIXTURE_ONLY" &&
+    fs.readFileSync(keptFile, "utf8") === "kept conversation", JSON.stringify(oneEntry))
 
   const ticket = await browserLogin.authorize({ name: "browser-account" })
   check("browser login returns the official authorization URL and a native paste callback",

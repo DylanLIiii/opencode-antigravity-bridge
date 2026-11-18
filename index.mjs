@@ -326,6 +326,14 @@ const CATALOG_TTL_MS = 10 * 60_000
 const CATALOG_COLD_WAIT_MS = 12_000
 const catalogReadAt = new Map()
 const catalogRefreshing = new Map()
+// Bumped when an account's credential changes, so a read started under the old
+// credential can never publish its result into the fresh caches. Keyed by the
+// account alone: a refresh may be in flight with no published catalog yet.
+const catalogGeneration = new Map()
+
+function catalogGenerationOf(account) {
+  return catalogGeneration.get(account.key) ?? 0
+}
 
 function catalogKey(agyPath, account) {
   return `${agyPath}|${account.key}`
@@ -334,7 +342,14 @@ function catalogKey(agyPath, account) {
 function refreshCatalog(agyPath, account) {
   const key = catalogKey(agyPath, account)
   if (!catalogRefreshing.has(key)) {
+    const generation = catalogGenerationOf(account)
     const run = loadModelCatalog(agyPath, true, account)
+      .then(catalog => {
+        // Signed in again while this ran: hand back what the new credential's
+        // cache holds, never the old list as this call's answer.
+        if (catalogGenerationOf(account) !== generation) return catalogCache.get(key) ?? catalog
+        return catalog
+      })
       .catch(() => catalogCache.get(key) ?? buildModelCatalog(FALLBACK_MODELS, true))
       .finally(() => { if (catalogRefreshing.get(key) === run) catalogRefreshing.delete(key) })
     catalogRefreshing.set(key, run)
@@ -367,6 +382,9 @@ async function listingCatalog(agyPath, account) {
 // and request use the account's current credential.
 function forgetAccountState(account) {
   if (!account) return
+  // Bump first and unconditionally: a refresh already in flight may have no
+  // published catalog yet, and it must still learn that its answer is stale.
+  catalogGeneration.set(account.key, catalogGenerationOf(account) + 1)
   for (const map of [catalogCache, catalogReadAt, catalogRefreshing, offeredProbes]) {
     for (const key of [...map.keys()]) if (key.endsWith(`|${account.key}`)) map.delete(key)
   }
@@ -551,9 +569,13 @@ async function loadModelCatalog(agyPath, refresh = false, account = DEFAULT_ACCO
   if (refresh && !wslDistro() && (await backgroundBlocked({ dir: account.dir }))) {
     return buildModelCatalog(FALLBACK_MODELS, true)
   }
+  // A sign-in again while this read runs invalidates it: its list, and the
+  // token it was read with, are the old credential's.
+  const generation = catalogGenerationOf(account)
   const extraArgs = account.dir ? [`--gemini_dir=${account.dir}`] : []
   const listed = await listAgyModels(agyPath, extraArgs)
   const catalog = buildModelCatalog(listed.models, listed.isFallback)
+  if (catalogGenerationOf(account) !== generation) return catalogCache.get(key) ?? catalog
   // A failed read must not replace an account's last good catalog.
   const previous = catalogCache.get(key)
   if (catalog.isFallback && previous && !previous.isFallback) return previous
@@ -5921,7 +5943,7 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
 // import existing agy credentials as named accounts. Paths are on the machine
 // running Magpie. They share importAccounts() with `agy-bridge accounts import`;
 // OpenCode retains its shared sentinel; Magpie registers independent accounts.
-async function importResult(entries, complete = () => ({ type: "success", key: "agy" }), { replaceSingle = false, onReplace } = {}) {
+async function importResult(entries, complete = () => ({ type: "success", key: "agy" }), { replace = false, onReplace } = {}) {
   try {
     if (wslDistro()) return { type: "failed", error: "Account import is unavailable in WSL mode; use the distro default account" }
     sweepStaging()
@@ -5930,9 +5952,10 @@ async function importResult(entries, complete = () => ({ type: "success", key: "
       imported = importAccounts(entries)
     } catch (error) {
       // One account under a name that already exists is a sign-in again:
-      // replace only its credential. A batch keeps its all-or-nothing,
-      // never-overwrite rule.
-      if (!(replaceSingle && entries.length === 1 && error instanceof ImportError && error.code === "name_collision")) throw error
+      // replace only its credential. Only the single-account form asks for
+      // this; a manifest keeps its all-or-nothing, never-overwrite rule even
+      // when it holds a single entry.
+      if (!(replace && entries.length === 1 && error instanceof ImportError && error.code === "name_collision")) throw error
       const replaced = replaceAccountCredential(entries[0].name, entries[0].source)
       await onReplace?.(replaced)
       imported = [replaced]
@@ -5969,7 +5992,7 @@ function accountImportMethods(importEntries) { return [
         validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
       },
     ],
-    authorize: async (inputs, options) => importEntries([{ name: String(inputs?.name ?? "").trim(), source: expandHome(inputs?.source) }], options),
+    authorize: async (inputs, options) => importEntries([{ name: String(inputs?.name ?? "").trim(), source: expandHome(inputs?.source) }], { ...options, replace: true }),
   },
   {
     type: "api",
@@ -6032,7 +6055,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
     invalidateModelMetadataCache()
     await retireAccountProcs(name)
   }
-  const importEntries = async (entries, { signal } = {}) => {
+  const importEntries = async (entries, { signal, replace = false } = {}) => {
     if (signal?.aborted) return { type: "failed", error: "Account import was cancelled." }
     if (native && entries.length > 1 && typeof input.client?.auth?.set !== "function") {
       return { type: "failed", error: "This host cannot register multiple Bridge accounts. Import them one at a time." }
@@ -6051,7 +6074,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
       } catch {
         return { type: "failed", error: "The profiles were saved, but Magpie could not register every account. Use 'Use a saved Bridge account' to register them without signing in again." }
       }
-    }, { replaceSingle: true, onReplace: replaced => accountChanged(replaced.name) })
+    }, { replace, onReplace: replaced => accountChanged(replaced.name) })
   }
   const accountLogin = createAccountLoginMethod(findAgy, {
     resultForAccount: name => native ? nativeAccountResult(name) : { type: "success", key: "agy" },

@@ -171,7 +171,10 @@ agy-bridge accounts replace work <source>  # replace only the credential (UI sig
 
 A row whose profile is missing or whose reference is invalid now reports that it
 needs signing in again (usage and requests carry `signIn: "expired"` /
-`X-Magpie-Sign-In: expired`) instead of a bare read error. Hidden staging folders
+`X-Magpie-Sign-In: expired`) instead of a bare read error. Only the single-account
+form replaces a credential; a manifest of any length refuses existing names. A
+catalog read that started before a sign-in again cannot publish its list
+afterwards. Hidden staging folders
 left by interrupted sign-ins or imports are swept on plugin start and on the next
 sign-in (only those older than an hour).
 

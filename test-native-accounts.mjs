@@ -150,8 +150,10 @@ test("real Magpie host keeps two native rows and routes identical models through
   assert.deepEqual(stored[result.account], record("Yazi"))
   assert.deepEqual(stored.unrelated, unrelated)
   assert.equal(Object.keys(stored).length, 3)
+  // An existing name starts a sign-in again; nothing changes until its
+  // callback completes.
   const duplicateGoogle = await call("authorize", { provider, method: 3, account: "new", inputs: { name: "Yazi" } })
-  assert.equal(duplicateGoogle.ok, false)
+  assert.equal(duplicateGoogle.ok, true)
   assert.deepEqual(JSON.parse(fs.readFileSync(authPath, "utf8")), stored)
   const row = (await call("providers", {})).find(p => p.id === provider)
   assert.equal(row.accounts.length, 2)
@@ -197,4 +199,159 @@ test("real Magpie host keeps two native rows and routes identical models through
   await call("reload", { provider })
   assert.equal((await call("providers", {})).find(p => p.id === provider).accounts.length, 4)
   assert(fs.existsSync(path.join(f.accounts, "Yazi/antigravity-cli/antigravity-oauth-token")))
+  // The user's case: the row was removed but the profile stayed. Adding the
+  // same name again through the Google sign-in signs it in again rather than
+  // failing, and gives Magpie a working row back.
+  const conversation = path.join(f.accounts, "Yazi/antigravity-cli/conversations/kept.pb")
+  fs.mkdirSync(path.dirname(conversation), { recursive: true })
+  fs.writeFileSync(conversation, "kept conversation")
+  const readd = await call("authorize", { provider, method: 3, account: "new", inputs: { name: "yazi" } })
+  assert.equal(readd.ok, true)
+  const readded = await call("callback", { session: readd.session, code: "4/smoke-login-code" })
+  assert.equal(readded.ok, true)
+  assert.deepEqual(JSON.parse(fs.readFileSync(authPath, "utf8"))[readded.account], record("Yazi"))
+  assert.equal(fs.readFileSync(conversation, "utf8"), "kept conversation")
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.accounts, "Yazi/antigravity-cli/antigravity-oauth-token"), "utf8")).refresh_token, "SYNTHETIC_LOGIN_FIXTURE_ONLY")
+  const checked = await call("check", { provider, account: readded.account })
+  assert(checked.models.length > 0)
+  assert.equal(checked.usage.windows.length, 1)
+  // A row whose profile is gone: usage marks it as needing sign-in.
+  fs.rmSync(path.join(f.accounts, "batch-b"), { recursive: true })
+  const lapsed = await call("usage", { provider, account: nativeAccountSlot("batch-b") })
+  assert.equal(lapsed.signIn, "expired")
+})
+
+test("signing an account in again keeps its rows and conversations, refreshes its catalog and retires its idle agy", { skip: process.platform === "win32" }, async t => {
+  const f = nativeFixture(), saved = { ...process.env }
+  Object.assign(process.env, f.env)
+  const { AntigravityBridgePlugin } = await import("./index.mjs?resign")
+  const plugin = await AntigravityBridgePlugin({ magpie: {}, client: { auth: { set: async () => {} } } })
+  t.after(() => {
+    f.cleanup()
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]
+    Object.assign(process.env, saved)
+  })
+  const importMethod = plugin.auth.methods[1]
+  assert.deepEqual(await importMethod.authorize({ name: "Work", source: f.source }), nativeAccountResult("Work"))
+  const dir = path.join(f.accounts, "Work")
+  const conversation = path.join(dir, "antigravity-cli", "conversations", "kept.pb")
+  fs.mkdirSync(path.dirname(conversation), { recursive: true })
+  fs.writeFileSync(conversation, "kept conversation")
+  const auth = record("Work")
+  const loader = await plugin.auth.loader(async () => auth)
+  const body = { model: "gemini-test-medium", stream: false, metadata: { user_id: "resign" }, messages: [{ role: "user", content: "before re-sign-in" }] }
+  assert.equal((await loader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(body) })).status, 200)
+  const live = f.logs().filter(e => e.type === "init" && e.geminiDir === dir).at(-1)
+  assert(live, "the account ran in its own agy")
+  const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+  assert(alive(live.pid))
+
+  // Same name, different case: a sign-in again, not a failure.
+  const fresh = path.join(f.root, "fresh-token")
+  fs.writeFileSync(fresh, JSON.stringify({ refresh_token: "SYNTHETIC_RESIGNED" }))
+  assert.deepEqual(await importMethod.authorize({ name: "work", source: fresh }), nativeAccountResult("Work"))
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "antigravity-cli/antigravity-oauth-token"), "utf8")).refresh_token, "SYNTHETIC_RESIGNED")
+  assert.equal(fs.readFileSync(conversation, "utf8"), "kept conversation")
+  for (let i = 0; i < 100 && alive(live.pid); i++) await new Promise(resolve => setTimeout(resolve, 20))
+  assert(!alive(live.pid), "the idle agy holding the old token was stopped")
+
+  const probes = () => f.logs().filter(e => e.type === "models" && e.geminiDir === dir).length
+  const before = probes()
+  // A sign-in again invalidates the catalog twice (before and after the swap);
+  // either way the next listing must read the account again rather than serve
+  // the old credential's list.
+  await plugin.provider.models({}, { auth })
+  const afterSignIn = probes()
+  assert(afterSignIn > before, "the catalog is read again after a sign-in again")
+  await plugin.provider.models({}, { auth })
+  await plugin.provider.models({}, { auth })
+  assert.equal(probes(), afterSignIn, "a fresh catalog is served from cache, not re-read on every listing")
+
+  // Batch imports keep refusing existing names: all-or-nothing, never overwrite.
+  const manifest = path.join(f.root, "manifest.json")
+  fs.writeFileSync(manifest, JSON.stringify([{ name: "Work", source: f.source }, { name: "other", source: f.source }]))
+  assert.equal((await plugin.auth.methods[2].authorize({ manifest })).type, "failed")
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "antigravity-cli/antigravity-oauth-token"), "utf8")).refresh_token, "SYNTHETIC_RESIGNED")
+  assert(!fs.existsSync(path.join(f.accounts, "other")))
+
+  // A response in progress is not cut off: its agy finishes the tool turn
+  // under the old credential, then stops instead of being reused.
+  const request = { model: "gemini-test-medium", stream: true, metadata: { user_id: "resign-busy" }, messages: [{ role: "user", content: "TOOL during re-sign-in" }],
+    tools: [{ name: "echo", description: "Echo", input_schema: { type: "object", properties: { text: { type: "string" } } } }] }
+  const send = payload => loader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify(payload) })
+  const first = parse(await (await send(request)).text())
+  const call = first.find(e => e.data.content_block?.type === "tool_use").data.content_block
+  const args = JSON.parse(first.filter(e => e.data.delta?.type === "input_json_delta").map(e => e.data.delta.partial_json).join(""))
+  const text = first.filter(e => e.data.delta?.type === "text_delta").map(e => e.data.delta.text).join("")
+  const busy = f.logs().filter(e => e.type === "init" && e.geminiDir === dir).at(-1)
+  assert.deepEqual(await importMethod.authorize({ name: "Work", source: f.source }), nativeAccountResult("Work"))
+  assert(alive(busy.pid), "a pending tool turn keeps its agy through a sign-in again")
+  const final = parse(await (await send({ ...request, messages: [...request.messages,
+    { role: "assistant", content: [...(text ? [{ type: "text", text }] : []), { ...call, input: args }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: "busy-result" }] }] })).text())
+  assert.equal(final.find(e => e.event === "message_delta")?.data.delta.stop_reason, "end_turn")
+  for (let i = 0; i < 150 && alive(busy.pid); i++) await new Promise(resolve => setTimeout(resolve, 20))
+  assert(!alive(busy.pid), "it stops once its response is complete")
+})
+
+test("a row whose profile is gone tells Magpie it needs signing in again", { skip: process.platform === "win32" }, async t => {
+  const f = nativeFixture(), saved = { ...process.env }
+  Object.assign(process.env, f.env)
+  const { AntigravityBridgePlugin } = await import("./index.mjs?gone")
+  const plugin = await AntigravityBridgePlugin({ magpie: {} })
+  t.after(() => {
+    f.cleanup()
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]
+    Object.assign(process.env, saved)
+  })
+  const gone = record("Gone")
+  const usage = await plugin.auth.usage(async () => gone)
+  assert.equal(usage.signIn, "expired")
+  assert.match(usage.error, /Sign in again/)
+  await assert.rejects(plugin.provider.models({}, { auth: gone }), error => error.signIn === "expired")
+  const loader = await plugin.auth.loader(async () => gone)
+  const response = await loader.fetch("agy://local/messages", { method: "POST", body: JSON.stringify({
+    model: "gemini-test-medium", stream: false, messages: [{ role: "user", content: "x" }] }) })
+  assert.equal(response.status, 503)
+  assert.equal(response.headers.get("x-magpie-sign-in"), "expired")
+  assert.equal(response.headers.get("x-should-retry"), "false")
+  // A malformed reference also asks for sign-in; a transient failure would not.
+  const invalid = await plugin.auth.usage(async () => ({ type: "api", key: "agy:..%2Fx" }))
+  assert.equal(invalid.signIn, "expired")
+  const unselected = await plugin.auth.usage(async () => undefined)
+  assert.equal(unselected.signIn, "kept")
+})
+
+test("a profile deleted and signed in again under the same name is read afresh", { skip: process.platform === "win32" }, async t => {
+  const f = nativeFixture(), saved = { ...process.env }
+  Object.assign(process.env, f.env)
+  const { AntigravityBridgePlugin } = await import("./index.mjs?recreated")
+  const plugin = await AntigravityBridgePlugin({ magpie: {}, client: { auth: { set: async () => {} } } })
+  t.after(() => {
+    f.cleanup()
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]
+    Object.assign(process.env, saved)
+  })
+  const auth = record("Renamed")
+  assert.deepEqual(await plugin.auth.methods[1].authorize({ name: "Renamed", source: f.source }), nativeAccountResult("Renamed"))
+  const dir = path.join(f.accounts, "Renamed")
+  const probes = () => f.logs().filter(e => e.type === "models" && e.geminiDir === dir).length
+  await plugin.provider.models({}, { auth })
+  const before = probes()
+  assert(before > 0, "the first listing read the catalog")
+
+  // The profile is deleted; the row is not. Signing in again under the same
+  // name through Google creates a new profile at the same path, hence the same
+  // account key. This path goes through the sign-in method, not an import.
+  fs.rmSync(dir, { recursive: true, force: true })
+  const login = plugin.auth.methods[3]
+  const ticket = await login.authorize({ name: "Renamed" })
+  assert.equal(ticket.method, "code")
+  assert.deepEqual(await ticket.callback("https://antigravity.google/oauth-callback?code=4/smoke-login-code&state=smoke-login-state"),
+    nativeAccountResult("Renamed"))
+  assert.ok(fs.existsSync(path.join(dir, "antigravity-cli/antigravity-oauth-token")), "the profile was created again")
+
+  await plugin.provider.models({}, { auth })
+  const after = probes()
+  assert(after > before, `a recreated account is read again, not served the old credential's list (${before} -> ${after})`)
 })

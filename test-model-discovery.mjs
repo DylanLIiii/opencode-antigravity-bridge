@@ -56,7 +56,8 @@ if (args.includes("--version")) { console.log("1.5.7"); process.exit(0) }
 if (args.includes("models")) {
   log({ type: "models-start" })
   await sleep(cfg.cliDelay)
-  process.stdout.write(JSON.parse(process.env.FAKE_CLI).map(([id, name]) => id + "  " + name).join("\n") + "\n")
+  if (cfg.cliMode === "fail") { log({ type: "models-end" }); process.exit(1) }
+  process.stdout.write((cfg.cli || JSON.parse(process.env.FAKE_CLI)).map(([id, name]) => id + "  " + name).join("\n") + "\n")
   log({ type: "models-end" })
   process.exit(0)
 }
@@ -246,4 +247,75 @@ test("cold wait is bounded, and old-CLI refresh preserves and throttles a previo
     delete process.env.AGY_BRIDGE_MODEL_CACHE_TTL_MS
     delete process.env.AGY_BRIDGE_MODEL_PROBE_RETRY_MS
   }
+})
+
+test("a catalog read from before a sign-in again cannot publish its list", async () => {
+  const older = CLI.filter(([id]) => !id.startsWith("gemini-3.8-flash") && !id.startsWith("claude-sonnet"))
+  // An empty ACP probe keeps the CLI list as the only evidence here.
+  const auth = account("resign", { acpMode: "empty", cliDelay: 900 })
+  const ended = () => events().filter(e => e.type === "models-end" && e.scope === "resign").length
+  const started = () => events().filter(e => e.type === "models-start" && e.scope === "resign").length
+  assert.deepEqual(await models(auth), FULL)
+  assert.equal(ended(), 1)
+
+  // A stale catalog starts a background refresh under the old credential, and
+  // that refresh is still running when the credential changes.
+  process.env.AGY_BRIDGE_CATALOG_TTL_MS = "1"
+  try {
+    await sleep(5)
+    configure("resign", { cliDelay: 1500, acpMode: "empty" })
+    assert.deepEqual(await models(auth), FULL, "the stale list is served while it refreshes")
+    for (let i = 0; i < 200 && started() < 2; i++) await sleep(10)
+    assert.equal(ended(), 1, "its refresh is still in flight")
+
+    const { type: _, ...fields } = nativeAccountResult("resign")
+    configure("resign", { cliDelay: 0, acpMode: "empty", cli: older })
+    const fresh = path.join(root, "resign-fresh-token")
+    fs.writeFileSync(fresh, JSON.stringify({ refresh_token: "SYNTHETIC_RESIGNED" }))
+    const resigned = await plugin.auth.methods[1].authorize({ name: "resign", source: fresh })
+    assert.equal(resigned.type, "success", JSON.stringify(resigned))
+
+    // The new credential's read publishes first...
+    const current = await models({ type: "api", ...fields })
+    assert.deepEqual(current, ["claude-opus-5-5", "gemini-4-argon", "gpt-oss-120b-medium"].sort())
+    // ...then the pre-replacement read finishes last, and must not publish.
+    for (let i = 0; i < 400 && ended() < 3; i++) await sleep(10)
+    assert.equal(ended(), 3, "the pre-replacement read finished last")
+    assert.equal(started(), 3)
+    await sleep(100)
+    assert.deepEqual(await models({ type: "api", ...fields }), current,
+      "a read that began under the old credential did not publish over the new list")
+  } finally { delete process.env.AGY_BRIDGE_CATALOG_TTL_MS }
+  await probesSettled("resign")
+})
+
+test("the CLI catalog is served from cache, refreshed once in the background, and kept when a refresh fails", async () => {
+  const auth = account("catalog", { acp: FULL })
+  const cli = () => events().filter(e => e.type === "models-start" && e.scope === "catalog").length
+  assert.deepEqual(await models(auth), FULL)
+  await probesSettled("catalog")
+  assert.equal(cli(), 1)
+  assert.deepEqual(await models(auth), FULL)
+  assert.deepEqual(await models(auth), FULL)
+  assert.equal(cli(), 1, "a fresh catalog does not start the CLI again")
+
+  process.env.AGY_BRIDGE_CATALOG_TTL_MS = "1"
+  try {
+    configure("catalog", { cliDelay: 1500 })
+    await sleep(5)
+    const started = Date.now()
+    const listed = await Promise.all([models(auth), models(auth), models(auth)])
+    assert(Date.now() - started < 1200, "a stale catalog is served without waiting for the CLI")
+    for (const result of listed) assert.deepEqual(result, FULL)
+    for (let i = 0; i < 100 && events().filter(e => e.type === "models-end" && e.scope === "catalog").length < 2; i++) await sleep(50)
+    assert.equal(cli(), 2, "concurrent stale listings share one background refresh")
+
+    configure("catalog", { cliDelay: 0, cliMode: "fail" })
+    await sleep(5)
+    assert.deepEqual(await models(auth), FULL)
+    for (let i = 0; i < 100 && events().filter(e => e.type === "models-end" && e.scope === "catalog").length < 3; i++) await sleep(50)
+    await sleep(50)
+    assert.deepEqual(await models(auth), FULL, "a failed refresh keeps the last good catalog")
+  } finally { delete process.env.AGY_BRIDGE_CATALOG_TTL_MS }
+  await probesSettled("catalog")
 })

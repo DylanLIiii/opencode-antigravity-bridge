@@ -1,5 +1,31 @@
 # Handoff: opencode-antigravity-bridge
 
+## 0.9.2: named-account sign-in again, removal and listing cost
+
+- Cause of the reported loop: Magpie's `signOut` only deletes its own auth row and
+  never calls the plugin, so the profile folder stayed; import and Google sign-in
+  then refused the name as "already exists". A single import or Google sign-in
+  under an existing name (case-insensitive) now replaces only
+  `antigravity-cli/antigravity-oauth-token` (staged beside it, renamed over it);
+  the rest of the profile is untouched. Manifests keep never-overwrite.
+- A credential swap clears that account's catalog, ACP probe, quota reader and
+  dead-sign-in mark and retires its idle agy processes; a process mid-response is
+  flagged `staleCredential`, finishes, then retires and is never reused.
+- `agy-bridge accounts remove|replace` added. A missing/invalid profile reports
+  `signIn: "expired"` (usage, listing error, `X-Magpie-Sign-In` on requests).
+- Listings use a 10-minute per-account `agy models` cache with one background
+  refresh (`listingCatalog`); WSL mode still reads directly so its failures surface.
+  Measured on macOS agy 1.5.10: repeat listings went from 7.5-8.5 s to about 1 ms;
+  the first read per account is unchanged (6-8 s).
+- Validation: `npm test` 426 tests (424 pass, 2 skipped as on main) + 763 smoke
+  checks; the opt-in real-host test passes against Magpie's host script under its
+  Bun 1.4.4, including remove-row-then-re-add. Not exercised: a live Google
+  authorization, the Magpie GUI, Windows. Quota reads still cost about 10 s per
+  account (one `agy -p /usage` run) and are not cached, by existing design.
+- Not plugin-fixable: stale `Yazi/...` model IDs in Magpie's `providers.json`
+  `pickedFrom` and the old quota cache entry; and the default CLI row, whose
+  credential is agy's machine-global keychain login.
+
 ## Magpie UI description and 0.1.2
 
 - Added `magpie.name` and `magpie.summary.en/zh` to `package.json`, matching the

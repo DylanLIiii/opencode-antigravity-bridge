@@ -9,7 +9,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { createUsageReader } from "./usage.mjs"
 import { DEFAULT_ACCOUNT, invalidateAccounts, listAccounts, splitModelAccount } from "./accounts.mjs"
-import { importAccounts, ImportError, readManifest, validateAccountName } from "./accounts-import.mjs"
+import { importAccounts, ImportError, readManifest, replaceAccountCredential, sweepStaging, validateAccountName } from "./accounts-import.mjs"
 import { createAccountLoginMethod } from "./accounts-login.mjs"
 import { NativeAccountError, nativeAccount, nativeAccountResult, nativeAccountSlot, nativeModelId } from "./native-accounts.mjs"
 import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
@@ -316,9 +316,108 @@ async function listAgyModels(agyPath, extraArgs = []) {
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const catalogCache = new Map()
 const offeredProbes = new Map()
+// `agy models` starts a fresh CLI each time: 7.5-8.5 s per account on a warm
+// macOS machine. The model listing ran it on every refresh for every account,
+// close to the host's 20 s budget for a listing plus usage. A listing now
+// serves the last good catalog and refreshes it in the background once it is
+// older than the TTL; only an account's first read waits, and that wait is
+// bounded. Request routing still reads its catalog from the same cache.
+const CATALOG_TTL_MS = 10 * 60_000
+const CATALOG_COLD_WAIT_MS = 12_000
+const catalogReadAt = new Map()
+const catalogRefreshing = new Map()
+// Bumped when an account's credential changes, so a read started under the old
+// credential can never publish its result into the fresh caches. Keyed by the
+// account alone: a refresh may be in flight with no published catalog yet.
+const catalogGeneration = new Map()
+
+function catalogGenerationOf(account) {
+  return account?.key == null ? 0 : catalogGeneration.get(account.key) ?? 0
+}
+
+function catalogKey(agyPath, account) {
+  return `${agyPath}|${account.key}`
+}
+
+function refreshCatalog(agyPath, account) {
+  const key = catalogKey(agyPath, account)
+  if (!catalogRefreshing.has(key)) {
+    const generation = catalogGenerationOf(account)
+    const run = loadModelCatalog(agyPath, true, account)
+      .then(catalog => {
+        // Signed in again while this ran: hand back what the new credential's
+        // cache holds, never the old list as this call's answer.
+        if (catalogGenerationOf(account) !== generation) return catalogCache.get(key) ?? catalog
+        return catalog
+      })
+      .catch(() => catalogCache.get(key) ?? buildModelCatalog(FALLBACK_MODELS, true))
+      .finally(() => { if (catalogRefreshing.get(key) === run) catalogRefreshing.delete(key) })
+    catalogRefreshing.set(key, run)
+  }
+  return catalogRefreshing.get(key)
+}
+
+async function listingCatalog(agyPath, account) {
+  // WSL mode reports a failing distro or agy as an error rather than a cached
+  // or built-in list; keep reading it directly there.
+  if (wslDistro()) return loadModelCatalog(agyPath, true, account)
+  const key = catalogKey(agyPath, account)
+  const held = catalogCache.get(key)
+  const ttl = configuredTimeout("AGY_BRIDGE_CATALOG_TTL_MS", CATALOG_TTL_MS)
+  if (held && !held.isFallback) {
+    if (Date.now() - (catalogReadAt.get(key) ?? 0) >= ttl) void refreshCatalog(agyPath, account)
+    return held
+  }
+  const pending = refreshCatalog(agyPath, account)
+  let timer
+  const ready = await Promise.race([pending, new Promise(resolve => {
+    timer = setTimeout(() => resolve(null), configuredTimeout("AGY_BRIDGE_CATALOG_WAIT_MS", CATALOG_COLD_WAIT_MS))
+    timer.unref?.()
+  })])
+  clearTimeout(timer)
+  return ready ?? catalogCache.get(key) ?? buildModelCatalog(FALLBACK_MODELS, true)
+}
+
+// Forget everything learned about one account, so the next listing, quota read
+// and request use the account's current credential.
+function forgetAccountState(account) {
+  if (!account) return
+  const name = typeof account.name === "string" ? account.name.toLowerCase() : null
+  // Which account key a cache key belongs to: "…|dir:/x/Work" → "dir:/x/Work".
+  const accountKeyOf = key => key.slice(key.lastIndexOf("|") + 1)
+  const namesAccount = key => {
+    const rest = accountKeyOf(key)
+    if (account.key != null && rest === account.key) return true
+    if (name == null) return false
+    if (rest.startsWith("dir:")) return path.basename(rest.slice(4)).toLowerCase() === name
+    if (rest.startsWith("agy:")) {
+      try { return decodeURIComponent(rest.slice(4)).toLowerCase() === name } catch { return false }
+    }
+    return false
+  }
+  // Bump before forgetting, for every way this account is named: a refresh
+  // already in flight may have no published catalog yet, so it is not in any
+  // map to be found there.
+  const bumped = new Set()
+  if (account.key != null) {
+    bumped.add(account.key)
+    catalogGeneration.set(account.key, catalogGenerationOf(account) + 1)
+  }
+  for (const map of [catalogCache, catalogReadAt, catalogRefreshing, offeredProbes]) {
+    for (const key of [...map.keys()]) {
+      if (!namesAccount(key)) continue
+      const own = accountKeyOf(key)
+      if (!bumped.has(own)) {
+        bumped.add(own)
+        catalogGeneration.set(own, (catalogGeneration.get(own) ?? 0) + 1)
+      }
+      map.delete(key)
+    }
+  }
+}
 
 function catalogWarming() {
-  const pending = [...offeredProbes.values()].map(entry => entry.promise).filter(Boolean)
+  const pending = [...[...offeredProbes.values()].map(entry => entry.promise), ...catalogRefreshing.values()].filter(Boolean)
   return pending.length ? Promise.allSettled(pending).then(() => undefined) : null
 }
 
@@ -496,10 +595,18 @@ async function loadModelCatalog(agyPath, refresh = false, account = DEFAULT_ACCO
   if (refresh && !wslDistro() && (await backgroundBlocked({ dir: account.dir }))) {
     return buildModelCatalog(FALLBACK_MODELS, true)
   }
+  // A sign-in again while this read runs invalidates it: its list, and the
+  // token it was read with, are the old credential's.
+  const generation = catalogGenerationOf(account)
   const extraArgs = account.dir ? [`--gemini_dir=${account.dir}`] : []
   const listed = await listAgyModels(agyPath, extraArgs)
   const catalog = buildModelCatalog(listed.models, listed.isFallback)
+  if (catalogGenerationOf(account) !== generation) return catalogCache.get(key) ?? catalog
+  // A failed read must not replace an account's last good catalog.
+  const previous = catalogCache.get(key)
+  if (catalog.isFallback && previous && !previous.isFallback) return previous
   catalogCache.set(key, catalog)
+  if (!catalog.isFallback) catalogReadAt.set(key, Date.now())
   return catalog
 }
 
@@ -2586,7 +2693,12 @@ class Proc {
       if (this.compaction) {
         dropFromPool(this)
         this.stop().catch(() => {})
-      } else if (!this.stopping && !this.retiring) park(this)
+      } else if (!this.stopping && !this.retiring) {
+        park(this)
+        // Its account was signed in again while it answered: stop it now, so
+        // the next prompt resumes the parked session under the new credential.
+        if (this.staleCredential && !this.steering && !this.continuingCancel) retire(this.convKey, this).catch(() => {})
+      }
     }
   }
 
@@ -2805,6 +2917,31 @@ function extractAgentError(text) {
 
 function dropFromPool(proc) {
   if (pool.get(proc.convKey) === proc) pool.delete(proc.convKey)
+}
+
+// A running agy keeps the access token it started with. After an account's
+// credential is replaced, its idle processes are stopped (their sessions stay
+// parked on disk, so the next request resumes them under the new credential).
+// A process with a response in progress finishes it and is then retired by the
+// ordinary idle path; it is never cut off mid-answer.
+async function retireAccountProcs(accountName) {
+  const stops = []
+  // Names are unique case-insensitively, so a sign-in again may spell the name
+  // differently from the profile's own folder name.
+  const wanted = accountName == null ? null : String(accountName).toLowerCase()
+  for (const proc of [...allProcs]) {
+    const own = proc.account == null ? null : String(proc.account).toLowerCase()
+    if (own !== wanted) continue
+    if (proc.dead || proc.stopping || proc.retiring) continue
+    if (proc.turn || proc.steering || proc.continuingCancel) {
+      // Finishes its response, then is retired (finalizeTurn) and never
+      // reused for another prompt (acquireProcLocked, findFlattenedProc).
+      proc.staleCredential = true
+      continue
+    }
+    stops.push(retire(proc.convKey, proc))
+  }
+  await Promise.allSettled(stops)
 }
 
 function digest(value) {
@@ -3112,7 +3249,7 @@ async function withAcquireLock(key, fn) {
 }
 
 function findFlattenedProc(opts) {
-  const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.turn && !proc.steering && !proc.continuingCancel && proc.hasSentFirstTurn &&
+  const candidates = [...pool.values()].filter(proc => !proc.dead && !proc.retiring && !proc.staleCredential && !proc.turn && !proc.steering && !proc.continuingCancel && proc.hasSentFirstTurn &&
     (proc.account || null) === (opts.account || null) && proc.agyPath === findAgy() && proc.userId === (opts.userId || "") &&
     proc.workDir === opts.workDir && proc.model === opts.model && proc.toolsSignature === JSON.stringify(opts.tools) &&
     sameInstructions(proc.instructions, opts.instructions) && isContinuedOpening(proc, opts.messages?.[0]))
@@ -3265,7 +3402,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
         matchedHistory = opts.messages.slice(0, k)
       }
     }
-    const compatible = !forceNew && !existing.dead && !existing.retiring &&
+    const compatible = !forceNew && !existing.dead && !existing.retiring && !existing.staleCredential &&
       existing.workDir === opts.workDir && sameInstructions(existing.instructions, opts.instructions) &&
       existing.matchesHistory(matchedHistory)
     if (compatible && !(isFreshConversation && existing.hasSentFirstTurn)) {
@@ -5836,10 +5973,27 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, p
 // import existing agy credentials as named accounts. Paths are on the machine
 // running Magpie. They share importAccounts() with `agy-bridge accounts import`;
 // OpenCode retains its shared sentinel; Magpie registers independent accounts.
-async function importResult(entries, complete = () => ({ type: "success", key: "agy" })) {
+async function importResult(entries, complete = () => ({ type: "success", key: "agy" }), { replace = false, onReplace } = {}) {
   try {
     if (wslDistro()) return { type: "failed", error: "Account import is unavailable in WSL mode; use the distro default account" }
-    const imported = importAccounts(entries)
+    sweepStaging()
+    let imported
+    try {
+      imported = importAccounts(entries)
+    } catch (error) {
+      // One account under a name that already exists is a sign-in again:
+      // replace only its credential. Only the single-account form asks for
+      // this; a manifest keeps its all-or-nothing, never-overwrite rule even
+      // when it holds a single entry.
+      if (!(replace && entries.length === 1 && error instanceof ImportError && error.code === "name_collision")) throw error
+      // Invalidate the caches before the swap as well: a models read still
+      // running under the old credential must not publish in between. The
+      // swap itself is what stops the old processes, so that happens after.
+      await onReplace?.(entries[0].name, { retire: false })
+      const replaced = replaceAccountCredential(entries[0].name, entries[0].source)
+      await onReplace?.(entries[0].name)
+      imported = [replaced]
+    }
     accountsCache = null
     invalidateAccounts()
     return await complete(imported)
@@ -5872,7 +6026,7 @@ function accountImportMethods(importEntries) { return [
         validate: value => String(value ?? "").trim() ? undefined : "path required / 请输入路径",
       },
     ],
-    authorize: async (inputs, options) => importEntries([{ name: String(inputs?.name ?? "").trim(), source: expandHome(inputs?.source) }], options),
+    authorize: async (inputs, options) => importEntries([{ name: String(inputs?.name ?? "").trim(), source: expandHome(inputs?.source) }], { ...options, replace: true }),
   },
   {
     type: "api",
@@ -5921,13 +6075,36 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
   }
   const readUsage = createUsageReader(findAgy, { resolveAccounts: agy => getAccounts(agy) })
   const nativeUsage = new Map()
-  const importEntries = async (entries, { signal } = {}) => {
+  // Leftovers of sign-ins a killed host never finished.
+  if (!wslDistro()) sweepStaging()
+  // After a sign-in again, nothing learned under the old credential may be used:
+  // catalogs, ACP probes, metadata, the dead-sign-in mark, and live processes.
+  const accountChanged = async (name, { retire = true } = {}) => {
+    accountsCache = null
+    invalidateAccounts()
+    // Names are unique case-insensitively, so a sign-in again may spell the
+    // name differently from the folder that holds the profile.
+    const wanted = name == null ? null : String(name).toLowerCase()
+    const account = wanted == null
+      ? DEFAULT_ACCOUNT
+      : listAccounts(process.env, { refresh: true }).find(item => item.name != null && item.name.toLowerCase() === wanted)
+    // A profile the scan no longer finds still has caches under its name.
+    forgetAccountState(account ?? (wanted == null ? null : { name, key: null }))
+    if (account) nativeUsage.delete(account.key)
+    forgetStoredSignIn({ dead: true })
+    invalidateModelMetadataCache()
+    if (retire) await retireAccountProcs(name)
+  }
+  const importEntries = async (entries, { signal, replace = false } = {}) => {
     if (signal?.aborted) return { type: "failed", error: "Account import was cancelled." }
     if (native && entries.length > 1 && typeof input.client?.auth?.set !== "function") {
       return { type: "failed", error: "This host cannot register multiple Bridge accounts. Import them one at a time." }
     }
     return importResult(entries, async imported => {
       if (!native) return { type: "success", key: "agy" }
+      // Imported profiles may replace a name this machine used before (a
+      // deleted account, a stale catalog under the same key).
+      for (const account of imported) forgetAccountState({ name: account.name, key: null })
       try {
         // The host saves/settles the first success itself. Other newly imported
         // profiles get deterministic slots through its supported auth interface.
@@ -5940,18 +6117,22 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
       } catch {
         return { type: "failed", error: "The profiles were saved, but Magpie could not register every account. Use 'Use a saved Bridge account' to register them without signing in again." }
       }
-    })
+    }, { replace, onReplace: (name, options) => accountChanged(name, options) })
   }
   const accountLogin = createAccountLoginMethod(findAgy, {
     resultForAccount: name => native ? nativeAccountResult(name) : { type: "success", key: "agy" },
-    onImport: () => {
-    accountsCache = null
-    invalidateAccounts()
-    catalogCache.clear()
-    offeredProbes.clear()
-    forgetStoredSignIn({ dead: true })
-    invalidateModelMetadataCache()
-  } })
+    onImport: (name, { replaced, retire } = {}) => {
+      // Both a sign-in again and a fresh profile need their caches dropped: a
+      // profile deleted and recreated under the same name keeps the same
+      // account key, so a missing directory does not mean an unused one.
+      if (replaced) return accountChanged(name, { retire: retire !== false })
+      accountsCache = null
+      invalidateAccounts()
+      forgetAccountState({ name, key: null })
+      forgetStoredSignIn({ dead: true })
+      invalidateModelMetadataCache()
+    },
+  })
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -5977,7 +6158,9 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
             createUsageReader(findAgy, { resolveAccounts: () => [{ ...account, name: null }] }))
           return await nativeUsage.get(account.key)()
         } catch (error) {
-          return { windows: [], error: error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", signIn: "kept" }
+          // A row whose profile is gone can only be fixed by signing it in
+          // again (or removing it); say so, so Magpie marks the row.
+          return { windows: [], error: error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", signIn: error?.signIn === "expired" ? "expired" : "kept" }
         }
       },
       methods: [
@@ -6093,7 +6276,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 modelId = parsed.model
               }
             } catch (error) {
-              return jsonError(error.statusCode ?? 503, error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", error.code, true)
+              return jsonError(error.statusCode ?? 503, error instanceof NativeAccountError ? error.message : "Could not read the selected Bridge account.", error.code,
+                { noRetry: true, ...(error?.signIn === "expired" ? { headers: { "X-Magpie-Sign-In": "expired" } } : {}) })
             }
             if (!account.dir && !wslDistro()) {
               const notSignedIn = cannotSignIn(storedSignInNow())
@@ -6430,7 +6614,7 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
         const out = {}
         const accountFallbacks = await Promise.all(accounts.map(async account => {
           const blocked = agy && !wslDistro() ? await backgroundBlocked({ dir: account.dir }) : ""
-          const catalogPromise = agy && !blocked ? loadModelCatalog(agy, true, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS, true))
+          const catalogPromise = agy && !blocked ? listingCatalog(agy, account) : Promise.resolve(buildModelCatalog(FALLBACK_MODELS, true))
           const offeredPromise = agy && !blocked
             ? probeOfferedModels(agy, account, configuredTimeout("AGY_BRIDGE_MODEL_PROBE_WAIT_MS", MODEL_PROBE_WAIT_MS))
             : Promise.resolve(null)

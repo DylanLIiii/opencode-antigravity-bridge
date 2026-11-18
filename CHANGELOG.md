@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.2
+
+- Sign an existing named account in again from **Add a Google account** or **Import an account** by entering its name (case-insensitive). Only its credential file is replaced, staged in the same folder and renamed over the old one; conversations, settings and logs stay, and any failure keeps the previous credential. Previously an existing folder refused the name, so an account whose Magpie row had been removed could not be added back. Manifest imports still never overwrite.
+- After a sign-in again, drop that account's cached catalog, ACP probes, quota reader and dead-sign-in mark, and stop its idle agy processes so the next request uses the new credential; a response in progress finishes first.
+- Add `agy-bridge accounts remove <name>` (Magpie removes only its own row and does not notify plugins) and `agy-bridge accounts replace <name> <source>`. Symlinked folders and credentials are unlinked or refused, never followed.
+- Report a missing or invalid account profile as needing sign-in: usage returns `signIn: "expired"`, listings throw with `signIn: "expired"`, and requests answer `X-Magpie-Sign-In: expired`, so Magpie marks the row instead of showing a bare read failure.
+- Only the single-account import form may replace an existing account's credential; a manifest that happens to hold one entry still refuses the name.
+- A catalog read that began before a sign-in again cannot publish its list afterwards (per-account generation guard), so request routing never uses the old credential's models. The caches are invalidated before the credential swap as well as after, and every scope that names the account (`agy:<name>` and `dir:<path>`) is cleared, not just one of them.
+- Match a named account case-insensitively when clearing its state and retiring its processes, the same way account names are unique.
+- Retry the `resume append` protocol test once when its fixture child exits before starting a session, a spawn flake seen on loaded Windows runners (and on `main`'s jobs) rather than a protocol result.
+- Drop a name's cached catalogs and probes after every successful sign-in or import, including one that creates a profile afresh: a profile deleted and signed in again under the same name keeps the same account key, so it must not serve the previous credential's models for the cache's lifetime.
+- Serve each account's `agy models` catalog from a 10-minute cache with one shared background refresh, bounded first wait and last-good retention on failure. Each listing previously started a cold CLI per account (7.5–8.5 s measured), which with quota reads approached Magpie's per-listing budget.
+- Sweep hidden `.login-*`, `.import-*` and `.removed-*` staging folders older than an hour on plugin start and before a sign-in or import.
+
 ## 0.9.1
 
 - Declare a 512,000-token context window to Magpie and OpenCode for the official agy CLI, bounded by smaller model limits. Require a selected, verified managed unlock for larger windows, up to the model's physical limit (maximum 1,048,576); model metadata and `AGY_BRIDGE_CONTEXT_WINDOW` can no longer bypass the official ceiling. Keep GPT-OSS capped at 131,072.

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // agy-bridge: account import and optional context unlock for the Magpie bridge.
 import { accountsRootDir, listAccounts } from "../accounts.mjs"
-import { ImportError, importAccount, importManifest } from "../accounts-import.mjs"
+import { ImportError, importAccount, importManifest, removeAccount, replaceAccountCredential } from "../accounts-import.mjs"
 import { ContextError, contextStatus, disableContext, unlockContext } from "../context-unlock.mjs"
 
 import { wslDistro } from "../platform.mjs"
@@ -10,11 +10,15 @@ const USAGE = `Usage:
   agy-bridge accounts list
   agy-bridge accounts import <name> <agy-profile-dir | antigravity-oauth-token file>
   agy-bridge accounts import --manifest <manifest.json>
+  agy-bridge accounts replace <name> <agy-profile-dir | antigravity-oauth-token file>
+                                 replace only the credential; conversations stay
+  agy-bridge accounts remove <name>
+                                 delete the profile on disk (remove its Magpie row too)
   agy-bridge context status
   agy-bridge context unlock      copy official agy, patch only the copy (default off)
   agy-bridge context disable [--purge]
 
-Existing accounts are never overwritten. Paths are on this machine.
+import never overwrites an existing account; use replace for that. Paths are on this machine.
 Restart Magpie after a context change; running sessions keep their current agy.`
 
 function printStatus(status, out) {
@@ -44,6 +48,20 @@ export function main(argv, { out = console.log, env = process.env } = {}) {
       if (!created) { out(USAGE); return 2 }
       for (const item of created) out(`imported ${item.name} -> ${item.dir}`)
       out("Refresh Magpie's model list to see the new account(s).")
+      return 0
+    }
+    if (area === "accounts" && action === "replace") {
+      if (rest.length !== 2 || rest[0].startsWith("-")) { out(USAGE); return 2 }
+      const replaced = replaceAccountCredential(rest[0], rest[1], env)
+      out(`replaced the credential of ${replaced.name} -> ${replaced.dir}`)
+      out("Restart Magpie, or sign in again from Magpie, so running agy processes pick it up.")
+      return 0
+    }
+    if (area === "accounts" && action === "remove") {
+      if (rest.length !== 1 || rest[0].startsWith("-")) { out(USAGE); return 2 }
+      const removed = removeAccount(rest[0], env)
+      out(`removed ${removed.name} (${removed.dir})`)
+      out("Remove its row in Magpie too; a remaining row reports that the account needs signing in again.")
       return 0
     }
     if (area === "context" && action === "status" && rest.length === 0) { printStatus(contextStatus({ env, full: true }), out); return 0 }

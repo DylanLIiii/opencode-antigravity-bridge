@@ -99,7 +99,7 @@ test("native OAuth method asks for a named account and publishes only after call
   assert.equal(f.method.type, "oauth")
   assert.match(f.method.label, /Google/)
   assert.equal(f.method.labels.zh, "新增 Google 账号")
-  assert.match(f.method.prompts[0].messages.zh, /已有账号会保留/)
+  assert.match(f.method.prompts[0].messages.zh, /重新登录.*只替换登录凭据.*对话记录保留/)
   assert.equal(f.method.prompts[0].key, "name")
   assert.ok(f.method.prompts[0].validate("../bad"))
   assert.equal(f.method.prompts[0].validate("work"), undefined)
@@ -139,15 +139,67 @@ test("raw authorization codes are accepted, and a real WSL interop path is prese
   assert.equal(f.calls()[0].fileStorage, f.env.WSL_INTEROP)
 })
 
-test("bad names, missing CLI and existing names fail before spawning", async t => {
+test("bad names, missing CLI and a non-folder existing name fail before spawning", async t => {
   const f = fixture(t)
   failed(await f.begin("../bad"), /name/i)
   assert.equal(f.calls().length, 0)
-  fs.mkdirSync(path.join(f.accounts, "WORK"), { recursive: true })
-  failed(await f.begin("work"), /already exists/i)
+  fs.mkdirSync(f.accounts, { recursive: true })
+  fs.writeFileSync(path.join(f.accounts, "FILE"), "not an account")
+  failed(await f.begin("file"), /not a regular account folder/i)
   assert.equal(f.calls().length, 0)
   const method = createAccountLoginMethod(() => null, { env: f.env })
   failed(await method.authorize({ name: "fresh" }), /not found|install/i)
+})
+
+test("signing in again under an existing name replaces only the credential and keeps the profile", async t => {
+  const f = fixture(t)
+  const dir = path.join(f.accounts, "Work")
+  const token = path.join(dir, TOKEN_RELATIVE)
+  const conversation = path.join(dir, "antigravity-cli", "conversations", "kept.pb")
+  fs.mkdirSync(path.dirname(conversation), { recursive: true, mode: 0o700 })
+  fs.writeFileSync(token, JSON.stringify({ refresh_token: "OLD_SYNTHETIC" }), { mode: 0o600 })
+  fs.writeFileSync(conversation, "kept conversation")
+  const replaced = []
+  const method = createAccountLoginMethod(() => "synthetic-agy", {
+    env: f.env, onImport: (name, info) => replaced.push([name, info.replaced, info.retire === false]),
+    spawnProcess: (_file, args, opts) => spawn(process.execPath, [path.join(f.root, "fake-agy.mjs"), ...args], opts),
+    resultForAccount: name => ({ type: "success", key: `agy:${name}` }),
+    urlTimeoutMs: 2000, finishTimeoutMs: 2000, probeTimeoutMs: 2000, loginTimeoutMs: 5000,
+  })
+  // Different case: names are unique case-insensitively, so this is "Work".
+  const ticket = await method.authorize({ name: "work" })
+  assert.equal(ticket.method, "code")
+  assert.deepEqual(await ticket.callback(callbackURL()), { type: "success", key: "agy:Work" })
+  assert.deepEqual(replaced, [["Work", true, true], ["Work", true, false]],
+    "caches are invalidated before the swap too, without retiring processes yet")
+  assert.equal(JSON.parse(fs.readFileSync(token, "utf8")).refresh_token, SECRET + "_r")
+  assert.equal(fs.readFileSync(conversation, "utf8"), "kept conversation")
+  assert.deepEqual(f.entries(), ["Work"])
+  assert.deepEqual(fs.readdirSync(path.dirname(token)).filter(n => n.endsWith(".tmp")), [], "no staged token is left behind")
+  if (process.platform !== "win32") assert.equal(fs.statSync(token).mode & 0o777, 0o600)
+})
+
+test("a failed sign-in again leaves the previous credential untouched", async t => {
+  const f = fixture(t, "probe-fail")
+  const token = path.join(f.accounts, "work", TOKEN_RELATIVE)
+  fs.mkdirSync(path.dirname(token), { recursive: true })
+  fs.writeFileSync(token, "previous credential")
+  const ticket = await f.begin("work")
+  failed(await ticket.callback(callbackURL()), /verify/i)
+  assert.equal(fs.readFileSync(token, "utf8"), "previous credential")
+  assert.equal(f.imports(), 0)
+})
+
+test("stale staging from an interrupted sign-in is swept; a fresh one is kept", async t => {
+  const f = fixture(t)
+  fs.mkdirSync(path.join(f.accounts, ".login-old", "profile"), { recursive: true })
+  fs.mkdirSync(path.join(f.accounts, ".login-live"), { recursive: true })
+  const past = new Date(Date.now() - 2 * 60 * 60_000)
+  fs.utimesSync(path.join(f.accounts, ".login-old"), past, past)
+  const ticket = await f.begin("swept")
+  assert.ok(!fs.existsSync(path.join(f.accounts, ".login-old")))
+  assert.ok(fs.existsSync(path.join(f.accounts, ".login-live")))
+  assert.equal((await ticket.callback(callbackURL())).type, "success")
 })
 
 for (const [label, value] of [

@@ -175,6 +175,112 @@ export function importAccount(name, source, env = process.env) {
   return importAccounts([{ name, source }], env)
 }
 
+// The existing account directory whose name matches `name` ignoring case, or
+// null. Names are unique case-insensitively, so there is at most one.
+function existingAccountDir(root, name) {
+  let entries
+  try { entries = fs.readdirSync(root) } catch { return null }
+  const found = entries.find(entry => entry.toLowerCase() === name.toLowerCase())
+  return found === undefined ? null : { name: found, dir: path.join(root, found) }
+}
+
+// Sign in again to an existing named account: replace only its credential
+// file. Conversations, settings and logs in the profile stay. The new token is
+// staged in the account's own antigravity-cli directory and renamed over the
+// old one, so a failure at any step leaves the previous credential in place.
+// A symlinked or non-directory destination is refused, never followed.
+export function replaceAccountCredential(name, source, env = process.env) {
+  validateAccountName(name)
+  const root = accountsRootDir(env)
+  const existing = existingAccountDir(root, name)
+  if (!existing) throw new ImportError(`account "${name}" does not exist; add it as a new account`, "not_found")
+  const bytes = readSource(source, "account")
+  let stat
+  try { stat = fs.lstatSync(existing.dir) } catch {
+    throw new ImportError(`account "${existing.name}" disappeared; add it as a new account`, "not_found")
+  }
+  if (!stat.isDirectory()) throw new ImportError(`account "${existing.name}" is not a regular account folder; remove it first`, "invalid_destination")
+  const app = path.join(existing.dir, "antigravity-cli")
+  try {
+    const appStat = fs.lstatSync(app)
+    if (!appStat.isDirectory()) throw new ImportError(`account "${existing.name}" has an unexpected credential folder; remove it first`, "invalid_destination")
+  } catch (error) {
+    if (error instanceof ImportError) throw error
+    if (error.code !== "ENOENT") throw new ImportError(`could not read account "${existing.name}": ${error.code || "unexpected error"}`, "write_failed")
+    fs.mkdirSync(app, { mode: 0o700 })
+  }
+  const token = path.join(app, "antigravity-oauth-token")
+  try {
+    if (fs.lstatSync(token).isSymbolicLink()) throw new ImportError(`account "${existing.name}" has a linked credential; remove it first`, "invalid_destination")
+  } catch (error) {
+    if (error instanceof ImportError) throw error
+    if (error.code !== "ENOENT") throw new ImportError(`could not read account "${existing.name}": ${error.code || "unexpected error"}`, "write_failed")
+  }
+  const staged = path.join(app, `.antigravity-oauth-token.${process.pid}.${Date.now()}.tmp`)
+  try {
+    fs.writeFileSync(staged, bytes, { mode: 0o600, flag: "wx" })
+    fs.chmodSync(staged, 0o600)
+    fs.renameSync(staged, token)
+  } catch (error) {
+    try { fs.rmSync(staged, { force: true }) } catch {}
+    throw new ImportError(`could not replace the credential of "${existing.name}": ${error.code || "unexpected error"}`, "write_failed")
+  }
+  invalidateAccounts()
+  return { name: existing.name, dir: existing.dir, replaced: true }
+}
+
+// Delete a named account's profile on disk. The host's account row is the
+// host's to remove; Magpie does not tell plugins when a row is removed, so
+// this is the only way to release the name and the stored credential.
+// The directory is renamed to a hidden staging name first, so discovery never
+// lists a half-deleted profile. Symlinks are unlinked, never followed.
+export function removeAccount(name, env = process.env) {
+  validateAccountName(name)
+  const root = accountsRootDir(env)
+  const existing = existingAccountDir(root, name)
+  if (!existing) throw new ImportError(`account "${name}" does not exist`, "not_found")
+  let stat
+  try { stat = fs.lstatSync(existing.dir) } catch {
+    throw new ImportError(`account "${name}" does not exist`, "not_found")
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    // unlink removes the link itself; rmSync would refuse a link to a folder.
+    try { fs.unlinkSync(existing.dir) } catch (error) {
+      throw new ImportError(`could not remove account "${existing.name}": ${error.code || "unexpected error"}`, "remove_failed")
+    }
+    invalidateAccounts()
+    return { name: existing.name, dir: existing.dir }
+  }
+  const trash = path.join(root, `.removed-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+  try { fs.renameSync(existing.dir, trash) } catch (error) {
+    throw new ImportError(`could not remove account "${existing.name}": ${error.code || "unexpected error"}`, "remove_failed")
+  }
+  invalidateAccounts()
+  try { fs.rmSync(trash, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) } catch {}
+  return { name: existing.name, dir: existing.dir }
+}
+
+// Leftovers of interrupted imports, sign-ins and removals. A host that kills
+// the plugin mid-sign-in leaves `.login-*`, which may hold a half-finished
+// profile. Only entries older than `maxAgeMs` go, so live work is never touched.
+const STAGING_PREFIXES = [".login-", ".import-", ".removed-"]
+export function sweepStaging(env = process.env, { maxAgeMs = 60 * 60_000, now = Date.now() } = {}) {
+  const root = accountsRootDir(env)
+  const removed = []
+  let entries
+  try { entries = fs.readdirSync(root, { withFileTypes: true }) } catch { return removed }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !STAGING_PREFIXES.some(prefix => entry.name.startsWith(prefix))) continue
+    const dir = path.join(root, entry.name)
+    try {
+      if (now - fs.lstatSync(dir).mtimeMs < maxAgeMs) continue
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+      removed.push(entry.name)
+    } catch {}
+  }
+  return removed
+}
+
 export function importManifest(manifestPath, env = process.env) {
   return importAccounts(readManifest(manifestPath), env)
 }

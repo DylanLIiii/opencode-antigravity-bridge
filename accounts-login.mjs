@@ -5,7 +5,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { spawn, spawnSync } from "node:child_process"
 import { accountsRootDir } from "./accounts.mjs"
-import { importAccount, ImportError, TOKEN_RELATIVE, validateAccountName } from "./accounts-import.mjs"
+import { importAccount, ImportError, replaceAccountCredential, sweepStaging, TOKEN_RELATIVE, validateAccountName } from "./accounts-import.mjs"
 import { agySpawnSpec, childEnv } from "./platform.mjs"
 import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
 
@@ -221,10 +221,24 @@ export function createAccountLoginMethod(findAgy, {
         // A plugin can change process.env while the user is in the browser.
         // Publish to the same root this sign-in started with, even then.
         const signInEnv = { ...env, AGY_BRIDGE_ACCOUNTS_DIR: root }
-        if (fs.existsSync(root) && fs.readdirSync(root).some(entry => entry.toLowerCase() === name.toLowerCase())) {
-          throw new LoginError(`Account "${name}" already exists; choose another name.`)
+        // An existing name is a sign-in again: only its credential is
+        // replaced when the login completes; its conversations stay.
+        // Decided here so a name taken while the user is in the browser is
+        // still refused rather than silently overwritten.
+        const existing = fs.existsSync(root)
+          ? fs.readdirSync(root).find(entry => entry.toLowerCase() === name.toLowerCase())
+          : undefined
+        const accountName = existing ?? name
+        if (existing !== undefined) {
+          // Refuse a destination the credential swap would refuse anyway,
+          // before the user spends a browser round trip on it.
+          let stat
+          try { stat = fs.lstatSync(path.join(root, existing)) } catch {}
+          if (!stat?.isDirectory()) throw new LoginError(`"${existing}" in the accounts folder is not a regular account folder; remove it first.`)
         }
         fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+        // Leftovers of sign-ins a killed host never finished.
+        sweepStaging(signInEnv)
         const stage = fs.mkdtempSync(path.join(root, ".login-"))
         const controller = new AbortController()
         const children = []
@@ -325,9 +339,19 @@ export function createAccountLoginMethod(findAgy, {
               if (verified.error) throw verified.error
               if (verified.code !== 0 || !verified.stdout.trim()) throw new LoginError("agy could not verify this account's models. Start the sign-in again.")
               if (finishSignal?.aborted || controller.signal.aborted || attempt !== generation) throw new LoginError(CANCELLED)
-              importAccount(name, profile, signInEnv)
-              onImport()
-              return resultForAccount(name)
+              if (existing === undefined) {
+                importAccount(name, profile, signInEnv)
+              } else {
+                // Invalidate the caches before the swap too: a models read
+                // still running under the old credential must not publish in
+                // between. The swap stops the old processes, so that is after.
+                try { await onImport(accountName, { replaced: true, retire: false }) } catch {}
+                replaceAccountCredential(accountName, profile, signInEnv)
+              }
+              // The credential is already published; cleanup failing must
+              // not turn a completed sign-in into an error.
+              try { await onImport(accountName, { replaced: existing !== undefined }) } catch {}
+              return resultForAccount(accountName)
             } catch (error) { return failed(error) }
             finally {
               clearTimeout(finishTimer)

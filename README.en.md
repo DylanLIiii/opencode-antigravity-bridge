@@ -113,8 +113,8 @@ the action labels in its selected language:
 | Add a Google account | Sign in through Google and save the account under a new name |
 | Use a saved Bridge account | Register a profile saved by an earlier version or the CLI without another Google sign-in |
 
-Adding and importing keep existing accounts. An occupied name is refused;
-choose another name. Magpie displays each account in its own row, sharing ordinary
+Adding or importing a single account under an existing name signs that account in
+again: only its credential is replaced (see below). Manifest imports never overwrite. Magpie displays each account in its own row, sharing ordinary
 model IDs without account prefixes. Use the host's account preferences, switches
 and routing rules to choose between accounts. Requests, sessions and quota use the
 account selected by Magpie.
@@ -128,7 +128,7 @@ restarts do not automatically restore removed registrations.
 WSL mode supports only the distro's existing CLI login; named-account sign-in
 and imports are not offered there.
 
-**Browser sign-in.** Submit the new account name to start the official `agy acp --login` in a
+**Browser sign-in.** Submit an account name (a new one, or an existing one to sign it in again) to start the official `agy acp --login` in a
 hidden staging profile. The CLI sends the browser to
 `https://antigravity.google/oauth-callback`, so the current flow needs a paste;
 it does not finish automatically through localhost. Remote Magpie uses the same
@@ -140,7 +140,7 @@ The account is published through the import backend only after the CLI exits
 successfully, writes a file credential containing a refresh token, and an isolated
 `agy models` check succeeds. Its model caches are invalidated. Credentials stay in
 the bridge's named-account directory; Magpie's auth store receives only a local
-account reference. The login forces file storage, and existing accounts are never overwritten.
+account reference. The login forces file storage.
 On POSIX, directories are `0700` and published tokens `0600`; see the Windows
 permission requirements below.
 
@@ -149,6 +149,41 @@ one up. Cancellation during the start or completion step also cleans up. Closing
 the UI while it waits for a paste leaves no RPC signal for the plugin to observe;
 the hidden profile and child process are removed on expiry or the next sign-in.
 After a failed attempt, start again and use a fresh callback or code.
+
+**Signing in again and removing accounts.** When an account's sign-in lapses, or
+you want a different Google account under the same name, use **Add a Google
+account** or **Import an account** with the **existing name** (any case). Only that
+account's credential is replaced; its conversations, settings and logs stay. The new
+credential is written into the same folder and renamed over the old one, so a failure
+at any step keeps the previous credential. Afterwards the account's cached catalog,
+ACP probes and idle agy processes are dropped, and the next request starts with the
+new credential (a response in progress finishes first). Manifest imports still fail
+as a whole rather than overwrite.
+
+Removing an account row in Magpie removes only Magpie's registration; Magpie does
+not tell plugins, so the profile and its credential stay on disk. To delete it and
+free the name:
+
+```sh
+agy-bridge accounts remove work            # delete the profile on disk
+agy-bridge accounts replace work <source>  # replace only the credential (UI sign-in again)
+```
+
+A row whose profile is missing or whose reference is invalid now reports that it
+needs signing in again (usage and requests carry `signIn: "expired"` /
+`X-Magpie-Sign-In: expired`) instead of a bare read error. Only the single-account
+form replaces a credential; a manifest of any length refuses existing names. A
+catalog read that started before a sign-in again cannot publish its list
+afterwards. Hidden staging folders
+left by interrupted sign-ins or imports are swept on plugin start and on the next
+sign-in (only those older than an hour).
+
+The model listing caches each account's `agy models` result for 10 minutes
+(`AGY_BRIDGE_CATALOG_TTL_MS`). Past that it serves the previous list and refreshes in
+the background; a failed refresh keeps the last good list. An account's first read
+waits at most 12 s (`AGY_BRIDGE_CATALOG_WAIT_MS`). Previously every listing started a
+cold CLI per account (about 8 s), which could exceed Magpie's listing budget with
+several accounts.
 
 ### Multiple accounts
 
@@ -188,7 +223,7 @@ agy-bridge accounts list
 
 An import copies only `antigravity-cli/antigravity-oauth-token` (written `0600`
 in a `0700` directory) into `<accounts root>/<name>/`; agy keeps refreshing it.
-Existing accounts are never overwritten (pick another name), all manifest entries
+A single import under an existing name replaces only that account's credential; manifests never overwrite existing accounts, all manifest entries
 are validated before anything is written and profile copying is all-or-nothing.
 Tokens are never printed. Magpie UI imports also register the accounts. If host
 registration is interrupted, saved profiles remain available through **Use a saved

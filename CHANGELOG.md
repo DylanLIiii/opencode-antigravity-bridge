@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.3
+
+- Return agy’s standalone quota and model-capacity warnings as structured 429 and 503 errors. Magpie can try the next routing candidate when the warning arrives before any answer text.
+
 ## 0.9.2
 
 - Sign an existing named account in again from **Add a Google account** or **Import an account** by entering its name (case-insensitive). Only its credential file is replaced, staged in the same folder and renamed over the old one; conversations, settings and logs stay, and any failure keeps the previous credential. Previously an existing folder refused the name, so an account whose Magpie row had been removed could not be added back. Manifest imports still never overwrite.

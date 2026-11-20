@@ -135,6 +135,30 @@ test("issue 66 notices handle chunk boundaries, recovery and quoted text", () =>
   }
 })
 
+test("agy quota and model-capacity banners become terminal evidence without a log", () => {
+  for (const notice of [
+    "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 12h34m56s.",
+    "⚠ Our servers are experiencing high traffic right now, please try again in a minute. (UNAVAILABLE (code 503): No capacity available for model test-model-high on the server)",
+  ]) {
+    for (const suffix of ["", "\n", "\r\n"]) {
+      const text = "\n" + notice + suffix
+      for (const chunks of [[text], split(text)]) {
+        const f = new AgentNoticeFilter()
+        const output = chunks.map(chunk => f.push(chunk)).join("") + f.flush({ holdTerminal: true })
+        assert.equal(output, "")
+        assert.equal(f.failureCandidate, true)
+        assert.equal(f.terminalDetail, notice)
+      }
+    }
+    for (const text of [`quoted ${notice}\n`, `\`\`\`\n${notice}\n\`\`\`\n`, `${notice} is the CLI's warning.\n`]) {
+      assert.equal(run(split(text)).text, text)
+    }
+    assert.deepEqual(run([notice + "\n", "Recovered."]), {
+      text: "Recovered.", failureCandidate: false, dropped: 1,
+    })
+  }
+})
+
 test("terminal and API evidence survives notice chains but clears on any recovered output", () => {
   const credits = "⚠ Your AI credits balance is too low to continue."
   const network = "⚠ There was a network issue connecting to the server, please try again."

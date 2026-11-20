@@ -437,6 +437,22 @@ async function prompt(params, recorded = false) {
     await new Promise(resolve => setTimeout(resolve, 3000))
     return { stopReason: "end_turn" }
   }
+  if (text.includes("QUOTA_BANNER")) {
+    chunk("\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits.")
+    chunk(" Resets in 12h34m56s.\n")
+    return { stopReason: "end_turn" }
+  }
+  if (text.includes("CAPACITY_BANNER")) {
+    chunk("\n\n\n\n")
+    chunk("\n\n\n")
+    chunk("\n⚠ Our servers are experiencing high traffic right now, please try again in a minute.")
+    chunk(" (UNAVAILABLE (code 503): No capacity available for model test-model-high on the server)\n")
+    if (text.endsWith(" recovery")) {
+      chunk("Recovered answer.")
+      return finish("Recovered answer.")
+    }
+    return { stopReason: "end_turn" }
+  }
   if (text.includes("QUOTA")) {
     fs.appendFileSync(agentLog, "E1103 17:11:25.570096 685 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): quota exhausted.\n")
     chunk("\n⚠ Agent execution ")
@@ -2074,6 +2090,32 @@ for (const [prompt, expected] of [
   const { events } = await readSSE(await callFetch({ model, messages: [{ role: "user", content: "QUOTA exhausted" }] }))
   const error = events.find(event => event.event === "error")?.data?.error
   check("split error marker and quota map to rate_limit_error", error?.type === "rate_limit_error" && error.message.includes("quota exhausted") && textOf(events) === "", JSON.stringify({ error, text: textOf(events) }))
+}
+
+for (const [prompt, status, code] of [
+  ["QUOTA_BANNER", 429, "AGY_ERROR_QUOTA_EXHAUSTED"],
+  ["CAPACITY_BANNER", 503, "AGY_ERROR_MODEL_CAPACITY_EXHAUSTED"],
+]) {
+  const body = { model, messages: [{ role: "user", content: prompt }] }
+  const { events } = await readSSE(await callFetch(body))
+  const error = events.find(event => event.event === "error")?.data?.error
+  check(`${prompt} emits a structured error before any answer`,
+    error?.status === status && error.code === code && error.retryable === false &&
+    textOf(events) === "" && !events.some(event => event.event === "message_stop"),
+    JSON.stringify({ error, text: textOf(events) }))
+
+  const response = await callFetch({
+    ...body, stream: false, messages: [{ role: "user", content: `${prompt} nonstream` }],
+  })
+  const payload = await response.json()
+  check(`${prompt} returns the matching HTTP error when not streaming`,
+    response.status === status && payload.error?.code === code, JSON.stringify(payload))
+}
+
+{
+  const { events } = await readSSE(await callFetch({ model, messages: [{ role: "user", content: "CAPACITY_BANNER recovery" }] }))
+  check("recovery after a capacity notice preserves leading whitespace",
+    stopOf(events) === "end_turn" && /^\n+Recovered answer\.$/.test(textOf(events)), JSON.stringify(textOf(events)))
 }
 
 {

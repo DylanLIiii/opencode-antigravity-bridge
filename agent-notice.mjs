@@ -2,7 +2,7 @@
 //   "\n⚠ Agent execution terminated due to error.\n"       -> the turn failed
 //   "\n⚠ The stream was interrupted. Please continue the task you were working on.\n"
 //   "\n⚠ API error (attempt N): request failed: ...: EOF"   -> internal retry noise
-// Network/credits terminal notices are also failure evidence without a log.
+// Network, quota and model-capacity notices are failure evidence without a log.
 // Invalid-output notices describe an internal retry and are dropped.
 // They are agy's, not the model's, so they are only recognised as a standalone
 // line at a line boundary. Retry notices are ignored inside code fences;
@@ -16,6 +16,11 @@ const NETWORK_LINE = "⚠ There was a network issue connecting to the server, pl
 const CREDITS_LINE = "⚠ Your AI credits balance is too low to continue."
 const INVALID_LINE = "⚠ Model produced invalid output."
 const TERMINAL_LINES = [NETWORK_LINE, CREDITS_LINE]
+const QUOTA_HEAD = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits."
+const CAPACITY_HEAD = "⚠ Our servers are experiencing high traffic right now, please try again in a minute."
+const QUOTA_TAIL = /^(?: Resets in (?:\d+[hms]){1,3}\.)?$/
+const CAPACITY_TAIL = /^ \(UNAVAILABLE \(code 503\): No capacity available for model [\w./-]+ on the server\)$/
+const MAX_TERMINAL_LENGTH = 256
 const INTERRUPT_LINE = "⚠ The stream was interrupted. Please continue the task you were working on."
 const API_HEAD = "⚠ API error (attempt "
 const API_FULL = /^⚠ API error \(attempt \d+\): /
@@ -24,6 +29,13 @@ const EXHAUSTED_FULL = /^⚠ RESOURCE_EXHAUSTED \(code \d+\): /
 const API_PARTIAL = /^\d*(?:\)(?::(?: )?)?)?$/
 export const isRefused429 = (detail) =>
   /code 429\b/i.test(String(detail ?? "")) && /resource has been exhausted/i.test(String(detail ?? ""))
+
+function isTerminalNotice(line) {
+  const detail = line.trimEnd()
+  return TERMINAL_LINES.includes(detail) || (line.length <= MAX_TERMINAL_LENGTH &&
+    ((detail.startsWith(QUOTA_HEAD) && QUOTA_TAIL.test(detail.slice(QUOTA_HEAD.length))) ||
+     (detail.startsWith(CAPACITY_HEAD) && CAPACITY_TAIL.test(detail.slice(CAPACITY_HEAD.length)))))
+}
 
 export class AgentNoticeFilter {
   constructor(isDiagnostic = () => false) {
@@ -49,9 +61,11 @@ export class AgentNoticeFilter {
     if (!complete && (ERROR_LINE.startsWith(line) ||
       (line.length <= ERROR_LINE.length + 16 && line.trimEnd() === ERROR_LINE))) return "hold"
     if (this.fence) return "emit"
-    if (complete && TERMINAL_LINES.includes(line.trimEnd())) return "terminal"
+    if (complete && isTerminalNotice(line)) return "terminal"
     if (!complete && TERMINAL_LINES.some(value => value.startsWith(line) ||
       (line.length <= value.length + 16 && line.trimEnd() === value))) return "hold"
+    if (!complete && line.length <= MAX_TERMINAL_LENGTH &&
+      [QUOTA_HEAD, CAPACITY_HEAD].some(head => head.startsWith(line) || line.startsWith(head))) return "hold"
     if (line.startsWith("⚠") || "⚠".startsWith(line)) {
       if (complete ? [INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) : false) return "notice"
       if (API_FULL.test(line) || EXHAUSTED_FULL.test(line)) return "api"
@@ -155,7 +169,7 @@ export class AgentNoticeFilter {
     const line = rest[0] === "\n" ? rest.slice(1) : rest
     if (line.trimEnd() === ERROR_LINE) { this.failureCandidate = true; this.terminal += rest; return holdTerminal ? "" : this.flush() }
     if (!this.fence) {
-      if (TERMINAL_LINES.includes(line.trimEnd())) { this.failureCandidate = true; this.terminalDetail = line.trimEnd(); this.dropped++; return "" }
+      if (isTerminalNotice(line)) { this.failureCandidate = true; this.terminalDetail = line.trimEnd(); this.dropped++; return "" }
       if (API_FULL.test(line)) this.apiDetail = line.slice(0, 2000)
       if ([INTERRUPT_LINE, INVALID_LINE].includes(line.trimEnd()) || API_FULL.test(line)) { this.dropped++; this.failureCandidate = true; return "" }
     }

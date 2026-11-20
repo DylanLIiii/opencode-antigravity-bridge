@@ -1,12 +1,13 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { v1 as openCodeCompactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
 
-const here = path.dirname(new URL(import.meta.url).pathname)
+const here = path.dirname(fileURLToPath(import.meta.url))
 const suffix = `-${process.pid}`
 const fakeAgy = path.join(here, `.tmp-fake-agy${suffix}.mjs`)
-const wrapper = path.join(here, `.tmp-agy${suffix}`)
+const wrapper = path.join(here, `.tmp-agy${suffix}${process.platform === "win32" ? ".cmd" : ""}`)
 const logPath = path.join(here, `.tmp-fake-agy-log${suffix}`)
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-agy-state-"))
 const originalAutoUpdate = process.env.AGY_CLI_DISABLE_AUTO_UPDATE
@@ -862,8 +863,10 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
 })
 `)
 
-fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgy)} "$@"\n`)
-fs.chmodSync(wrapper, 0o755)
+fs.writeFileSync(wrapper, process.platform === "win32"
+  ? `@echo off\r\n"${process.execPath}" "${fakeAgy}" %*\r\n`
+  : `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgy)} "$@"\n`)
+if (process.platform !== "win32") fs.chmodSync(wrapper, 0o755)
 process.env.AGY_PATH = wrapper
 
 const { default: pluginDefault } = await import(process.env.AGY_BRIDGE_TEST_INDEX || "./index.mjs")
@@ -4531,6 +4534,45 @@ process.env.AGY_BRIDGE_STORED_SIGNIN = "skip"
   if (response.status !== 200) await response.text()
   check("Esc plus an orphan result replays as a fresh prompt instead of 409", response.status === 200 && stopOf(final) === "end_turn")
   check("Esc replay preserves the orphan result and the new instruction", lastOf("user").text.includes("orphan result preserved") && lastOf("user").text.includes("continue now"))
+}
+
+{
+  const opening = { model, metadata: { user_id: "paseo-summary-orphan" }, stream: true,
+    messages: [{ role: "user", content: "TOOL first completed turn" }], tools: [echoTool] }
+  const firstEvents = (await readSSE(await callFetch(opening))).events
+  const firstCall = toolCall(firstEvents)
+  const firstDone = (await readSSE(await callFetch(continuation(opening, firstEvents, "first result")))).events
+  check("summary fixture completes its first tool turn", firstCall && stopOf(firstDone) === "end_turn")
+  // The summary replays the completed turn, while the live process is now
+  // waiting on a newer call from the next turn. Its old call ID is no longer
+  // registered, but its history is self-consistent.
+  const liveBody = nextTurn(opening, firstDone, "TWOSTEP summary fork")
+  const liveEvents = (await readSSE(await callFetch(liveBody))).events
+  const liveCall = toolCall(liveEvents)
+  check("summary fixture advances to a newer pending call", liveCall && stopOf(liveEvents) === "tool_use" &&
+    liveCall.id !== firstCall?.id)
+  const before = inits().length
+  const summary = { ...liveBody, messages: [
+    opening.messages[0],
+    { role: "assistant", content: [firstCall] },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: firstCall.id, content: "first result" },
+      { type: "text", text: "BACKGROUND_SUMMARY: CRITICAL: Respond with TEXT ONLY. Do NOT call any tools. " +
+        "Your task is to create a detailed summary of the conversation so far." },
+    ] },
+  ] }
+  const summaryResponse = await callFetch(summary)
+  const summaryEvents = summaryResponse.status === 200 ? (await readSSE(summaryResponse)).events : []
+  const summaryError = summaryResponse.status === 200
+    ? `inits ${before}->${inits().length}, stop ${stopOf(summaryEvents)}, events ${summaryEvents.length}`
+    : await summaryResponse.text()
+  check("Paseo-style summary with an orphan historical result replays in an isolated fork",
+    summaryResponse.status === 200 && inits().length === before + 1 && stopOf(summaryEvents) === "end_turn", summaryError)
+  const mainDrive = await drive(liveBody, liveEvents, "second result")
+  const mainEvents = mainDrive.events
+  const mainError = `inits ${before}->${inits().length}, stop ${stopOf(mainEvents)}`
+  check("the live owner still accepts its newer pending tool result",
+    stopOf(mainEvents) === "end_turn" && inits().length === before + 1, mainError)
 }
 
 {

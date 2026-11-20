@@ -3524,6 +3524,16 @@ function pendingCallsAnsweredIn(turn, history) {
   return open.every((call) => answered.has(call.id))
 }
 
+function summaryReplayRequest(body) {
+  const messages = trailingMessages(body).history
+  const lastUser = [...messages].reverse().find((message) => message?.role === "user")
+  if (!lastUser) return false
+  const content = Array.isArray(lastUser.content) ? lastUser.content : [{ type: "text", text: String(lastUser.content ?? "") }]
+  const text = content.filter((block) => block?.type === "text" || block?.type === "input_text")
+    .map((block) => block.text || "").join("\n")
+  return /CRITICAL:\s*Respond with TEXT ONLY|create a detailed summary of the conversation|Summarize the conversation so far|This session is being continued from a previous conversation/i.test(text)
+}
+
 function replayHistoryProblem(body, resultBlocks) {
   const calls = lastAssistantCalls(trailingMessages(body).history)
   if (!calls.length) return "no_tool_use"
@@ -6522,7 +6532,19 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
                 }
                 if (!acquireOpts.ownerKey && !acquireOpts.reclaimedKey && pool.get(convKey)?.turn && !pool.get(convKey).turn.cancelRequested) {
                   const proc = pool.get(convKey)
-                  if (!canReplayUnmatchedFork(proc, body, resultBlocks, acquireOpts)) {
+                  const summaryReplay = summaryReplayRequest(body) ||
+                    (Array.isArray(proc.turn?.baseHistory) && trailingMessages(body).history.length < proc.turn.baseHistory.length)
+                  if (summaryReplay && !replayHistoryProblem(body, resultBlocks)) {
+                    // A client-side summary/compaction can replay an older,
+                    // already answered tool step while a live head waits for a
+                    // newer call. The result IDs are no longer in the live MCP
+                    // registry. Keep that live head intact and replay this
+                    // snapshot in an isolated fork instead of wedging it with 409.
+                    acquireOpts.validateReplay()
+                    acquireOpts.ownerKey = `${convKey}:fork:${randomUUID()}`
+                    acquireOpts.replayReason = "orphan_historical_results"
+                    logBridgeEvent(proc, proc.turn, "isolated", acquireOpts.replayReason, acquireOpts)
+                  } else if (!canReplayUnmatchedFork(proc, body, resultBlocks, acquireOpts)) {
                     const recovered = await recoverStaleTurn({ agy, convKey, proc, turn: proc.turn,
                       body, resultBlocks, acquireOpts, isFresh, begin, claim })
                     if (recovered) return streamResponse(recovered.proc, recovered.turn, body, init.signal)

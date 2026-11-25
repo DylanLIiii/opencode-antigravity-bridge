@@ -862,11 +862,15 @@ class PromptOutcomeUnknownError extends Error {
 // conversation, so a different follow-up continues without replaying history.
 export function streamErrorOf(error) {
   const type = error?.kind || "api_error"
+  const status = type === "invalid_request_error" ? 400
+    : error?.code === "AGY_ERROR_QUOTA_EXHAUSTED" ? 429
+    : error?.code === "AGY_ERROR_MODEL_CAPACITY_EXHAUSTED" ? 503
+    : undefined
   return {
     type,
     message: String(error?.message ?? error),
     // Declare status explicitly so clients do not classify quoted upstream text (e.g. "code 429") as 429.
-    ...(type === "invalid_request_error" ? { status: 400 } : {}),
+    ...(status === undefined ? {} : { status }),
     ...(error?.code ? { code: error.code } : {}),
     ...(typeof error?.retryable === "boolean" ? { retryable: error.retryable } : {}),
     ...(Number.isSafeInteger(error?.retryAfterMs) ? { retry_after_ms: error.retryAfterMs } : {}),
@@ -2241,7 +2245,8 @@ class Proc {
     const classification = classifyUpstreamError(detail, { promptGuardMatched })
     const kind = classification.category === "forbidden" ? "permission_error"
       : classification.category === "request_rejected" ? "invalid_request_error"
-      : ["quota_exhausted", "model_capacity", "rate_limit", "prompt_rejected"].includes(classification.category)
+      : classification.category === "model_capacity" ? "overloaded_error"
+      : ["quota_exhausted", "rate_limit", "prompt_rejected"].includes(classification.category)
         ? "rate_limit_error"
         : "api_error"
     return new AgentTurnError(classification.message, kind, classification)
@@ -5570,6 +5575,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
 
   return new ReadableStream({
     async start(controller) {
+      let leadingText = ""
       const send = (event, data) => controller.enqueue(encoder.encode(sseEvent(event, data)))
       const closeBlock = () => {
         if (!open) return
@@ -5605,6 +5611,10 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           index: blockIndex,
           delta: type === "text" ? { type: "text_delta", text } : { type: "thinking_delta", thinking: text },
         })
+      }
+      const emitLeadingText = () => {
+        emitDelta("text", leadingText)
+        leadingText = ""
       }
       const emitToolUse = (call) => {
         closeBlock()
@@ -5683,14 +5693,26 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           const event = await turn.next()
           if (finished) return
           if (event.type === "text") {
-            emitDelta("text", event.text)
+            // An agy diagnostic can be preceded by blank text chunks. Sending
+            // those as an answer would prevent the host from failing over.
+            const text = leadingText + event.text
+            if (!open && blockIndex === 0 && text.length <= 4096 && !text.trim()) {
+              leadingText = text
+              continue
+            }
+            leadingText = ""
+            emitDelta("text", text)
             continue
           }
           if (event.type === "thinking") {
-            if (forwardThinking) emitDelta("thinking", event.text)
+            if (forwardThinking) {
+              emitLeadingText()
+              emitDelta("thinking", event.text)
+            }
             continue
           }
           if (event.type === "tool") {
+            emitLeadingText()
             emitToolUse(event.call)
             // Calls agy issued together leave in the same response.
             while (turn.events[0]?.type === "tool") emitToolUse(turn.events.shift().call)
@@ -5716,6 +5738,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
             return
           }
           if (event.type === "result") {
+            emitLeadingText()
             closeBlock()
             turn.rawUsage = event.result.usage ?? turn.rawUsage
             const usage = await settleUsage(proc, turn, step, responseContent, event.result)
@@ -5729,6 +5752,7 @@ function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.regist
           }
           if (event.type === "error") {
             if (finished) return
+            leadingText = ""
             // A long-lived agy whose OAuth token expired mid-session fails the
             // very first model call with 401. Nothing has been streamed yet,
             // so retire it and replay on a fresh process (which reloads the

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto"
 
 // Exact stock prompts, frozen in test/fixtures/opencode-compaction-prompts.mjs:
-// OpenCode v1.2.0 defaultPrompt and v2.2.7 buildPrompt(false), (true), (true,true).
+// OpenCode v1.2.0 defaultPrompt, v2.2.7 buildPrompt(false), (true), (true,true),
+// and Codex CLI / Magpie codex-rs checkpoint compaction prompt.
 // A prefix match can override a later user instruction, so accept only the full
 // verified text (apart from transport CRLF and outer whitespace). Customized or
 // future prompts keep the ordinary request path until explicitly supported.
@@ -10,14 +11,20 @@ const STOCK_PROMPTS = new Set([
   "9816134b00ca0aea915930daa68289403ab951c8c7334d3ff01fc4818b32135e",
   "7432c94c498ce37a5a0c049393d04e8fbf9a6ae4e1f321c0d842a217efbe1684",
   "6c4096c2b2cf8dbce360bf0248054337ef1f1dc21b4633d247c56e1bcaa24e81",
+  "bab68c28f14288fc320a002bf87e6e53c3bb88288eb047893a9e65c96ef9c35c",
 ])
 const NUDGE = "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template."
+const MAGPIE_PLACEHOLDER_NOTICE_RE = /(?:^|\n\n)Values written like \{\{NAME_ab12cd34\}\} are placeholders for real values\. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs\. Don't ask to verify them, and don't replace them with examples\.(?=\s|$)/g
+
+function normalizePromptText(raw) {
+  return raw.replace(/\r\n/g, "\n").replace(MAGPIE_PLACEHOLDER_NOTICE_RE, "").trim()
+}
 
 function textOnly(message) {
   if (message?.role !== "user") return null
-  if (typeof message.content === "string") return message.content.trim()
+  if (typeof message.content === "string") return normalizePromptText(message.content)
   if (!Array.isArray(message.content) || message.content.some(part => part?.type !== "text" || typeof part.text !== "string")) return null
-  return message.content.map(part => part.text).join("\n\n").trim()
+  return normalizePromptText(message.content.map(part => part.text).join("\n\n"))
 }
 
 export function openCodeCompactionStart(messages) {
@@ -29,11 +36,11 @@ export function openCodeCompactionStart(messages) {
   // Anthropic adapters can coalesce consecutive user messages into one array,
   // including a tool_result or flattened transcript before the summary prompt.
   let last = Array.isArray(message.content) ? message.content.length - 1 : -1
-  if (last >= 0 && message.content[last]?.type === "text" && message.content[last].text?.trim() === NUDGE) last--
+  if (last >= 0 && message.content[last]?.type === "text" && normalizePromptText(message.content[last].text) === NUDGE) last--
   const tail = last >= 0 && message.content[last]?.type === "text" ? message.content[last].text : null
-  const text = typeof tail === "string" ? tail.trim() : textOnly(message)
+  const text = typeof tail === "string" ? normalizePromptText(tail) : textOnly(message)
   if ((index < 1 && last < 1) || !text) return -1
-  return STOCK_PROMPTS.has(createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex")) ? index : -1
+  return STOCK_PROMPTS.has(createHash("sha256").update(text).digest("hex")) ? index : -1
 }
 
 export const COMPACTION_INSTRUCTIONS = "You are summarizing an existing conversation for continuation. " +

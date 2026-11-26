@@ -101,3 +101,15 @@ export const legacyUpdate = [
 ].join("\n\n")
 
 export const nudge = "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template."
+
+export const codex = [
+  "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.",
+  [
+    "Include:",
+    "- Current progress and key decisions made",
+    "- Important context, constraints, or user preferences",
+    "- What remains to be done (clear next steps)",
+    "- Any critical data, examples, or references needed to continue",
+  ].join("\n"),
+  "Be concise, structured, and focused on helping the next LLM seamlessly continue the work.",
+].join("\n\n")

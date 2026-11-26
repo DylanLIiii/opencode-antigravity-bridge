@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.4
+
+- Recognize Codex CLI and Magpie compaction summaries (`Another language model started to solve this problem...`) alongside Claude Code summaries, split assistant-less post-compaction `replacement_history` turns into replayable history + trailing turn, and proactively omit superseded older compaction summaries even below the 180 KB ACP prompt ceiling while keeping opening context, the latest summary, and the active turn intact.
+- Recognize stock Codex / Magpie checkpoint compaction requests (`You are performing a CONTEXT CHECKPOINT COMPACTION...`) for `<180 KB` fragment staging without weakening exact-prompt anti-injection checks.
+
 ## 0.9.3
 
 - Return agy’s standalone quota and model-capacity warnings as structured 429 and 503 errors. Magpie can try the next routing candidate when the warning arrives before any answer text.

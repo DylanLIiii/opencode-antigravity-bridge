@@ -3598,6 +3598,84 @@ for (const recent of [true, false]) {
     lastOf("user").text.includes("CURRENT-731\n</current_turn>") && !assistantBlocks(compactedEvents).some(block => block.type === "tool_use"))
 }
 
+// Codex replacement_history replay: deduplicate stacked summaries both under and over 180 KB,
+// split assistant-less replacement_history cleanly, and reuse the session on the next turn.
+{
+  const codexPrefix = "Another language model started to solve this problem and produced a summary of its thinking process. " +
+    "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n"
+  const smallCompacted = {
+    model,
+    metadata: { user_id: "codex-small-stacked-summaries" },
+    system: "Concise coding assistant.",
+    messages: [
+      { role: "user", content: "CODEX-SMALL-OPENING: maintain strict types" },
+      { role: "user", content: codexPrefix + "CODEX-OLD-SUMMARY-1" },
+      { role: "user", content: "CODEX-MID-USER: added parser" },
+      { role: "user", content: codexPrefix + "CODEX-OLD-SUMMARY-2" },
+      { role: "user", content: codexPrefix + "CODEX-LATEST-SUMMARY-3" },
+      { role: "user", content: "CODEX-SMALL-CONTINUE: run validation" },
+    ],
+  }
+  const smallResp = await callFetch(smallCompacted)
+  const smallEvents = smallResp.status === 200 ? (await readSSE(smallResp)).events : []
+  const smallSent = lastOf("user")?.text || ""
+  check("under-180KB Codex replay proactively omits older stacked summaries while keeping opening, latest summary and current turn",
+    smallResp.status === 200 && stopOf(smallEvents) === "end_turn" &&
+    Buffer.byteLength(smallSent, "utf8") < 10_000 &&
+    smallSent.includes("CODEX-SMALL-OPENING") &&
+    smallSent.includes("CODEX-MID-USER") &&
+    smallSent.includes("CODEX-LATEST-SUMMARY-3") &&
+    smallSent.includes("CODEX-SMALL-CONTINUE: run validation\n</current_turn>") &&
+    !smallSent.includes("CODEX-OLD-SUMMARY-1") &&
+    !smallSent.includes("CODEX-OLD-SUMMARY-2"))
+
+  const png1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+  const imgBlock = { type: "image", source: { type: "base64", media_type: "image/png", data: png1x1 } }
+  const bigMessages = [
+    { role: "user", content: "CODEX-BIG-OPENING: ship dual-end upgrade" },
+    ...Array.from({ length: 8 }, (_, i) => ({
+      role: "user",
+      content: i < 3
+        ? [{ type: "text", text: `CODEX-EARLY-${i} ` + "e".repeat(3000) }, imgBlock]
+        : `CODEX-EARLY-${i} ` + "e".repeat(3000),
+    })),
+    ...Array.from({ length: 6 }, (_, i) => ({
+      role: "user",
+      content: `${codexPrefix}CODEX-STALE-SUMMARY-${i + 1} ` + "s".repeat(25_000),
+    })),
+    { role: "developer", content: "<skills_instructions>\n" + "k".repeat(25_000) + "\n</skills_instructions>" },
+    { role: "user", content: `${codexPrefix}CODEX-ACTIVE-SUMMARY-7 ` + "L".repeat(75_000) },
+    { role: "developer", content: "<skills_instructions>\n" + "d".repeat(30_000) + "\n</skills_instructions>" },
+    { role: "user", content: "继续执行收尾验证" },
+  ]
+  const beforeInits = inits().length
+  const bigBody = {
+    model,
+    metadata: { user_id: "codex-big-replacement-history" },
+    system: "You're a coding agent running in the Codex CLI.\n" + "i".repeat(20_000),
+    tools: [echoTool],
+    messages: bigMessages,
+  }
+  const bigResp = await callFetch(bigBody)
+  const bigEvents = bigResp.status === 200 ? (await readSSE(bigResp)).events : []
+  const bigReplay = lastOf("user")
+  const bigText = bigReplay?.text || ""
+  check("oversized assistant-less Codex replacement_history fits 180 KB official ACP ceiling and preserves latest summary + 继续",
+    bigResp.status === 200 && stopOf(bigEvents) === "end_turn" &&
+    inits().length === beforeInits + 1 &&
+    Buffer.byteLength(bigText, "utf8") <= 180_000 &&
+    bigText.includes("CODEX-BIG-OPENING") &&
+    bigText.includes("CODEX-ACTIVE-SUMMARY-7") &&
+    bigText.includes("继续执行收尾验证\n</current_turn>") &&
+    ![1, 2, 3, 4, 5, 6].some(i => bigText.includes(`CODEX-STALE-SUMMARY-${i}`)))
+
+  const nextBody = nextTurn(bigBody, bigEvents, "CODEX-FOLLOWUP-SAME-SESSION")
+  const nextEvents = (await readSSE(await callFetch(nextBody))).events
+  check("turn after Codex replacement_history replay reuses the live ACP session without replaying",
+    stopOf(nextEvents) === "end_turn" && inits().length === beforeInits + 1 &&
+    lastOf("user")?.convId === bigReplay?.convId && lastOf("user")?.text === "CODEX-FOLLOWUP-SAME-SESSION")
+}
+
 {
   let body = { model, messages: [{ role: "user", content: "MEMORY " + "h".repeat(150_000) }], tools: [echoTool] }
   let events = (await readSSE(await callFetch(body))).events

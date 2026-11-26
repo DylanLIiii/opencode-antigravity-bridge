@@ -20,8 +20,8 @@ let source = fs.readFileSync(entry, "utf8")
 source = source.replace(/from "(\.\/[^"\n]+)"/g, (_, target) => `from ${JSON.stringify(new URL(target, entry).href)}`)
 source = source.replace('new URL("./package.json", import.meta.url)', JSON.stringify(fileURLToPath(new URL("./package.json", entry))))
 source += "\nexport { Turn, Proc, estimateInputTokens, responseUsage, streamResponse, maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts, promptAttempts, claimPromptAttempt, settlePromptAttempt, releasePromptAttempt, retire, acquireProcLocked, stableJSON, digest };\n"
-fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync };\n")
-const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
+fs.writeFileSync(path.join(workspace, "bridge.mjs"), source + "\nexport { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync, trailingMessages, isCompactionSummary, hasRecentCompactionSummary, acpPromptTextBytes };\n")
+const { inspectToolTurn, matchToolResults, historyKey, allProcs, toolCalls, renderInitialPromptParts, renderContinuedTurnParts, toolResult, withStateLock, execOnce, normalizeTools, validatePromptBudget, validateAcpPromptBudget, renderReplayPromptParts, lastAgentError, lastAgentErrorSync, trailingMessages, isCompactionSummary, hasRecentCompactionSummary, acpPromptTextBytes } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
 after(() => fs.rmSync(workspace, { recursive: true, force: true }))
 
 const { Turn, Proc, estimateInputTokens, responseUsage, streamResponse, maxProcs, detachedEvictMs, evictLRU, pool, reclaimedRoutes, rememberReclaimedRoute, matchingReclaimedRoute, conversationKey, probeOfferedModels, getAccounts } = await import(pathToFileURL(path.join(workspace, "bridge.mjs")).href)
@@ -529,6 +529,155 @@ test("prompt budget counts UTF-8 text and installed instructions, preserving com
   } finally {
     if (previous === undefined) delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
     else process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES = previous
+  }
+})
+
+const codexSummaryPrefix = "Another language model started to solve this problem and produced a summary of its thinking process. " +
+  "You also have access to the state of the tools that were used by that language model. " +
+  "Use this to build on the work that has already been done and avoid duplicating work. " +
+  "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n"
+
+test("Codex compaction summary detection avoids false positives on quoted markers and recognizes assistant-less tails", () => {
+  assert.equal(isCompactionSummary({ role: "user", content: codexSummaryPrefix + "checkpoint 1" }), true)
+  assert.equal(isCompactionSummary({ role: "user", content: [
+    { type: "text", text: "<system-reminder>\nhook\n</system-reminder>\n" + codexSummaryPrefix + "checkpoint 2" },
+  ] }), true)
+  assert.equal(isCompactionSummary({ role: "user", content:
+    `Fix bug where isCompactionSummary misses "${codexSummaryPrefix.trim()}" in Codex sessions.` }), false)
+  assert.equal(isCompactionSummary({ role: "user", content: [
+    { type: "tool_result", tool_use_id: "t1", content: codexSummaryPrefix + "quoted in tool output" },
+  ] }), false)
+  assert.equal(isCompactionSummary({ role: "assistant", content: codexSummaryPrefix + "assistant quote" }), false)
+
+  // Assistant-less post-compaction tail stays latched even if >8 non-assistant metadata items follow.
+  const assistantless = { messages: [
+    { role: "user", content: codexSummaryPrefix + "recent checkpoint" },
+    ...Array.from({ length: 10 }, (_, i) => ({ role: i % 2 ? "developer" : "user", content: `meta-${i}` })),
+  ] }
+  assert.equal(hasRecentCompactionSummary(assistantless), true)
+  assert.throws(() => validateAcpPromptBudget([{ type: "text", text: "x".repeat(180_001) }], "", assistantless),
+    error => error.code === "prompt_budget_exceeded" && !/prompt is too long/i.test(error.message))
+
+  // Once assistant exchanges push the summary >=8 messages back, reactive compaction is allowed again.
+  const aged = { messages: [
+    { role: "user", content: codexSummaryPrefix + "older checkpoint" },
+    ...Array.from({ length: 8 }, (_, i) => ({ role: i % 2 ? "user" : "assistant", content: `turn-${i}` })),
+  ] }
+  assert.equal(hasRecentCompactionSummary(aged), false)
+  assert.throws(() => validateAcpPromptBudget([{ type: "text", text: "x".repeat(180_001) }], "", aged),
+    error => error.code === "context_length_exceeded" && /prompt is too long/i.test(error.message))
+})
+
+test("proactively deduplicates stacked Claude Code and Codex compaction summaries even well below 180 KB", () => {
+  for (const prefix of [compactionSummary + "\n", codexSummaryPrefix]) {
+    const body = {
+      system: "Keep concise.",
+      messages: [
+        { role: "user", content: "OPENING-CONSTRAINTS: keep TypeScript strict mode." },
+        { role: "user", content: prefix + "SUPERSEDED-SUMMARY-1: initial scaffolding" },
+        { role: "user", content: "INTERMEDIATE-NOTE: added routes" },
+        { role: "user", content: prefix + "SUPERSEDED-SUMMARY-2: routes and schema complete" },
+        { role: "user", content: prefix + "LATEST-SUMMARY-3: tests remaining" },
+        { role: "user", content: "CURRENT-TASK: finish unit tests" },
+      ],
+    }
+    const parts = renderReplayPromptParts(body, "/repo", false, "")
+    const bytes = acpPromptTextBytes(parts)
+    assert(bytes < 10_000, `expected small payload (<10 KB), got ${bytes}`)
+    const rendered = parts.map(part => part.text || "").join("")
+    assert(rendered.includes("OPENING-CONSTRAINTS"))
+    assert(rendered.includes("INTERMEDIATE-NOTE"))
+    assert(rendered.includes("LATEST-SUMMARY-3"))
+    assert(rendered.includes("CURRENT-TASK: finish unit tests"))
+    assert(!rendered.includes("SUPERSEDED-SUMMARY-1"))
+    assert(!rendered.includes("SUPERSEDED-SUMMARY-2"))
+    assert(!rendered.includes("older history messages omitted"), "deduplicating superseded summaries under budget needs no truncation warning")
+  }
+})
+
+test("assistant-less Codex replacement_history with 7 stacked summaries and inline images fits 180 KB", () => {
+  const system = "You're a coding agent running in the Codex CLI.\n" + "s".repeat(20_500)
+  const summaries = Array.from({ length: 7 }, (_, i) =>
+    `${codexSummaryPrefix}SUMMARY-MARKER-${i + 1}: ` + `summary_${i + 1}_detail `.repeat(i >= 5 ? 4400 : 600))
+  const buildReplacementHistory = () => {
+    const msgs = [
+      { role: "user", content: [{ type: "text", text: "OPENING-GOAL: upgrade dual-end mini-program permissions" }] },
+    ]
+    for (let i = 1; i <= 11; i++) {
+      if (i === 3) {
+        msgs.push({ role: "user", content: [
+          { type: "text", text: `early-user-${i} ` + "u".repeat(400) },
+          { type: "text", text: '<image name=[Image #1] path="/tmp/s1.png">\n' },
+          image,
+          { type: "text", text: "</image>" },
+        ] })
+      } else {
+        msgs.push({ role: "user", content: [{ type: "text", text: `early-user-${i} ` + "u".repeat(300) }] })
+      }
+    }
+    msgs.push({ role: "user", content: [{ type: "text", text: summaries[0] }] })
+    msgs.push({ role: "user", content: [{ type: "text", text: "mid-user-a " + "m".repeat(800) }] })
+    msgs.push({ role: "user", content: [{ type: "text", text: summaries[1] }] })
+    for (const imgIdx of [2, 3]) {
+      msgs.push({ role: "user", content: [
+        { type: "text", text: `screenshot-turn-${imgIdx} ` + "p".repeat(500) },
+        { type: "text", text: `<image name=[Image #${imgIdx}] path="/tmp/s${imgIdx}.png">\n` },
+        image,
+        { type: "text", text: "</image>" },
+      ] })
+    }
+    msgs.push({ role: "user", content: [{ type: "text", text: summaries[2] }] })
+    msgs.push({ role: "user", content: [{ type: "text", text: summaries[3] }] })
+    msgs.push({ role: "user", content: [{ type: "text", text: summaries[4] }] })
+    for (let i = 0; i < 6; i++) msgs.push({ role: "user", content: [{ type: "text", text: `pre-dev-user-${i} ` + "d".repeat(600) }] })
+    msgs.push({ role: "developer", content: [{ type: "text", text: "<skills_instructions>\n" + "k".repeat(15_000) + "\n</skills_instructions>" }] })
+    msgs.push({ role: "user", content: [
+      { type: "text", text: "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n" + "a".repeat(21_500) + "\n</INSTRUCTIONS>" },
+      { type: "text", text: "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>" },
+    ] })
+    msgs.push({ role: "user", content: [{ type: "text", text: "PRE-COMPACT-TASK: verify coach binding flow" }] })
+    msgs.push({ role: "user", content: [{ type: "text", text: summaries[5] }] })
+    msgs.push({ role: "user", content: [{ type: "text", text: summaries[6] }] })
+    return msgs
+  }
+
+  const postSummary = [
+    { role: "user", content: [{ type: "text", text: '<codex_internal_context source="goal">\nContinue active goal.\n</codex_internal_context>' }] },
+    { role: "developer", content: [{ type: "text", text: "<skills_instructions>\n" + "n".repeat(32_000) + "\n</skills_instructions>" }] },
+    { role: "user", content: [{ type: "text", text: "继续" }] },
+  ]
+  const coalesce = messages => [{
+    role: "user",
+    content: messages.flatMap(m => m.role === "developer"
+      ? [{ type: "text", text: `<system-reminder>\n${m.content.map(b => b.text).join("\n\n")}\n</system-reminder>` }]
+      : m.content),
+  }]
+
+  const uncoalescedTail = { system, messages: buildReplacementHistory() }
+  const uncoalescedFollowup = { system, messages: [...buildReplacementHistory(), ...postSummary] }
+  assert(trailingMessages(uncoalescedTail).history.length > 20)
+  assert.equal(trailingMessages(uncoalescedTail).messages.length, 1)
+  assert.equal(trailingMessages(uncoalescedFollowup).messages.length, 3)
+
+  for (const [label, body, hasFollowup] of [
+    ["uncoalesced summary tail", uncoalescedTail, false],
+    ["uncoalesced follow-up 继续", uncoalescedFollowup, true],
+    ["coalesced summary tail", { system, messages: coalesce(uncoalescedTail.messages) }, false],
+    ["coalesced follow-up 继续", { system, messages: coalesce(uncoalescedFollowup.messages) }, true],
+  ]) {
+    const original = structuredClone(body)
+    const parts = renderReplayPromptParts(body, "/repo", false, "")
+    const bytes = acpPromptTextBytes(parts)
+    assert(bytes <= 180_000, `${label}: expected <= 180000 ACP bytes, got ${bytes}`)
+    validateAcpPromptBudget(parts, "", body)
+    const rendered = parts.map(part => part.text || "").join("")
+    assert(rendered.includes("OPENING-GOAL: upgrade dual-end mini-program permissions"), `${label}: keeps opening goal`)
+    assert(rendered.includes("SUMMARY-MARKER-7:"), `${label}: keeps latest summary`)
+    for (let i = 1; i <= 6; i++) {
+      assert(!rendered.includes(`SUMMARY-MARKER-${i}:`), `${label}: omits superseded summary ${i}`)
+    }
+    if (hasFollowup) assert.match(rendered, /继续\s*<\/current_turn>$/, `${label}: keeps trailing 继续`)
+    assert.deepEqual(body, original, `${label}: does not mutate request body`)
   }
 })
 

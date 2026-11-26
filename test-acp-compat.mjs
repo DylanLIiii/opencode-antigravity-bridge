@@ -300,6 +300,49 @@ test("oversized Codex/Magpie compaction stages fragments under 180 KB and drops 
   }
 })
 
+for (const mode of ["response-first", "no-append"]) {
+  test(`Codex remote compaction bounds megabyte-scale tool history with ${mode}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const oldCheckpoint = "Another language model started to solve this problem and produced a summary of its thinking process. SUPERSEDED"
+    const result = {
+      type: "tool_result", tool_use_id: "oversized-result", is_error: true,
+      content: "RESULT-HEAD" + "𐐷".repeat(225_000) + "RESULT-TAIL",
+    }
+    const latest = { type: "text", text: "NEW-DIRECTION: keep the release pending." }
+    const ask = { type: "text", text: codexCompactionPrompt }
+    const messages = [
+      { role: "user", content: "UNFINISHED-GOAL: verify the release.\n" + "context ".repeat(24_000) },
+      { role: "user", content: oldCheckpoint },
+      { role: "user", content: oldCheckpoint.replace("SUPERSEDED", "CURRENT-CHECKPOINT") },
+      { role: "assistant", content: [{
+        type: "tool_use", id: result.tool_use_id, name: "Read",
+        input: { path: "REPORT-PATH", query: "a".repeat(240_000) },
+      }] },
+      { role: "user", content: mode === "no-append" ? [result, latest, ask] : [result, latest] },
+    ]
+    if (mode !== "no-append") messages.push({ role: "user", content: [ask] })
+    const before = logs().length
+    const response = await request(client, messages, { stream: true })
+    const raw = await response.text()
+    assert.equal(response.status, 200, raw)
+    assert.match(raw, /Keep LATEST-INSTRUCTION pending/)
+    assert.ok(!raw.includes("ACK-INTERNAL"))
+    const sent = logs().slice(before).filter(event => event.kind === "prompt")
+    const texts = sent.map(event => event.prompt.map(part => part.text || "").join(""))
+    assert.ok(texts.length)
+    assert.ok(texts.every(text => Buffer.byteLength(text) <= 180_000))
+    assert.ok(texts.reduce((total, text) => total + Buffer.byteLength(text), 0) <= 1_048_576)
+    const combined = texts.join("")
+    for (const expected of ["UNFINISHED-GOAL", "CURRENT-CHECKPOINT", "REPORT-PATH", "RESULT-HEAD",
+      "RESULT-TAIL", 'is_error="true"', 'body_abridged="true"', "NEW-DIRECTION", codexCompactionPrompt]) {
+      assert.ok(combined.includes(expected), expected)
+    }
+    assert.ok(!combined.includes("SUPERSEDED"))
+    assert.ok(!combined.includes("\ufffd"))
+  })
+}
+
 for (const mode of ["compaction-failure", "compaction-refusal"]) {
   test(`failed compaction ingestion stops before the summary: ${mode}`, async () => {
     process.env.COMPAT_MODE = mode

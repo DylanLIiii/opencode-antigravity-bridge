@@ -101,3 +101,18 @@ export function compactionPrompts(parts, limit) {
   flush()
   return [...fragments, [{ type: "text", text: FINAL }]]
 }
+
+// Keep the stock instruction and optional nudge in the current turn. Earlier
+// blocks in the same transport message can then use historical tool rendering.
+export function splitCompactionTail(current) {
+  const message = current[0]
+  if (!Array.isArray(message.content) || message.content.length < 2) return { history: [], current }
+  let start = message.content.length - 1
+  const last = message.content[start]
+  if (last?.type === "text" && normalizePromptText(last.text) === NUDGE) start--
+  if (start <= 0) return { history: [], current }
+  return {
+    history: [{ ...message, content: message.content.slice(0, start) }],
+    current: [{ ...message, content: message.content.slice(start) }, ...current.slice(1)],
+  }
+}

@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
-import { v2 as compactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
+import { v2 as compactionPrompt, codex as codexCompactionPrompt } from "./test/fixtures/opencode-compaction-prompts.mjs"
 
 // Exercise the public provider and its real Proc/AcpConnection with a subprocess.
 // The fake has no network, credentials, context unlock or MCP dependencies.
@@ -259,6 +259,87 @@ for (const mode of ["response-first", "no-append"]) for (const stream of [false,
     const session = "session-" + sent[0].pid
     const saved = fs.existsSync(process.env.AGY_BRIDGE_STATE_FILE) ? fs.readFileSync(process.env.AGY_BRIDGE_STATE_FILE, "utf8") : ""
     assert.ok(!saved.includes(session), "temporary summary sessions are not parked for conversation reuse")
+  })
+}
+
+test("oversized Codex/Magpie compaction stages fragments under 180 KB and drops superseded historical summaries", async () => {
+  process.env.COMPAT_MODE = "response-first"
+  const client = await loader()
+  const codexSummaryHeader = "Another language model started to solve this problem and produced a summary of its thinking process. "
+  for (const coalesced of [false, true]) {
+    const before = logs().length
+    const messages = coalesced
+      ? [{
+        role: "user",
+        content: [
+          { type: "text", text: codexSummaryHeader + "OLD-CHECKPOINT-A " + "a".repeat(40_000) },
+          { type: "text", text: codexSummaryHeader + "LATEST-CHECKPOINT-B " + "b".repeat(40_000) },
+          { type: "text", text: "This is the conversation so far:\n\n" + largeHistory },
+          { type: "text", text: codexCompactionPrompt },
+        ],
+      }]
+      : [
+        { role: "user", content: codexSummaryHeader + "OLD-CHECKPOINT-A " + "a".repeat(40_000) },
+        { role: "user", content: codexSummaryHeader + "LATEST-CHECKPOINT-B " + "b".repeat(40_000) },
+        { role: "user", content: largeHistory },
+        { role: "user", content: codexCompactionPrompt },
+      ]
+    const response = await request(client, messages, { stream: true })
+    const raw = await response.text()
+    assert.equal(response.status, 200, raw)
+    assert.ok(!raw.includes("ACK-INTERNAL"))
+    assert.match(raw, /Keep LATEST-INSTRUCTION pending/)
+    const sent = logs().slice(before).filter(event => event.kind === "prompt")
+    assert.ok(sent.length >= 3, "staged into multiple <180 KB fragments plus final request")
+    assert.equal(new Set(sent.map(event => event.pid)).size, 1)
+    for (const event of sent) assert.ok(event.prompt.reduce((sum, part) => sum + Buffer.byteLength(part.text || ""), 0) <= 180_000)
+    const combined = sent.map(event => event.prompt.map(part => part.text || "").join("")).join("\n")
+    assert.ok(!combined.includes("OLD-CHECKPOINT-A"), "superseded summary omitted before staging")
+    assert.ok(combined.includes("LATEST-CHECKPOINT-B"), "newest summary retained for staging")
+    assert.ok(combined.includes(codexCompactionPrompt), "Codex compaction format preserved")
+  }
+})
+
+for (const mode of ["response-first", "no-append"]) {
+  test(`Codex remote compaction bounds megabyte-scale tool history with ${mode}`, async () => {
+    process.env.COMPAT_MODE = mode
+    const client = await loader()
+    const oldCheckpoint = "Another language model started to solve this problem and produced a summary of its thinking process. SUPERSEDED"
+    const result = {
+      type: "tool_result", tool_use_id: "oversized-result", is_error: true,
+      content: "RESULT-HEAD" + "𐐷".repeat(225_000) + "RESULT-TAIL",
+    }
+    const latest = { type: "text", text: "NEW-DIRECTION: keep the release pending." }
+    const ask = { type: "text", text: codexCompactionPrompt }
+    const messages = [
+      { role: "user", content: "UNFINISHED-GOAL: verify the release.\n" + "context ".repeat(24_000) },
+      { role: "user", content: oldCheckpoint },
+      { role: "user", content: oldCheckpoint.replace("SUPERSEDED", "CURRENT-CHECKPOINT") },
+      { role: "assistant", content: [{
+        type: "tool_use", id: result.tool_use_id, name: "Read",
+        input: { path: "REPORT-PATH", query: "a".repeat(240_000) },
+      }] },
+      { role: "user", content: mode === "no-append" ? [result, latest, ask] : [result, latest] },
+    ]
+    if (mode !== "no-append") messages.push({ role: "user", content: [ask] })
+    const before = logs().length
+    const response = await request(client, messages, { stream: true })
+    const raw = await response.text()
+    assert.equal(response.status, 200, raw)
+    assert.match(raw, /Keep LATEST-INSTRUCTION pending/)
+    assert.ok(!raw.includes("ACK-INTERNAL"))
+    const sent = logs().slice(before).filter(event => event.kind === "prompt")
+    const texts = sent.map(event => event.prompt.map(part => part.text || "").join(""))
+    assert.ok(texts.length)
+    assert.ok(texts.every(text => Buffer.byteLength(text) <= 180_000))
+    assert.ok(texts.reduce((total, text) => total + Buffer.byteLength(text), 0) <= 1_048_576)
+    const combined = texts.join("")
+    for (const expected of ["UNFINISHED-GOAL", "CURRENT-CHECKPOINT", "REPORT-PATH", "RESULT-HEAD",
+      "RESULT-TAIL", 'is_error="true"', 'body_abridged="true"', "NEW-DIRECTION", codexCompactionPrompt]) {
+      assert.ok(combined.includes(expected), expected)
+    }
+    assert.ok(!combined.includes("SUPERSEDED"))
+    assert.ok(!combined.includes("\ufffd"))
   })
 }
 

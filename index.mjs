@@ -27,7 +27,7 @@ import { cloakUser, outgoing, hint, turnsAway } from "./cloak.mjs"
 import { fitTools } from "./tool-budget.mjs"
 import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
 import { AGY_MANUAL, installAgy, keepAgyCurrent } from "./install.mjs"
-import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
+import { COMPACTION_INSTRUCTIONS, compactionPrompts, openCodeCompactionStart, splitCompactionTail } from "./compaction.mjs"
 import { fetchCloudCodeModels, getCachedCloudCodeModels, invalidateModelMetadataCache, isReasoningModel, resolveModelMetadata } from "./model-metadata.mjs"
 
 const PACKAGE_METADATA = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
@@ -108,6 +108,23 @@ const ACP_LINE_LIMIT = 64 * 1024 * 1024
 const DEFAULT_MAX_PROMPT_TEXT_BYTES = 1024 * 1024
 // Claude Code prefixes the first message after compaction with this summary.
 const COMPACTION_SUMMARY_MARKER = "This session is being continued from a previous conversation"
+// Codex prefixes compaction summary items in replacement_history with this header.
+const CODEX_COMPACTION_SUMMARY_MARKER = "Another language model started to solve this problem and produced a summary of its thinking process."
+const MAGPIE_PLACEHOLDER_NOTICE = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
+const MAGPIE_PLACEHOLDER_NOTICE_RE = /(?:^|\n\n)Values written like \{\{NAME_ab12cd34\}\} are placeholders for real values\. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs\. Don't ask to verify them, and don't replace them with examples\.(?=\s|$)/g
+const NOTICE_TAG_NAMES = "system-update|teammate-message|agent-message|cross-session-message|coordinator-relay|channel|ide_opened_file|ide_selection|mcp-resource|mcp-resource-update|mcp-polling-update|post-tool-use-hook|user-prompt-submit-hook"
+const CONTEXT_NOTICE_RE = new RegExp(
+  `<(${NOTICE_TAG_NAMES})(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1>|(?:\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\][^<]*)?<task-notification>[\\s\\S]*?<\\/task-notification>`,
+  "g",
+)
+const SYSTEM_REMINDER_RE = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder(?:\s[^>]*)?>/g
+const PROTOCOL_NOTICE_START_RE = new RegExp(
+  `^(?:<(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b|\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\])`,
+)
+const UNCLOSED_NOTICE_RE = new RegExp(
+  `<\\/?(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b`,
+)
+const CODEX_HOST_CONTEXT_RE = /(?:^|\n)# AGENTS\.md instructions for [^\r\n]+\s*<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>|<(?:environment_context|codex_internal_context|turn_aborted)(?:\s[^>]*)?>[\s\S]*?<\/(?:environment_context|codex_internal_context|turn_aborted)>/g
 // Claude Code's compaction request. When the user submits while context is full,
 // it appends this instruction to the still-unanswered prompt in the same turn.
 const COMPACTION_REQUEST_MARKER = "Your task is to create a detailed summary of the conversation so far"
@@ -785,11 +802,23 @@ function acpPromptTextBytes(parts) {
   return promptTextBytes(parts) + parts.filter(part => part.type === "image").length * 1024
 }
 
+function stripMagpiePlaceholderNotice(text) {
+  if (typeof text !== "string" || !text.includes("{{NAME_ab12cd34}}")) return text
+  return text.replace(MAGPIE_PLACEHOLDER_NOTICE_RE, "")
+}
+
+function isCompactionSummaryText(raw) {
+  if (typeof raw !== "string") return false
+  if (!raw.includes(COMPACTION_SUMMARY_MARKER) && !raw.includes(CODEX_COMPACTION_SUMMARY_MARKER)) return false
+  const cleaned = stripMagpiePlaceholderNotice(raw).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "").trimStart()
+  return cleaned.startsWith(COMPACTION_SUMMARY_MARKER) || cleaned.startsWith(CODEX_COMPACTION_SUMMARY_MARKER)
+}
+
 function isCompactionSummary(message) {
   if (message?.role !== "user") return false
-  if (typeof message.content === "string") return message.content.includes(COMPACTION_SUMMARY_MARKER)
+  if (typeof message.content === "string") return isCompactionSummaryText(message.content)
   return Array.isArray(message.content) && message.content.some(block =>
-    block?.type === "text" && typeof block.text === "string" && block.text.includes(COMPACTION_SUMMARY_MARKER))
+    block?.type === "text" && isCompactionSummaryText(block.text))
 }
 
 // The reply to a compaction request is consumed by the client and never shown;
@@ -801,7 +830,10 @@ function isCompactionRequest(messages) {
 function hasRecentCompactionSummary(body) {
   // The protocol has no compaction timestamp. Allow a short preserved segment,
   // but do not let an old summary disable reactive compaction for all later turns.
-  return Array.isArray(body?.messages) && body.messages.slice(-8).some(isCompactionSummary)
+  if (!Array.isArray(body?.messages)) return false
+  if (body.messages.slice(-8).some(isCompactionSummary)) return true
+  const lastSummary = body.messages.findLastIndex(isCompactionSummary)
+  return lastSummary >= 0 && !body.messages.slice(lastSummary + 1).some(message => message?.role === "assistant")
 }
 
 function validatePromptBudget(parts, instructions = "", body = null) {
@@ -3536,7 +3568,7 @@ function summaryReplayRequest(body) {
   const content = Array.isArray(lastUser.content) ? lastUser.content : [{ type: "text", text: String(lastUser.content ?? "") }]
   const text = content.filter((block) => block?.type === "text" || block?.type === "input_text")
     .map((block) => block.text || "").join("\n")
-  return /CRITICAL:\s*Respond with TEXT ONLY|create a detailed summary of the conversation|Summarize the conversation so far|This session is being continued from a previous conversation/i.test(text)
+  return /CRITICAL:\s*Respond with TEXT ONLY|create a detailed summary of the conversation|Summarize the conversation so far|This session is being continued from a previous conversation|Another language model started to solve this problem and produced a summary of its thinking process\.|You are performing a CONTEXT CHECKPOINT COMPACTION\./i.test(text)
 }
 
 function replayHistoryProblem(body, resultBlocks) {
@@ -3681,14 +3713,6 @@ function renderServerAssistantBlock(block) {
     return `[${block.type}${block.tool_use_id ? " id=" + block.tool_use_id : ""}] ${JSON.stringify(block.content ?? "")}`
   }
   return ""
-}
-
-const MAGPIE_PLACEHOLDER_NOTICE = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
-const MAGPIE_PLACEHOLDER_NOTICE_RE = /(?:^|\n\n)Values written like \{\{NAME_ab12cd34\}\} are placeholders for real values\. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs\. Don't ask to verify them, and don't replace them with examples\.(?=\s|$)/g
-
-function stripMagpiePlaceholderNotice(text) {
-  if (typeof text !== "string" || !text.includes("{{NAME_ab12cd34}}")) return text
-  return text.replace(MAGPIE_PLACEHOLDER_NOTICE_RE, "")
 }
 
 // Compare conversation content, not transport metadata or client-assigned IDs.
@@ -4130,12 +4154,23 @@ function renderPrefillCarrierParts(message) {
   return [{ type: "text", text: `${prefillCarrierNote()}\n${body}` }]
 }
 
+function hasLiveToolResultBlock(message) {
+  return message?.role === "user" && Array.isArray(message.content) &&
+    message.content.some(block => block?.type === "tool_result")
+}
+
 function trailingMessages(body) {
   body = canonicalBody(body)
   const run = prefillTailEnabled() ? prefillRun(body.messages) : null
   if (run) return { history: body.messages.slice(0, run.boundary), messages: body.messages.slice(run.boundary) }
   let start = body.messages.length
   while (start > 0 && body.messages[start - 1].role !== "assistant") start--
+  const lastSummary = body.messages.findLastIndex(isCompactionSummary)
+  if (lastSummary >= 0 && start <= lastSummary &&
+    !body.messages.slice(start, lastSummary + 1).some(hasLiveToolResultBlock)) {
+    const split = lastSummary < body.messages.length - 1 ? lastSummary + 1 : lastSummary
+    return { history: body.messages.slice(0, split), messages: body.messages.slice(split) }
+  }
   return { history: body.messages.slice(0, start), messages: body.messages.slice(start) }
 }
 
@@ -4494,7 +4529,7 @@ function escapeToolRecord(value) {
 // is quoted history, never answer text.
 const TOOL_RECORD_CAVEAT = "Historical tool record: context only, do not reproduce."
 
-function historicalToolRecord(block, role, content, stripResults = false) {
+function historicalToolRecord(block, role, content, stripResults = false, toolBytes = null) {
   const attributes = { role, type: block.type, id: role === "call" ? block.id || "" : block.tool_use_id || "" }
   if (role === "call") attributes.name = block.name || block.type
   else {
@@ -4504,6 +4539,30 @@ function historicalToolRecord(block, role, content, stripResults = false) {
     attributes.is_error = String(block.is_error === true || serverError)
   }
   const out = []
+  if (toolBytes !== null) {
+    const omitResult = role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1"
+    if (omitResult) toolBytes = 0
+    const escaped = content.map(part => part.type === "text" ? escapeToolRecord(part.text) : "").join("")
+    const data = Buffer.from(escaped, "utf8")
+    const omitted = omitResult || content.some(part => part.type !== "text") || data.length > toolBytes
+    if (omitted) attributes.body_abridged = "true"
+    const tag = `<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}`
+    if (omitted && !toolBytes) return [{ type: "text", text: `
+${tag} />
+` }]
+    let text = escaped
+    if (data.length > toolBytes) {
+      const omission = "\n[Tool record middle omitted]\n"
+      let head = Math.floor((toolBytes - Buffer.byteLength(omission)) / 2)
+      let tail = data.length - head
+      while ((data[head] & 0xc0) === 0x80) head--
+      while ((data[tail] & 0xc0) === 0x80) tail++
+      text = data.subarray(0, head).toString("utf8") + omission + data.subarray(tail).toString("utf8")
+    }
+    return [{ type: "text", text: `
+${tag}>${text}</tool_record>
+` }]
+  }
   if (stripResults) {
     // The enclosing conversation_history already carries the caveat. Keep a
     // compact, escaped skeleton instead of repeating it four times per pair.
@@ -4527,12 +4586,12 @@ function historicalToolRecord(block, role, content, stripResults = false) {
   return out
 }
 
-function historicalToolCall(block, stripResults = false) {
-  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }], stripResults)
+function historicalToolCall(block, stripResults = false, toolBytes = null) {
+  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }], stripResults, toolBytes)
     .map(part => part.text).join("")
 }
 
-function renderAssistantTurn(message, stripResults = false) {
+function renderAssistantTurn(message, stripResults = false, toolBytes = null) {
   const parts = []
   const blocks = Array.isArray(message.content)
     ? message.content
@@ -4540,11 +4599,11 @@ function renderAssistantTurn(message, stripResults = false) {
   for (const block of blocks) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
-      parts.push(historicalToolCall(block, stripResults))
+      parts.push(historicalToolCall(block, stripResults, toolBytes))
     } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
-      parts.push(historicalToolCall(block, stripResults))
+      parts.push(historicalToolCall(block, stripResults, toolBytes))
     } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
-      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }], stripResults)
+      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }], stripResults, toolBytes)
         .map(part => part.text).join(""))
     } else {
       const rendered = renderServerAssistantBlock(block)
@@ -4664,7 +4723,7 @@ function renderTurnMessage(message) {
   return out.join("\n\n")
 }
 
-function renderTurnMessageParts(message, historical = false, stripResults = false) {
+function renderTurnMessageParts(message, historical = false, stripResults = false, toolBytes = null) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
     const text = renderTurnMessage(message)
     return text === "" ? [] : [{ type: "text", text }]
@@ -4678,7 +4737,7 @@ function renderTurnMessageParts(message, historical = false, stripResults = fals
     } else if (block?.type === "tool_result") {
       const result = toolResult(block)
       if (historical) {
-        appendPrompt(parts, historicalToolRecord(block, "result", result.content, stripResults))
+        appendPrompt(parts, historicalToolRecord(block, "result", result.content, stripResults, toolBytes))
       } else {
         appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
         for (const part of result.content) appendPrompt(parts, [part])
@@ -4734,11 +4793,11 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
       `[${replay.omittedMessages} older history messages omitted to fit the bridge prompt budget. This history is incomplete; do not infer missing tool outcomes.]\n`)
     for (const message of history) {
       if (message.role === "assistant") {
-        appendPrompt(out, `Assistant: ${renderAssistantTurn(message, stripResults)}\n`)
+        appendPrompt(out, `Assistant: ${renderAssistantTurn(message, stripResults, replay?.toolBytes)}\n`)
       } else {
         const queued = message.role !== "user" && extractQueuedPrompt(messageText(message).trim()) !== null
         appendPrompt(out, message.role === "user" || queued ? "Human: " : `${message.role}: `)
-        appendPrompt(out, renderTurnMessageParts(message, true, stripResults))
+        appendPrompt(out, renderTurnMessageParts(message, true, stripResults, replay?.toolBytes))
         appendPrompt(out, "\n")
       }
     }
@@ -4767,7 +4826,7 @@ function replayHistoryGroups(history, current) {
     }
   }
   for (const [index, message] of history.entries()) {
-    if (!groups.length || (message.role === "assistant" && !pending.size)) groups.push([])
+    if (!groups.length || (!pending.size && (message.role === "assistant" || groups.at(-1).at(-1).role !== "assistant"))) groups.push([])
     groups.at(-1).push(message)
     for (const block of Array.isArray(message.content) ? message.content : []) {
       // An interrupted call with no later result must not bind every subsequent
@@ -4791,12 +4850,109 @@ function isReplayUserTask(message) {
     if (block?.type !== "text" || typeof block.text !== "string") return false
     const queued = extractQueuedPrompt(block.text)
     if (queued !== null) return !!queued.trim()
-    const text = stripMagpiePlaceholderNotice(block.text).replace(CONTEXT_NOTICE_RE, "").replace(SYSTEM_REMINDER_RE, "").trim()
+    const text = stripMagpiePlaceholderNotice(block.text)
+      .replace(CODEX_HOST_CONTEXT_RE, "")
+      .replace(CONTEXT_NOTICE_RE, "")
+      .replace(SYSTEM_REMINDER_RE, "")
+      .trim()
     if (!text || /^\[(?:MESSAGE FROM NON-USER SOURCE - NOT USER INPUT|Request interrupted by user(?:\s+for tool use)?)\]/i.test(text) ||
       /^(?:<task-notification\b|<system-reminder\b|<local-command-|<command-|<bash-|<available-deferred-tools\b)/i.test(text) ||
       /^(?:Your response (?:above was cut off|was cut off)|\[Your previous response|The previous response failed to produce a valid tool call|Your tool call was malformed|Output token limit hit|(?:Stop|SubagentStop|PreCompact|PostCompact) hook feedback:)/i.test(text)) return false
     return true
   })
+}
+
+function expandCoalescedCompactionMessage(message) {
+  if (message?.role !== "user" || !Array.isArray(message.content) || message.content.length <= 1 ||
+    hasLiveToolResultBlock(message) || !message.content.some(block => block?.type === "text" && isCompactionSummaryText(block.text))) {
+    return [message]
+  }
+  const out = []
+  const blocks = message.content
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i]?.type === "text" && /<image\b[^>]*>\s*$/.test(blocks[i].text || "") && blocks[i + 1]?.type === "image") {
+      const hasClosingTag = blocks[i + 2]?.type === "text" && /^\s*<\/image>\s*$/.test(blocks[i + 2].text || "")
+      out.push({ ...message, content: blocks.slice(i, i + (hasClosingTag ? 3 : 2)) })
+      i += hasClosingTag ? 2 : 1
+      continue
+    }
+    out.push({ ...message, content: [blocks[i]] })
+  }
+  return out
+}
+
+// Keep only the newest compaction summary across history + current; earlier
+// summaries were already incorporated into the latest checkpoint.
+function omitSupersededSummaries(history, current) {
+  const locations = []
+  const collect = (list, inCurrent) => {
+    for (let mi = 0; mi < list.length; mi++) {
+      const message = list[mi]
+      if (message?.role !== "user") continue
+      if (typeof message.content === "string") {
+        if (isCompactionSummaryText(message.content)) locations.push({ inCurrent, mi, bi: -1 })
+      } else if (Array.isArray(message.content)) {
+        for (let bi = 0; bi < message.content.length; bi++) {
+          if (message.content[bi]?.type === "text" && isCompactionSummaryText(message.content[bi].text)) {
+            locations.push({ inCurrent, mi, bi })
+          }
+        }
+      }
+    }
+  }
+  collect(history, false)
+  collect(current, true)
+  if (locations.length <= 1) return { history, current, changed: false }
+  const keep = locations.at(-1)
+  const filterList = (list, inCurrent) => {
+    const out = []
+    for (let mi = 0; mi < list.length; mi++) {
+      const message = list[mi]
+      if (message?.role !== "user") {
+        out.push(message)
+        continue
+      }
+      if (typeof message.content === "string") {
+        if (isCompactionSummaryText(message.content) && !(keep.inCurrent === inCurrent && keep.mi === mi && keep.bi === -1)) continue
+        out.push(message)
+      } else if (Array.isArray(message.content)) {
+        const nextBlocks = message.content.filter((block, bi) =>
+          !(block?.type === "text" && isCompactionSummaryText(block.text) && !(keep.inCurrent === inCurrent && keep.mi === mi && keep.bi === bi)))
+        if (!nextBlocks.length) continue
+        out.push(nextBlocks.length === message.content.length ? message : { ...message, content: nextBlocks })
+      } else {
+        out.push(message)
+      }
+    }
+    return out
+  }
+  return { history: filterList(history, false), current: filterList(current, true), changed: true }
+}
+
+function replayMessages(body) {
+  const { history: rawHistory, messages: rawCurrent } = trailingMessages(body)
+  let history = rawHistory
+  let current = rawCurrent
+  let expandedChanged = false
+  if (current.some(message => expandCoalescedCompactionMessage(message).length > 1) &&
+    !current.some(message => message?.role === "assistant")) {
+    const expanded = [...history.flatMap(expandCoalescedCompactionMessage), ...current.flatMap(expandCoalescedCompactionMessage)]
+    const lastSummary = expanded.findLastIndex(isCompactionSummary)
+    if (lastSummary >= 0 && !expanded.slice(0, lastSummary + 1).some(hasLiveToolResultBlock)) {
+      const split = lastSummary < expanded.length - 1 ? lastSummary + 1 : lastSummary
+      history = expanded.slice(0, split)
+      current = expanded.slice(split)
+      expandedChanged = true
+    }
+  } else {
+    const nextHistory = history.flatMap(expandCoalescedCompactionMessage)
+    if (nextHistory.length !== history.length) {
+      history = nextHistory
+      expandedChanged = true
+    }
+  }
+  const deduped = omitSupersededSummaries(history, current)
+  return { history: deduped.history, current: deduped.current, changed: expandedChanged || deduped.changed }
 }
 
 // Try lossless replay, then compact tool skeletons, then the newest complete
@@ -4805,37 +4961,86 @@ function isReplayUserTask(message) {
 function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, instructions = "") {
   const reminder = outputFormatReminder(body)
   const fits = parts => promptTextBytes(parts, instructions) <= promptTextLimit() && acpPromptTextBytes(parts) <= acpPromptTextLimit()
-  const full = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession), reminder)
+  const { history, current, changed } = replayMessages(body)
+  const replayBase = changed ? { history, current } : null
+  const full = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, false, replayBase), reminder)
   if (fits(full)) return full
-  const stripped = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true), reminder)
+  const stripped = mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true, replayBase), reminder)
   if (fits(stripped)) return stripped
 
-  const { history, messages: current } = trailingMessages(body)
   const groups = replayHistoryGroups(history, current)
   const taskGroup = groups.findLastIndex(group => group.some(isReplayUserTask))
-  const removable = groups.filter((group, i) => i > 0 && i < groups.length - 1 && i !== taskGroup && !group.some(isCompactionSummary))
-  if (!removable.length) return stripped
-  const window = count => {
-    const dropped = new Set(removable.slice(0, count))
-    const history = groups.filter(group => !dropped.has(group)).flat()
-    const omittedMessages = removable.slice(0, count).reduce((sum, group) => sum + group.length, 0)
-    return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true,
-      { history, omittedMessages }), reminder)
+  const lastSummaryGroup = groups.findLastIndex(group => group.some(isCompactionSummary))
+  const hasSummaryAfter = index => index >= 0 && (current.some(isCompactionSummary) || lastSummaryGroup > index)
+  const selectWindow = allowSummarizedTail => {
+    const removable = groups.filter((group, i) => {
+      if (i === 0 || group.some(isCompactionSummary)) return false
+      if (i === groups.length - 1) {
+        return allowSummarizedTail && current.some(isCompactionSummary) && !group.some(message => message.role === "assistant")
+      }
+      if (i === taskGroup) return allowSummarizedTail && hasSummaryAfter(taskGroup)
+      return true
+    })
+    if (!removable.length) return null
+    const window = count => {
+      const dropped = new Set(removable.slice(0, count))
+      const nextHistory = groups.filter(group => !dropped.has(group)).flat()
+      const omittedMessages = removable.slice(0, count).reduce((sum, group) => sum + group.length, 0)
+      return mergePromptParts(renderInitialPromptParts(body, callerWorkDir, instructionsInSession, true,
+        { history: nextHistory, current, omittedMessages }), reminder)
+    }
+    let best = window(removable.length)
+    if (!fits(best)) return null
+    // Find the smallest omitted prefix without repeatedly rendering every suffix.
+    let low = 1
+    let high = removable.length
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2)
+      const candidate = window(mid)
+      if (fits(candidate)) {
+        best = candidate
+        high = mid
+      } else low = mid + 1
+    }
+    return best
   }
-  let best = window(removable.length)
-  if (!fits(best)) return stripped // Protected content alone cannot fit; validation will reject it.
-  // Find the smallest omitted prefix without repeatedly rendering every suffix.
-  let low = 1
-  let high = removable.length
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2)
-    const candidate = window(mid)
-    if (fits(candidate)) {
-      best = candidate
-      high = mid
-    } else low = mid + 1
+  return selectWindow(false) || selectWindow(true) || stripped
+}
+
+function planCompactionPrompts(body, callerWorkDir, start) {
+  const { history, current } = omitSupersededSummaries(
+    body.messages.slice(0, start).flatMap(expandCoalescedCompactionMessage),
+    body.messages.slice(start),
+  )
+  const prefix = { type: "text", text: COMPACTION_INSTRUCTIONS + "\n\n" }
+  const fragmentLimit = Math.min(OFFICIAL_ACP_PROMPT_TEXT_BYTES, acpPromptTextLimit()) - acpPromptTextBytes([prefix])
+  const totalLimit = Math.min(DEFAULT_MAX_PROMPT_TEXT_BYTES, promptTextLimit())
+
+  // Exact summaries are removed first. When the full snapshot still will not
+  // fit, abridge only typed tool records, keeping their identity, status and
+  // short excerpts. User instructions, snapshots and other prose stay intact.
+  const tail = splitCompactionTail(current)
+  const candidates = [
+    { history, current },
+    { history: [...history, ...tail.history], current: tail.current, toolBytes: 4096 },
+    { history: [...history, ...tail.history], current: tail.current, toolBytes: 0 },
+  ]
+  let requiredBytes
+  for (const candidate of candidates) {
+    const full = renderInitialPromptParts(body, callerWorkDir, false, false, { ...candidate, compacting: true })
+    requiredBytes = acpPromptTextBytes(full) + acpPromptTextBytes([prefix])
+    if (requiredBytes > totalLimit) continue
+    const prompts = compactionPrompts(full, fragmentLimit)
+    // Count the fallback prefix on every fragment even if session/append is
+    // available. Count image labels in both the per-turn and cumulative budget.
+    requiredBytes = acpPromptTextBytes(prompts.flatMap(prompt => [prefix, ...prompt]))
+    if (requiredBytes <= totalLimit) return prompts
   }
-  return best
+  throw new ConflictError(
+    `agy bridge: the compaction request requires ${requiredBytes} UTF-8 text bytes including reserved overhead, above the bridge budget of ${totalLimit}. ` +
+    "Shorten the input or use another compaction provider. No model prompt or tool result from this request was sent.",
+    "prompt_budget_exceeded",
+  )
 }
 
 function renderContinuedTurnParts(messages) {
@@ -4982,19 +5187,6 @@ function isInterruptedToolTurn(body) {
   }
   return false
 }
-
-const NOTICE_TAG_NAMES = "system-update|teammate-message|agent-message|cross-session-message|coordinator-relay|channel|ide_opened_file|ide_selection|mcp-resource|mcp-resource-update|mcp-polling-update|post-tool-use-hook|user-prompt-submit-hook"
-const CONTEXT_NOTICE_RE = new RegExp(
-  `<(${NOTICE_TAG_NAMES})(?:\\s[^>]*)?>[\\s\\S]*?<\\/\\1>|(?:\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\][^<]*)?<task-notification>[\\s\\S]*?<\\/task-notification>`,
-  "g",
-)
-const SYSTEM_REMINDER_RE = /<system-reminder(?:\s[^>]*)?>([\s\S]*?)<\/system-reminder(?:\s[^>]*)?>/g
-const PROTOCOL_NOTICE_START_RE = new RegExp(
-  `^(?:<(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b|\\[(?:SYSTEM NOTIFICATION|MESSAGE FROM NON-USER SOURCE) - NOT USER INPUT\\])`,
-)
-const UNCLOSED_NOTICE_RE = new RegExp(
-  `<\\/?(?:${NOTICE_TAG_NAMES}|task-notification|system-reminder)\\b`,
-)
 
 function outgoingNotice(notice) {
   const open = /^<([a-z][a-z0-9-]*)(?:\s[^>]*)?>/i.exec(notice)
@@ -6350,19 +6542,8 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               if (compactionStart >= 0) {
                 // Compaction is a read-only snapshot, including pending tool
                 // results. It must not attach to or cancel their live owner.
-                const full = renderInitialPromptParts(body, callerWorkDir, false, false, {
-                  history: body.messages.slice(0, compactionStart),
-                  current: body.messages.slice(compactionStart), compacting: true,
-                })
-                validatePromptBudget(full, COMPACTION_INSTRUCTIONS, body)
+                const prompts = planCompactionPrompts(body, callerWorkDir, compactionStart)
                 const prefix = { type: "text", text: COMPACTION_INSTRUCTIONS + "\n\n" }
-                // Reserve for the older, no-system-append handshake too. Both
-                // modes must admit the full plan before any content is sent.
-                const prompts = compactionPrompts(full, acpPromptTextLimit() - promptTextBytes([prefix]))
-                // Include wrapper overhead in the total budget; reject the
-                // entire plan before startup if any fragment cannot fit.
-                validatePromptBudget(prompts.flatMap(prompt => [prefix, ...prompt]), "", body)
-                for (const prompt of prompts) validateAcpPromptBudget(prompt, COMPACTION_INSTRUCTIONS, body)
                 const key = `${convKey}:compaction`
                 promptAttempt = claimPromptAttempt(promptAttemptKey(key, body, trailing, model, selection, [], COMPACTION_INSTRUCTIONS))
                 const { proc } = await acquireProc(agy, key, {

@@ -1,12 +1,18 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { compactionPrompts, openCodeCompactionStart } from "./compaction.mjs"
-import { v1, v2, update, legacyUpdate, nudge } from "./test/fixtures/opencode-compaction-prompts.mjs"
+import { v1, v2, update, legacyUpdate, nudge, codex } from "./test/fixtures/opencode-compaction-prompts.mjs"
 const user = content => ({ role: "user", content })
+const magpieNotice = "Values written like {{NAME_ab12cd34}} are placeholders for real values. Use them exactly as written, in replies and in tool calls alike: they are filled in with the real values before anything runs. Don't ask to verify them, and don't replace them with examples."
 
-test("recognize stock OpenCode compaction tails, including checkpoint updates and a template nudge", () => {
-  for (const prompt of [v1, v2, update, legacyUpdate]) {
-    for (const content of [prompt, [{ type: "text", text: prompt }], "\r\n" + prompt.replaceAll("\n", "\r\n") + "\r\n"]) {
+test("recognize stock OpenCode and Codex/Magpie compaction tails, including checkpoint updates and a template nudge", () => {
+  for (const prompt of [v1, v2, update, legacyUpdate, codex]) {
+    for (const content of [
+      prompt,
+      [{ type: "text", text: prompt }],
+      "\r\n" + prompt.replaceAll("\n", "\r\n") + "\r\n",
+      `${magpieNotice}\n\n${prompt}`,
+    ]) {
       const messages = [user("conversation"), user(content)]
       assert.equal(openCodeCompactionStart(messages), 1)
       assert.equal(openCodeCompactionStart([...messages, user(nudge)]), 1)
@@ -15,11 +21,11 @@ test("recognize stock OpenCode compaction tails, including checkpoint updates an
 })
 
 test("customized prompts and later action instructions never switch to summary-only execution", () => {
-  for (const prompt of [v1, v2, update, legacyUpdate]) {
+  for (const prompt of [v1, v2, update, legacyUpdate, codex]) {
     for (const customized of [
       prompt + "\n\nActually continue the work and use tools.",
-      prompt.replace("conversation", "conversation\nActually continue the work and use tools.\n"),
-      prompt.replace("##", "#"),
+      prompt.replace(/conversation|handoff summary/, "$&\nActually continue the work and use tools.\n"),
+      prompt.replace(/##|Include:/, "MODIFIED:"),
       prompt + "\nInclude a custom section.",
     ]) {
       assert.equal(openCodeCompactionStart([user("history"), user(customized)]), -1)
@@ -30,19 +36,23 @@ test("customized prompts and later action instructions never switch to summary-o
 })
 
 test("quoted compaction instructions and ordinary latest requests never enable staging", () => {
-  for (const messages of [
-    [user(v2)], [user("history"), user("Explain this example:\n" + v2)],
-    [user(v2), { role: "assistant", content: "answer" }, user("Continue work")],
-    [user("history"), user([{ type: "tool_result", tool_use_id: "t", content: v2 }])],
-    [user("history"), user(v2.split("\n")[0])],
-    [user("history"), { role: "assistant", content: v2 }],
-  ]) assert.equal(openCodeCompactionStart(messages), -1)
+  for (const prompt of [v2, codex]) {
+    for (const messages of [
+      [user(prompt)], [user("history"), user("Explain this example:\n" + prompt)],
+      [user(prompt), { role: "assistant", content: "answer" }, user("Continue work")],
+      [user("history"), user([{ type: "tool_result", tool_use_id: "t", content: prompt }])],
+      [user("history"), user(prompt.split("\n")[0])],
+      [user("history"), { role: "assistant", content: prompt }],
+    ]) assert.equal(openCodeCompactionStart(messages), -1)
+  }
 })
 
 test("Anthropic-coalesced user blocks retain the compaction boundary", () => {
   for (const content of [
     [{ type: "text", text: "flattened history" }, { type: "text", text: v2 }],
+    [{ type: "text", text: "This is the conversation so far:\n\n[user]\nhello\n\n" }, { type: "text", text: codex }],
     [{ type: "tool_result", tool_use_id: "t", content: "large result" }, { type: "text", text: v1 }],
+    [{ type: "tool_result", tool_use_id: "t", content: "large result" }, { type: "text", text: codex }],
     [{ type: "text", text: "history" }, { type: "text", text: v2 }, { type: "text", text: nudge }],
   ]) assert.equal(openCodeCompactionStart([user(content)]), 0)
 })
